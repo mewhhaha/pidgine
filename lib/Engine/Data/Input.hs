@@ -1,15 +1,22 @@
 module Engine.Data.Input
   ( Button(..)
   , Input(..)
+  , InputPred(..)
   , press
   , release
   , held
   , axis
+  , justPressed
+  , justReleased
+  , isHeld
+  , axisAbove
+  , axisBelow
+  , axisWithin
   ) where
 
 import Engine.Data.FRP (Events, Step(..))
 
-data Button = Btn String
+data Button = Button String
   deriving (Eq, Ord, Show)
 
 data Input = Input
@@ -19,6 +26,31 @@ data Input = Input
   , axes :: [(String, Double)]
   }
   deriving (Eq, Show)
+
+newtype InputPred = InputPred
+  { matchInput :: Input -> Bool
+  }
+
+justPressed :: Button -> InputPred
+justPressed b = InputPred (\i -> b `elem` down i)
+
+justReleased :: Button -> InputPred
+justReleased b = InputPred (\i -> b `elem` up i)
+
+isHeld :: Button -> InputPred
+isHeld b = InputPred (\i -> b `elem` holds i)
+
+axisAbove :: String -> Double -> InputPred
+axisAbove name threshold = InputPred (\i -> lookupAxis name (axes i) > threshold)
+
+axisBelow :: String -> Double -> InputPred
+axisBelow name threshold = InputPred (\i -> lookupAxis name (axes i) < threshold)
+
+axisWithin :: String -> (Double, Double) -> InputPred
+axisWithin name (lo, hi) = InputPred (\i ->
+  let v = lookupAxis name (axes i)
+  in v >= lo && v <= hi
+  )
 
 instance Semigroup Input where
   a <> b = Input

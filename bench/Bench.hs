@@ -1,0 +1,50 @@
+{-# LANGUAGE TypeApplications #-}
+
+module Main where
+
+import Criterion.Main
+import Data.List (foldl')
+import qualified Engine.Data.ECS as E
+import qualified Engine.Data.System as S
+
+data Pos = Pos Double Double
+  deriving (Eq, Show)
+
+data Vel = Vel Double Double
+  deriving (Eq, Show)
+
+data Move
+
+buildWorld :: Int -> E.World
+buildWorld n = snd (foldl' add (0 :: Int, E.empty) [1 .. n])
+  where
+    add (i, w) _ =
+      let (_, w1) = E.spawn (Pos (fromIntegral i) 0, Vel 1 1) w
+      in (i + 1, w1)
+
+qPV :: E.Query (Pos, Vel)
+qPV = (,) <$> (E.comp :: E.Query Pos) <*> (E.comp :: E.Query Vel)
+
+moveSys :: S.System String
+moveSys = S.system @Move $ do
+  S.each qPV (\(Pos x y, Vel vx vy) -> (Pos (x + vx) (y + vy), Vel vx vy))
+  pure ()
+
+graph :: S.Graph String
+graph = S.graph @String moveSys
+
+main :: IO ()
+main = defaultMain
+  [ bgroup "ecs"
+      [ let w = buildWorld 10000
+        in bench "query-10k" $ nf (length . E.runq qPV) w
+      , bench "spawn-10k" $ nf (length . E.entities . buildWorld) 10000
+      ]
+  , bgroup "system"
+      [ let w = buildWorld 10000
+        in bench "run-10k" $ nf (\w0 ->
+            let (w1, _, _) = S.run 0.016 w0 [] graph
+            in length (E.entities w1)
+          ) w
+      ]
+  ]

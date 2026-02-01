@@ -18,6 +18,7 @@ module Engine.Data.ECS
   , World
   , empty
   , spawn
+  , Bundle(..)
   , kill
   , get
   , set
@@ -35,15 +36,27 @@ module Engine.Data.ECS
   , runq
   , foldq
   , Queryable(..)
+  , QueryableSum(..)
   , Has(..)
   , Not(..)
   , hasQ
   , notHasQ
+  , mapMaybeQ
+  , filterQ
+  , Out(..)
+  , In(..)
+  , relate
+  , unrelate
+  , out
+  , inn
+  , Build(..)
+  , build
+  , exec
+  , spawnB
   ) where
 
 import Prelude
 
-import Engine.Data.Filterable (Filterable(..))
 import qualified Control.Applicative as A
 import Data.Dynamic (Dynamic, fromDynamic, toDyn)
 import Data.IntMap (IntMap)
@@ -53,6 +66,7 @@ import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import Data.Typeable (TypeRep, Typeable, typeOf, typeRep)
 import GHC.Generics
+import GHC.TypeLits (ErrorMessage(..), TypeError)
 import qualified Data.IntMap as IntMap
 import qualified Data.IntSet as IntSet
 import qualified Data.Map as Map
@@ -65,6 +79,78 @@ data Component = forall c. Typeable c => Component c
 
 component :: Typeable c => c -> Component
 component = Component
+
+class Bundle a where
+  bundle :: a -> [Component]
+
+instance {-# OVERLAPPABLE #-} Typeable a => Bundle a where
+  bundle a = [component a]
+
+instance Bundle Component where
+  bundle c = [c]
+
+instance {-# OVERLAPPING #-} Bundle () where
+  bundle () = []
+
+instance Bundle [Component] where
+  bundle = id
+
+instance {-# OVERLAPPING #-} (Bundle a, Bundle b) => Bundle (a, b) where
+  bundle (a, b) = bundle a ++ bundle b
+
+instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c) => Bundle (a, b, c) where
+  bundle (a, b, c) = bundle a ++ bundle b ++ bundle c
+
+instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d) => Bundle (a, b, c, d) where
+  bundle (a, b, c, d) = bundle a ++ bundle b ++ bundle c ++ bundle d
+
+instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e)
+  => Bundle (a, b, c, d, e) where
+  bundle (a, b, c, d, e) = bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e
+
+instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e, Bundle f)
+  => Bundle (a, b, c, d, e, f) where
+  bundle (a, b, c, d, e, f) =
+    bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e ++ bundle f
+
+instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e, Bundle f, Bundle g)
+  => Bundle (a, b, c, d, e, f, g) where
+  bundle (a, b, c, d, e, f, g) =
+    bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e ++ bundle f ++ bundle g
+
+instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e, Bundle f, Bundle g, Bundle h)
+  => Bundle (a, b, c, d, e, f, g, h) where
+  bundle (a, b, c, d, e, f, g, h) =
+    bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e ++ bundle f ++ bundle g ++ bundle h
+
+newtype Build a = Build { runBuild :: World -> (a, World) }
+
+instance Functor Build where
+  fmap f (Build g) = Build $ \w ->
+    let (a, w') = g w
+    in (f a, w')
+
+instance Applicative Build where
+  pure a = Build $ \w -> (a, w)
+  Build f <*> Build a = Build $ \w ->
+    let (f', w1) = f w
+        (a', w2) = a w1
+    in (f' a', w2)
+
+instance Monad Build where
+  Build a >>= f = Build $ \w ->
+    let (a', w1) = a w
+        Build b = f a'
+    in b w1
+
+build :: Build a -> (a, World)
+build b = runBuild b empty
+
+exec :: Build a -> World
+exec = snd . build
+
+spawnB :: Bundle a => a -> Build Entity
+spawnB cs = Build $ \w -> spawn cs w
 
 data World = World
   { next :: Int
@@ -83,11 +169,11 @@ empty = World
   , res = Map.empty
   }
 
-spawn :: [Component] -> World -> (Entity, World)
+spawn :: Bundle a => a -> World -> (Entity, World)
 spawn cs w =
   let ent = Entity (next w)
       w1 = w { next = next w + 1, ents = IntSet.insert (eid ent) (ents w) }
-      comps' = foldl' (insertComp ent) (comps w1) cs
+      comps' = foldl' (insertComp ent) (comps w1) (bundle cs)
   in (ent, w1 { comps = comps' })
 
 kill :: Entity -> World -> World
@@ -263,8 +349,11 @@ componentSet w rep =
 intersectAll :: [IntSet] -> IntSet
 intersectAll [] = IntSet.empty
 intersectAll (s:xs) = foldl' IntSet.intersection s xs
-instance Filterable Query where
-  mapMaybe f q = q { run = \e w -> run q e w >>= f }
+mapMaybeQ :: (a -> Maybe b) -> Query a -> Query b
+mapMaybeQ f q = q { run = \e w -> run q e w >>= f }
+
+filterQ :: (a -> Bool) -> Query a -> Query a
+filterQ p = mapMaybeQ (\a -> if p a then Just a else Nothing)
 
 newtype Has (a :: Type) = Has ()
   deriving (Eq, Show)
@@ -277,7 +366,7 @@ hasQ = Has () <$ comp @a
 
 notHasQ :: forall a. Typeable a => Query (Not a)
 notHasQ =
-  mapMaybe
+  mapMaybeQ
     (\m -> case m of
       Nothing -> Just (Not ())
       Just _ -> Nothing
@@ -299,6 +388,40 @@ instance {-# OVERLAPPING #-} Typeable a => FieldQuery (Has a) where
 instance {-# OVERLAPPING #-} Typeable a => FieldQuery (Not a) where
   fieldQ = notHasQ
 
+newtype Out (r :: Type) = Out [Entity]
+  deriving (Eq, Show)
+
+newtype In (r :: Type) = In [Entity]
+  deriving (Eq, Show)
+
+out :: forall (r :: Type). Typeable r => Entity -> World -> [Entity]
+out e w =
+  case get @(Out r) e w of
+    Nothing -> []
+    Just (Out xs) -> xs
+
+inn :: forall (r :: Type). Typeable r => Entity -> World -> [Entity]
+inn e w =
+  case get @(In r) e w of
+    Nothing -> []
+    Just (In xs) -> xs
+
+relate :: forall (r :: Type). Typeable r => Entity -> Entity -> World -> World
+relate a b w =
+  let outs = out @r a w
+      ins = inn @r b w
+      w1 = set a (Out @r (b : Prelude.filter (/= b) outs)) w
+      w2 = set b (In @r (a : Prelude.filter (/= a) ins)) w1
+  in w2
+
+unrelate :: forall (r :: Type). Typeable r => Entity -> Entity -> World -> World
+unrelate a b w =
+  let outs = Prelude.filter (/= b) (out @r a w)
+      ins = Prelude.filter (/= a) (inn @r b w)
+      w1 = if null outs then del @(Out r) a w else set a (Out @r outs) w
+      w2 = if null ins then del @(In r) b w1 else set b (In @r ins) w1
+  in w2
+
 class GQuery f where
   gquery :: Query (f p)
 
@@ -308,8 +431,13 @@ instance GQuery f => GQuery (M1 i c f) where
 instance (GQuery a, GQuery b) => GQuery (a :*: b) where
   gquery = (:*:) <$> gquery <*> gquery
 
-instance (GQuery a, GQuery b) => GQuery (a :+: b) where
-  gquery = (L1 <$> gquery) A.<|> (R1 <$> gquery)
+instance
+  TypeError
+    ( 'Text "Queryable does not support sum types."
+    ':$$: 'Text "Use QueryableSum for sums (querySum)."
+    )
+  => GQuery (a :+: b) where
+  gquery = error "unreachable"
 
 instance GQuery U1 where
   gquery = pure U1
@@ -321,3 +449,26 @@ class Queryable a where
   query :: Query a
   default query :: (Generic a, GQuery (Rep a)) => Query a
   query = to <$> gquery
+
+class GQuerySum f where
+  gquerySum :: Query (f p)
+
+instance GQuerySum f => GQuerySum (M1 i c f) where
+  gquerySum = M1 <$> gquerySum
+
+instance (GQuerySum a, GQuerySum b) => GQuerySum (a :*: b) where
+  gquerySum = (:*:) <$> gquerySum <*> gquerySum
+
+instance (GQuerySum a, GQuerySum b) => GQuerySum (a :+: b) where
+  gquerySum = (L1 <$> gquerySum) A.<|> (R1 <$> gquerySum)
+
+instance GQuerySum U1 where
+  gquerySum = pure U1
+
+instance FieldQuery a => GQuerySum (K1 i a) where
+  gquerySum = K1 <$> fieldQ
+
+class QueryableSum a where
+  querySum :: Query a
+  default querySum :: (Generic a, GQuerySum (Rep a)) => Query a
+  querySum = to <$> gquerySum

@@ -10,6 +10,17 @@ module Engine.Data.FRP
   , time
   , int
   , after
+  , every
+  , during
+  , within
+  , range
+  , window
+  , for
+  , progress
+  , since
+  , forFrom
+  , progressFrom
+  , afterFrom
   , delay
   , hold
   , acc
@@ -64,6 +75,83 @@ after t = go 0
           then ([()], done)
           else ([], go elapsed')
     done = Step $ \_ _ -> ([], done)
+
+every :: Time -> Step a (Events ())
+every t =
+  if t <= 0
+    then Step $ \_ _ -> ([], every t)
+    else go 0
+  where
+    go carry = Step $ \d _ ->
+      let total = carry + realToFrac d
+          n = floor (total / t)
+          carry' = total - fromIntegral n * t
+      in (replicate n (), go carry')
+
+during :: (Time, Time) -> Step a Bool
+during (t0, t1) = fmap (\t -> t >= t0 && t < t1) time
+
+within :: (Time, Time) -> Step a (Events b) -> Step a (Events b)
+within rng evs = gate . ((,) <$> during rng <*> evs)
+
+range :: (Time, Time) -> Step a (Maybe Double)
+range (t0, t1) = fmap toRange time
+  where
+    toRange t
+      | t1 <= t0 = Nothing
+      | t < t0 || t >= t1 = Nothing
+      | otherwise = Just ((t - t0) / (t1 - t0))
+
+window :: (Time, Time) -> Step a b -> Step a (Maybe b)
+window rng s0 = go (during rng) s0
+  where
+    go okS s = Step $ \d a ->
+      let (ok, okS') = stepS okS d a
+      in if ok
+          then let (b, s') = stepS s d a
+               in (Just b, go okS' s')
+          else (Nothing, go okS' s)
+
+for :: Time -> Step a b -> Step a (Maybe b)
+for t = window (0, t)
+
+progress :: (Time, Time) -> Step a Double
+progress (t0, t1) = fmap toProg time
+  where
+    toProg t
+      | t1 <= t0 = 0
+      | t <= t0 = 0
+      | t >= t1 = 1
+      | otherwise = (t - t0) / (t1 - t0)
+
+since :: Step a (Events ()) -> Step a Double
+since start = go 0 start
+  where
+    go elapsed s = Step $ \d a ->
+      let (evs, s') = stepS s d a
+          elapsed' = if null evs then elapsed + realToFrac d else 0
+      in (elapsed', go elapsed' s')
+
+forFrom :: Step a (Events ()) -> Time -> Step a Bool
+forFrom start t = fmap (< t) (since start)
+
+progressFrom :: Step a (Events ()) -> Time -> Step a Double
+progressFrom start t = fmap toProg (since start)
+  where
+    toProg e
+      | t <= 0 = 1
+      | e <= 0 = 0
+      | e >= t = 1
+      | otherwise = e / t
+
+afterFrom :: Step a (Events ()) -> Time -> Step a (Events ())
+afterFrom start t = go 0 start
+  where
+    go elapsed s = Step $ \d a ->
+      let (evs, s') = stepS s d a
+          elapsed' = if null evs then elapsed + realToFrac d else 0
+          out = if elapsed' >= t && null evs then [()] else []
+      in (out, go elapsed' s')
 
 delay :: b -> Step b b
 delay b0 = Step $ \_ b -> (b0, delay b)

@@ -4,6 +4,7 @@ module Main where
 
 import ECSProps
 import FRPProps
+import SystemProps
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
 import System.Exit (exitFailure)
@@ -21,6 +22,14 @@ approx a b = abs (a - b) < 1e-9
 approxList :: [Double] -> [Double] -> Bool
 approxList xs ys = length xs == length ys && and (zipWith approx xs ys)
 
+approxMaybe :: Maybe Double -> Maybe Double -> Bool
+approxMaybe (Just a) (Just b) = approx a b
+approxMaybe Nothing Nothing = True
+approxMaybe _ _ = False
+
+approxMaybeList :: [Maybe Double] -> [Maybe Double] -> Bool
+approxMaybeList xs ys = length xs == length ys && and (zipWith approxMaybe xs ys)
+
 main :: IO ()
 main = do
   let cOut = F.run (pure (7 :: Int)) [(1, ()), (1, ())]
@@ -32,8 +41,26 @@ main = do
   let dOut = F.run (F.delay (0 :: Int)) [(1, 1), (1, 2), (1, 3)]
   assert "delay" (dOut == [0, 1, 2])
 
+  let evOut = map length (F.run (F.every 1) [(0.4,()), (0.4,()), (0.4,()), (0.4,())])
+  assert "every" (evOut == [0,0,1,0])
+
+  let durOut = F.run (F.during (0.5, 1.0)) [(0.25,()), (0.25,()), (0.25,()), (0.25,())]
+  assert "during" (durOut == [False, True, True, False])
+
+  let rOut = F.run (F.range (1, 2)) [(0.5,()), (0.5,()), (0.5,())]
+  assert "range" (approxMaybeList rOut [Nothing, Just 0.0, Just 0.5])
+
+  let pOut = F.run (F.progress (0, 1)) [(0.5,()), (0.5,()), (0.5,())]
+  assert "progress" (approxList pOut [0.5, 1.0, 1.0])
+
+  let wOut = F.run (F.window (1, 2) (pure (9 :: Int))) [(0.5,()), (0.6,()), (0.6,())]
+  assert "window" (wOut == [Nothing, Just 9, Just 9])
+
+  let sOut = F.run (F.since (F.after 0.2)) [(0.1,()), (0.1,()), (0.1,())]
+  assert "since" (approxList sOut [0.1, 0.0, 0.1])
+
   let w0 = E.empty
-      (e1, w1) = E.spawn [E.component (10 :: Int), E.component ("hi" :: String)] w0
+      (e1, w1) = E.spawn ((10 :: Int), ("hi" :: String)) w0
   assert "get" (E.get e1 w1 == Just (10 :: Int))
 
   let w2 = E.set e1 True w1
@@ -42,6 +69,9 @@ main = do
   let q = (E.comp :: E.Query Int)
       qOut = E.runq q w2
   assert "query" (qOut == [(e1, 10)])
+
+  assert "system resume" system_resume_once
+  assert "system await value" system_await_value
 
   results <-
     sequence
@@ -55,6 +85,12 @@ main = do
       , quickCheckResult prop_query_app
       , quickCheckResult prop_query_alt
       , quickCheckResult prop_query_queryable
+      , quickCheckResult prop_query_queryable_sum
+      , quickCheckResult prop_relations
+      , quickCheckResult prop_parent_child
+      , quickCheckResult prop_transform_inverse
+      , quickCheckResult prop_system_resume
+      , quickCheckResult prop_system_await_value
       ]
 
   if all isSuccess results

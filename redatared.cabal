@@ -23,7 +23,7 @@ library
                       Engine.Data.ECS
                       Engine.Data.System
                       Engine.Data.Input
-                      Engine.Data.Filterable
+                      Engine.Data.Transform
     -- other-modules:
     -- other-extensions:
     build-depends:    base ^>=4.21.0.0
@@ -37,8 +37,19 @@ test-suite redatared-tests
     main-is:          Main.hs
     other-modules:    FRPProps
                       ECSProps
+                      SystemProps
     build-depends:    base ^>=4.21.0.0
                       , containers
                       , QuickCheck
+                      , redatared
+    default-language: GHC2024
+
+benchmark redatared-bench
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          Bench.hs
+    build-depends:    base ^>=4.21.0.0
+                      , containers
+                      , criterion
                       , redatared
     default-language: GHC2024

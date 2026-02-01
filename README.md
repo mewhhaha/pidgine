@@ -10,6 +10,7 @@ import qualified Engine.Data.FRP as F
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.System as S
 import qualified Engine.Data.Input as I
+import qualified Engine.Data.Transform as T
 ```
 
 Note: Some examples use `do` with Applicative only; enable `ApplicativeDo`.
@@ -44,6 +45,52 @@ pos = F.int
 posOut :: [Double]
 posOut = F.run pos [(1, 2), (1, 2), (0.5, 2)]  -- velocity = 2
 -- [2.0,4.0,5.0]
+```
+
+### 2b) Ranges and timers
+
+```haskell
+-- True while time is in [0.5, 1.0)
+inRange :: [Bool]
+inRange = F.run (F.during (0.5, 1.0)) [(0.25,()), (0.25,()), (0.25,()), (0.25,())]
+-- [False,True,True,False]
+
+-- Progress 0..1 while inside a range
+prog :: [Maybe Double]
+prog = F.run (F.range (1, 2)) [(0.5,()), (0.5,()), (0.5,())]
+-- [Nothing,Just 0.0,Just 0.5]
+
+-- Emit once per second
+pulse :: [F.Events ()]
+pulse = F.run (F.every 1) [(0.4,()), (0.4,()), (0.4,()), (0.4,())]
+-- [[],[],[()],[]]
+
+-- Move for 1 second at 5 units/sec (progress-based, clamped)
+move1s :: [Double]
+move1s = map (*5) (F.run (F.progress (0, 1)) [(0.5,()), (0.5,()), (0.5,())])
+-- [2.5,5.0,5.0]   -- progress clamps after the range
+
+-- Gate any step to a time window
+gated :: [Maybe Int]
+gated = F.run (F.window (1,2) (pure 9)) [(0.5,()), (0.6,()), (0.6,())]
+-- [Nothing,Just 9,Just 9]
+```
+
+### 2c) Relative timers (event-driven)
+
+```haskell
+-- Time since "dash" was pressed.
+dashTime :: [Double]
+dashTime = F.run (F.since (I.press (I.Button "dash")))
+  [ (0.1, I.Input [] [] [] [])
+  , (0.1, I.Input [I.Button "dash"] [] [] [])
+  , (0.1, I.Input [] [] [] [])
+  ]
+-- [0.1,0.0,0.1]
+
+-- Invulnerable for 1 second after a hit.
+invuln :: F.Step I.Input Bool
+invuln = F.forFrom (I.press (I.Button "hit")) 1.0
 ```
 
 ### 3) Delay and hold
@@ -143,19 +190,29 @@ out = F.run pair [(1, 10), (1, 10)]
 
 ```haskell
 jump :: F.Step I.Input (F.Events ())
-jump = I.press (I.Btn "jump")
+jump = I.press (I.Button "jump")
 
 left :: F.Step I.Input Bool
-left = I.held (I.Btn "left")
+left = I.held (I.Button "left")
 
 moveX :: F.Step I.Input Double
 moveX = I.axis "x"
 
+waitJump :: S.System I.Input
+waitJump = S.system @Jump $ do
+  _ <- S.await (I.justPressed (I.Button "jump"))
+  pure ()
+
+waitDash :: S.System I.Input
+waitDash = S.system @Dash $ do
+  _ <- S.await (I.axisAbove "x" 0.8)
+  pure ()
+
 sample :: I.Input
 sample = I.Input
-  { I.down = [I.Btn "jump"]
+  { I.down = [I.Button "jump"]
   , I.up = []
-  , I.holds = [I.Btn "left"]
+  , I.holds = [I.Button "left"]
   , I.axes = [("x", 0.5)]
   }
 ```
@@ -233,8 +290,10 @@ tick dt inp w =
 
 data Pos = Pos Double Double deriving (Show, Eq)
 data Vel = Vel Double Double deriving (Show, Eq)
+data Player = Player deriving (Show, Eq)
+data Enemy = Enemy deriving (Show, Eq)
 
-(e, w1) = E.spawn [E.component (Pos 0 0), E.component (Vel 1 0)] E.empty
+(e, w1) = E.spawn (Pos 0 0, Vel 1 0) E.empty
 
 E.get e w1 :: Maybe Pos
 -- Just (Pos 0 0)
@@ -245,6 +304,27 @@ E.get e w2 :: Maybe Pos
 
 E.has @Vel e w2
 -- True
+```
+
+Bundles let you reuse component sets and compose them in tuples:
+
+```haskell
+data PlayerBundle = PlayerBundle Pos Vel
+
+instance E.Bundle PlayerBundle where
+  bundle (PlayerBundle p v) = E.bundle (p, v)
+
+(p, w3) = E.spawn (PlayerBundle (Pos 0 0) (Vel 1 0)) w2
+(q, w4) = E.spawn (PlayerBundle (Pos 2 3) (Vel 0 1), Player) w3
+```
+
+You can also build a world without threading `w` manually:
+
+```haskell
+(player, w5) = E.build do
+  p <- E.spawnB (Player, Pos 0 0)
+  _ <- E.spawnB (Enemy, Pos 10 0)
+  pure p
 ```
 
 ### 2) Simple queries
@@ -314,15 +394,27 @@ data NotEnemy = NotEnemy
 players = E.runq (E.query @PlayerQuery) w
 ```
 
-Queryable auto-derives for product types; sums are supported via `<|>` but skip `need` pruning.
+Queryable auto-derives for product types. For sum types, use `QueryableSum`:
+
+```haskell
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeApplications #-}
+
+data Who = P Player | E Enemy
+  deriving (Generic, E.QueryableSum)
+
+whoQ = E.querySum @Who
+```
+
+Sum queries use `<|>` and therefore skip `need` pruning.
 
 ### 6) Filter and map queries
 
 ```haskell
-import qualified Engine.Data.Filterable as W
 
 fastQ :: E.Query Vel
-fastQ = W.filter (\(Vel x y) -> x*x + y*y > 1) E.comp
+fastQ = E.filterQ (\(Vel x y) -> x*x + y*y > 1) E.comp
 
 namesQ :: E.Query String
 namesQ = do
@@ -348,25 +440,390 @@ move dt w =
     ) w w
 ```
 
----
-
-## Systems: FRP + ECS together
+### 9) Relationships (typed edges)
 
 ```haskell
-stepWorld :: Double -> E.World -> E.World
-stepWorld dt w =
-  E.foldq (do p <- (E.comp :: E.Query Pos); v <- (E.comp :: E.Query Vel); pure (p, v))
-    (\e (Pos x y, Vel vx vy) acc ->
-      E.set e (Pos (x + vx * dt) (y + vy * dt)) acc
-    ) w w
+data Owns
+data Targets
 
-sys :: S.WorldSys
-sys = S.stepw stepWorld
+-- a owns b
+w3 = E.relate @Owns a b w2
 
-runFrame :: F.DTime -> E.World -> E.World
-runFrame dt w =
-  let (w', _) = F.stepS sys dt w
-  in w'
+-- outgoing relationships
+E.out @Owns a w3
+
+-- incoming relationships
+E.inn @Owns b w3
+
+-- remove relation
+w4 = E.unrelate @Owns a b w3
+```
+
+### 10) Parent/child transforms (Bevy‑style)
+
+```haskell
+-- attach parent -> child
+w3 = T.attach parent child w2
+
+-- propagate transforms (global from local + parent)
+w4 = T.propagate w3
+
+-- Example locals
+w2 =
+  E.set parent (T.Local (T.translate (0,0,0))) $
+  E.set child  (T.Local (T.translate (2,0,0))) w1
+
+-- Resulting globals:
+-- parent = translate (0,0,0), child = translate (2,0,0)
+```
+
+### 11) Matrix helpers
+
+```haskell
+-- Build a local transform: translate * rotate * scale
+local = T.compose [T.translate (1,2,3), T.rotateZ 0.5, T.scale (2,2,2)]
+
+-- Invert a transform (affine)
+inv = T.inverse local
+
+-- Maybe-returning inverse (fallback to identity)
+invOrId = maybe T.identity id inv
+
+-- Typeclass composition
+world = T.ident T.<.> local
+```
+
+---
+
+## Systems: FRP + ECS together (async list)
+
+Note: system tags use `TypeApplications` (e.g. `system @Move` or `system @(Move, Render)`).
+`System` is an alias for `SystemV msg ()` (a system returning `()`); if you want
+to `await` a value, use `SystemV msg a`.
+
+Systems emit `Patch` values (using `S.set`, `S.update`, `S.del`, `S.put`, `S.each`, etc). Each system has a
+type tag id (via `TypeApplications`, e.g. `system @Move`). Tags are labels used by `await`:
+if multiple systems share a tag, `await` will unblock when any of them runs. Tuple tags
+register multiple labels at once, so `system @(Move, Render)` can be used as an `await`
+handle for “either Move or Render”. If a tag is produced by multiple systems, the
+latest in‑frame value wins.
+The runtime
+re-runs only systems that return `wait` (directly or via `await` gating) until no
+new messages appear, so `await` can be satisfied within the same frame. The returned outbox is the
+aggregate of all messages emitted this frame.
+When an `await` is not ready, the rest of that system does not run for the tick.
+Systems are coroutines: they resume at the suspended `await` on later frames,
+and restart from the top once they return.
+
+For “gathered” systems, use `system`: it batches `each`/`edit`/`send` operations and
+applies them once per tick, while `await` provides gating without manual `wait`.
+Use `sysP`/`sysE` only for low‑level patch or stateful `Step` systems.
+
+Graph construction is variadic: `S.graph sys1 sys2 sys3` (no list needed).
+
+Within a single `system`, all `each`/`collect` calls read the same world snapshot;
+their patches are merged and applied once. If you need “see the result of a
+previous update,” split it into another system and `await x`.
+
+```haskell
+data Move
+
+data MoveQ = MoveQ
+  { pos :: Pos
+  , vel :: Vel
+  } deriving (Generic, E.Queryable, S.Eachable)
+
+moveSys :: S.System ()
+moveSys = S.system @Move $ do
+  dt <- S.dt
+  S.each (E.query @MoveQ) (\q ->
+    q { pos = let Pos x y = pos q
+                      Vel vx vy = vel q
+              in Pos (x + vx * dt) (y + vy * dt)
+      })
+  pure ()
+
+g0 :: S.Graph ()
+g0 = S.graph moveSys
+
+runFrame :: F.DTime -> E.World -> S.Graph () -> (E.World, S.Graph ())
+runFrame dt w g =
+  let (w', _out, g') = S.run dt w [] g
+  in (w', g')
+```
+
+Note: Each round can be parallelized by evaluating all runnable systems
+against the same snapshot/inbox and then merging patches in list order.
+The current `run` executes sequentially for simplicity.
+
+Patch helpers also support update-in-place:
+
+```haskell
+data Score = Score Int
+
+bumpScore :: E.Entity -> S.Patch
+bumpScore e = S.update e (\(Score n) -> Score (n + 1))
+
+resetScore :: E.Entity -> S.Patch
+resetScore e = S.update e (const (Score 0)) -- or S.set e (Score 0)
+```
+
+---
+
+## System patterns
+
+### 1) Independent systems in one frame
+
+```haskell
+data Move
+data AI
+data Anim
+
+moveSys :: S.System ()
+moveSys = S.system @Move (pure ())
+
+aiSys :: S.System ()
+aiSys = S.system @AI (pure ())   -- placeholder
+
+animSys :: S.System ()
+animSys = S.system @Anim (pure ()) -- placeholder
+
+g0 :: S.Graph ()
+g0 = S.graph moveSys aiSys animSys
+```
+
+### 2) Deterministic patch order
+
+```haskell
+data Physics
+data Collision
+data Damage
+
+physicsSys :: S.System ()
+physicsSys = S.system @Physics (pure ())
+
+collisionSys :: S.System ()
+collisionSys = S.system @Collision (pure ())  -- resolve contacts
+
+damageSys :: S.System ()
+damageSys = S.system @Damage (pure ())
+
+g0 :: S.Graph ()
+g0 = S.graph physicsSys aiSys collisionSys damageSys animSys
+```
+
+### 3) Snapshot semantics
+
+```haskell
+-- All systems read the same snapshot; list order only affects patch application.
+data WritePos
+data ReadPos
+
+writePos :: S.System ()
+writePos = S.system @WritePos $ do
+  S.each (E.comp :: E.Query Pos) (\(Pos x y) -> Pos (x + 1) y)
+  pure ()
+
+readPos :: S.System ()
+readPos = S.system @ReadPos (pure ()) -- build a spatial index
+
+g0 :: S.Graph ()
+g0 = S.graph writePos readPos
+```
+
+### 4) Messaging between systems
+
+```haskell
+data Msg = Fire | SpawnBullet deriving (Eq, Show)
+data FireSys
+data SpawnSys
+
+fireSys :: S.System Msg
+fireSys = S.system @FireSys $ do
+  _fires <- S.await (S.Event (== Fire))
+  S.send [SpawnBullet]
+
+spawnSys :: S.System Msg
+spawnSys = S.system @SpawnSys $ do
+  spawns <- S.await (S.Event (== SpawnBullet))
+  let p = foldMap (const (S.set e Bullet)) spawns  -- assume e exists
+  S.edit p
+  pure ()
+
+-- `run` already feeds outbox back into inbox within the frame (bounded).
+-- The returned outbox is the aggregate of all messages emitted this frame.
+```
+
+### 4b) Movement waits for velocity update
+
+This pattern lets you write systems without rigid ordering: a system can
+use `await` to gate until another system has run in‑frame, and `run` will re‑run it in‑frame.
+
+```haskell
+data Vel = Vel Double Double
+data Pos = Pos Double Double
+
+data Speed
+data Move
+
+data MoveQ = MoveQ
+  { pos :: Pos
+  , vel :: Vel
+  } deriving (Generic, E.Queryable, S.Eachable)
+
+speedSys :: S.System ()
+speedSys = S.system @Speed $ do
+  S.each (E.query @MoveQ) (\q ->
+    q { vel = let Vel vx vy = vel q in Vel (vx * 1.1) (vy * 1.1) }
+    )
+  pure ()
+
+moveSys :: S.System ()
+moveSys = S.system @Move $ do
+  _ready <- S.await speedSys
+  dt <- S.dt
+  S.each (E.query @MoveQ) (\q ->
+    q { pos = let Pos x y = pos q
+                      Vel vx vy = vel q
+                  in Pos (x + vx * dt) (y + vy * dt)
+      }
+    )
+  pure ()
+
+g0 :: S.Graph ()
+g0 = S.graph moveSys speedSys  -- order doesn’t matter: moveSys waits
+```
+
+### 4c) Await a system value
+
+`await` returns the value produced by the system (for its last in‑frame run).
+Use `SystemV` for non‑`()` values; `graph` accepts any mix of return types.
+
+```haskell
+data Speed
+data Move
+
+speedSys :: S.SystemV () Double
+speedSys = S.system @Speed $ pure 2.5
+
+moveSys :: S.System ()
+moveSys = S.system @Move $ do
+  speed <- S.await speedSys
+  dt <- S.dt
+  S.each (E.comp :: E.Query Pos) (\(Pos x y) -> Pos (x + speed * dt) y)
+  pure ()
+
+g0 :: S.Graph ()
+g0 = S.graph speedSys moveSys
+```
+
+Another common pattern is “compute collisions once, then consume them”:
+
+```haskell
+data Collide
+data Damage
+
+data Collision = Collision Entity Entity
+
+collideSys :: S.SystemV () [Collision]
+collideSys = S.system @Collide $ do
+  pairs <- S.collect (E.query @PairQ)  -- PairQ omitted for brevity
+  pure (detect pairs)                 -- detect :: [(Entity, PairQ)] -> [Collision]
+
+damageSys :: S.System ()
+damageSys = S.system @Damage $ do
+  collisions <- S.await collideSys
+  let p = foldMap applyDamage collisions
+  S.edit p
+  pure ()
+
+g1 :: S.Graph ()
+g1 = S.graph collideSys damageSys
+```
+
+### 4d) Collect after sync point
+
+`await Update` waits until all systems have run once in the frame, then `collect` returns a snapshot.
+
+```haskell
+data EnemyQ = EnemyQ
+  { enemy :: Enemy
+  , posE :: Pos
+  } deriving (Generic, E.Queryable)
+
+data CountEnemies
+
+countEnemies :: S.System ()
+countEnemies = S.system @CountEnemies $ do
+  _ <- S.await S.Update
+  enemies <- S.collect (E.query @EnemyQ)
+  let n = length enemies
+  pure ()
+```
+
+### 4e) Await any of multiple tags
+
+You can create an `await` handle with tuple tags. This lets you wait for
+“either X or Y” without adding an extra system to the graph.
+
+```haskell
+data Move
+data Render
+data WaitAny
+
+moveSys :: S.System ()
+moveSys = S.system @Move (pure ())
+
+renderSys :: S.System ()
+renderSys = S.system @Render (pure ())
+
+moveOrRender :: S.System ()
+moveOrRender = S.system @(Move, Render) (pure ()) -- handle only (don’t add to graph)
+
+waitAnySys :: S.System ()
+waitAnySys = S.system @WaitAny $ do
+  _ <- S.await moveOrRender
+  pure ()
+```
+
+### 4f) Await a group of systems
+
+Tag multiple systems with the same type and wait for the whole group:
+
+```haskell
+data Physics
+data Move
+data Collide
+data Sync
+
+moveSys :: S.System ()
+moveSys = S.group @Physics $ S.system @Move $ do
+  -- physics integration
+  pure ()
+
+collideSys :: S.System ()
+collideSys = S.group @Physics $ S.system @Collide $ do
+  -- collision resolution
+  pure ()
+
+syncSys :: S.System ()
+syncSys = S.system @Sync $ do
+  _ <- S.await (S.Group @Physics)
+  -- all physics systems have run this frame
+  pure ()
+```
+
+### 5) Task queue as data (async runtime)
+
+```haskell
+data Job = LoadTex String | PlaySound String
+
+jobs :: F.Step I.Input (F.Events Job)
+jobs = do
+  jump <- I.press (I.Button "jump")
+  pure (if null jump then [] else [PlaySound "jump.wav"])
+
+-- Runtime: drain Events Job and perform IO outside the pure core.
 ```
 
 ---
@@ -379,11 +836,8 @@ runFrame dt w =
 -- Linear tween from 0 to target over duration seconds.
 tween :: Double -> Double -> F.Step a Double
 tween duration target = do
-  t <- F.time
-  let u = clamp (t / duration)
+  u <- F.progress (0, duration)
   pure (u * target)
-  where
-    clamp x = if x < 0 then 0 else if x > 1 then 1 else x
 
 -- Example: animate from 0 to 10 over 2 seconds
 -- F.run (tween 2 10) [(0.5, ()), (0.5, ()), (1.0, ())]
@@ -392,11 +846,8 @@ tween duration target = do
 -- From/to tween:
 tween2 :: Double -> Double -> Double -> F.Step a Double
 tween2 duration from to = do
-  t <- F.time
-  let u = clamp (t / duration)
+  u <- F.progress (0, duration)
   pure (from + u * (to - from))
-  where
-    clamp x = if x < 0 then 0 else if x > 1 then 1 else x
 ```
 
 ### 2) Animated sprites (frame selection)
@@ -458,6 +909,62 @@ game = do
   pure (p <> a)
 ```
 
+### 5) Fixed timestep accumulator
+
+```haskell
+-- Convert variable dt to fixed 60Hz steps.
+fixed60 :: F.Step a (F.Events ())
+fixed60 = F.every (1 / 60)
+```
+
+### 6) Cooldown / rate limiter
+
+```haskell
+cooldown :: Double -> F.Step (F.Events a) (F.Events a)
+cooldown t = F.switch idle
+  where
+    idle = do
+      evs <- F.id
+      let out = take 1 evs
+          next = if null out then [] else [cooling]
+      pure (out, next)
+
+    cooling = do
+      done <- F.after t
+      pure ([], map (const idle) done)
+```
+
+### 7) Camera follow
+
+```haskell
+data Cam = Cam { cx :: Double, cy :: Double }
+
+follow :: Double -> F.Step (Pos, Cam) Cam
+follow stiffness = do
+  (Pos x y, Cam cx0 cy0) <- F.id
+  let cx1 = cx0 + (x - cx0) * stiffness
+      cy1 = cy0 + (y - cy0) * stiffness
+  pure (Cam cx1 cy1)
+```
+
+### 8) Network interpolation (pure)
+
+```haskell
+data Snap = Snap { sx :: Double, sy :: Double, st :: Double }
+
+interp :: Snap -> Snap -> Double -> Pos
+interp (Snap x0 y0 t0) (Snap x1 y1 t1) t =
+  let u = (t - t0) / max 1e-6 (t1 - t0)
+  in Pos (x0 + u * (x1 - x0)) (y0 + u * (y1 - y0))
+```
+
+### 9) Animation blending
+
+```haskell
+blend :: Double -> Double -> Double -> Double
+blend a b t = a * (1 - t) + b * t
+```
+
 ---
 
 ## Enemy state machines (timed behaviors)
@@ -496,7 +1003,8 @@ enemy = F.switch idle
 ```
 
 This pattern is explicit: each state returns `(state, events)` where events
-carry the next state. Time‑based transitions use `F.after`.
+carry the next state. Time‑based transitions use `F.after`. The state machine
+runs continuously during gameplay; it is not a one‑time “startup” action.
 
 ---
 
@@ -521,37 +1029,47 @@ data Ball = Ball deriving (Show, Eq)
 
 initWorld :: E.World
 initWorld =
-  let w0 = E.empty
-      (p1, w1) = E.spawn [E.component Paddle, E.component (Pos (-8) 0)] w0
-      (p2, w2) = E.spawn [E.component Paddle, E.component (Pos 8 0)] w1
-      (_b, w3) = E.spawn [E.component Ball, E.component (Pos 0 0), E.component (Vel 5 2)] w2
-  in w3
+  E.exec do
+    _p1 <- E.spawnB (Paddle, Pos (-8) 0)
+    _p2 <- E.spawnB (Paddle, Pos 8 0)
+    _b  <- E.spawnB (Ball, Pos 0 0, Vel 5 2)
+    pure ()
 
-move :: Double -> E.World -> E.World
-move dt w =
-  E.foldq (do p <- (E.comp :: E.Query Pos); v <- (E.comp :: E.Query Vel); pure (p, v))
-    (\e (Pos x y, Vel vx vy) acc ->
-      E.set e (Pos (x + vx * dt) (y + vy * dt)) acc
-    ) w w
+data Move
+data Bounce
 
-bounceWalls :: E.World -> E.World
-bounceWalls w =
-  E.foldq (do p <- (E.comp :: E.Query Pos); v <- (E.comp :: E.Query Vel); pure (p, v))
-    (\e (Pos x y, Vel vx vy) acc ->
-      let vy' = if y > 9 || y < (-9) then -vy else vy
-      in E.set e (Vel vx vy') acc
-    ) w w
+data MoveQ = MoveQ
+  { pos :: Pos
+  , vel :: Vel
+  } deriving (Generic, E.Queryable, S.Eachable)
 
-stepPong :: Double -> E.World -> E.World
-stepPong dt = bounceWalls . move dt
+moveSys :: S.System ()
+moveSys = S.system @Move $ do
+  dt <- S.dt
+  S.each (E.query @MoveQ) (\q ->
+    q { pos = let Pos x y = pos q
+                      Vel vx vy = vel q
+              in Pos (x + vx * dt) (y + vy * dt)
+      })
+  pure ()
 
-pong :: S.WorldSys
-pong = S.stepw stepPong
+bounceSys :: S.System ()
+bounceSys = S.system @Bounce $ do
+  _ <- S.await moveSys
+  S.each (E.query @MoveQ) (\q ->
+    q { vel = let Pos _ y = pos q
+                      Vel vx vy = vel q
+                  in Vel vx (if y > 9 || y < (-9) then -vy else vy)
+      })
+  pure ()
 
-frame :: F.DTime -> E.World -> E.World
-frame dt w =
-  let (w', _) = F.stepS pong dt w
-  in w'
+pongGraph0 :: S.Graph ()
+pongGraph0 = S.graph moveSys bounceSys
+
+frame :: F.DTime -> E.World -> S.Graph () -> (E.World, S.Graph ())
+frame dt w g =
+  let (w', _out, g') = S.run dt w [] g
+  in (w', g')
 ```
 
 ### 2) Snake (grid + events)
@@ -672,14 +1190,23 @@ stepBreakout bricks ball =
 data Ship = Ship { spos :: (Double, Double), svel :: (Double, Double) } deriving (Eq, Show)
 data Bullet = Bullet { bpos :: (Double, Double), bvel :: (Double, Double) } deriving (Eq, Show)
 
+-- Time-based movement (no explicit dt): position = p0 + v * t
 advance :: Double -> (Double, Double) -> (Double, Double) -> (Double, Double)
-advance dt (x, y) (vx, vy) = (x + vx * dt, y + vy * dt)
+advance t (x, y) (vx, vy) = (x + vx * t, y + vy * t)
 
-stepShip :: Double -> Ship -> Ship
-stepShip dt (Ship p v) = Ship (advance dt p v) v
+stepShip :: Ship -> F.Step () Ship
+stepShip s0 = do
+  t <- F.time
+  let Ship p v = s0
+  pure (Ship (advance t p v) v)
 
-stepBullet :: Double -> Bullet -> Bullet
-stepBullet dt (Bullet p v) = Bullet (advance dt p v) v
+-- Bullet lives for 2 seconds, then disappears.
+stepBullet :: Bullet -> F.Step () (Maybe Bullet)
+stepBullet b0 = do
+  u <- F.progress (0, 2)  -- 0..1 over 2 seconds
+  let Bullet p v = b0
+      t = u * 2
+  pure (if u >= 1 then Nothing else Just (Bullet (advance t p v) v))
 ```
 
 ### 7) Flappy (simple physics + threshold)
@@ -739,3 +1266,21 @@ push d s =
 - Everything is pure. Effects are modeled as data flowing out of steps.
 - `Events` are just lists per tick; use `pure []`, `(<>)`, and `filter`.
 - For name clarity, prefer qualified imports as shown at the top.
+
+---
+
+## Pain points (current)
+
+- No built-in IO/async runtime: `Job`/`Events` are data only; you need an external executor.
+- Systems run sequentially; no automatic parallelism or dependency scheduling.
+- Patch conflicts are resolved by list order; no merge policy beyond `Semigroup` order.
+- Waiting systems are re-run within a frame; misbehaving systems can loop forever.
+- `QueryableSum` skips `need` pruning; sum queries scan all entities.
+- Queries are applicative; no dependent queries without giving up pruning.
+- No spatial index; collision queries are naive unless you build your own structure.
+- `Events` are plain lists: no timestamps, priorities, or guaranteed ordering across systems.
+- Long-running `Step`s require manual state hygiene; no built-in garbage collection for events.
+- Coroutine systems aren’t serializable as data; mid-flight saves require input logging/replay.
+- Relative timers are event-driven; there’s no first-class clock scaling/pausing per system.
+- No prefab/archetype registry; bundles are just ad‑hoc values without tooling.
+- `progress` clamps; `range` is windowed—users need to learn the distinction.
