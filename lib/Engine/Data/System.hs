@@ -588,20 +588,30 @@ runSystemM d w inbox locals0 = go mempty [] locals0
             EachP q f k -> go (patchAcc <> eachPW q f w) out locals k
             EachM key (q :: E.Query a) (f :: Entity -> a -> SystemM msg ()) k ->
               let ents = E.runq q w
+                  localsByEnt =
+                    Map.foldlWithKey'
+                      (\m key' v ->
+                        case localEnt key' of
+                          Nothing -> m
+                          Just e -> Map.insertWith Map.union e (Map.singleton key' v) m
+                      )
+                      Map.empty
+                      locals
                   runOne (e, a) =
                     let progKey = LocalKey key (Just e)
+                        localsEnt = Map.findWithDefault Map.empty e localsByEnt
                         prog0 =
-                          case Map.lookup progKey locals >>= fromDynamic of
+                          case Map.lookup progKey localsEnt >>= fromDynamic of
                             Just p -> p
                             Nothing -> f e a
                         curKey = LocalKey (typeRep (Proxy @CurrentEntity)) Nothing
-                        localsWithCur = Map.insert curKey (toDyn e) locals
+                        localsWithCur = Map.insert curKey (toDyn e) localsEnt
                         (t, localsNext, prog', ma) = runSystemM d w inbox localsWithCur prog0
                         progNext = case ma of
                           Nothing -> prog'
                           Just _ -> f e a
-                        localsEnt = Map.filterWithKey (\key' _ -> localEnt key' == Just e) localsNext
-                        localsFinal = Map.insert progKey (toDyn progNext) localsEnt
+                        localsEnt' = Map.delete curKey localsNext
+                        localsFinal = Map.insert progKey (toDyn progNext) localsEnt'
                     in (patchT t, outT t, localsFinal)
                   results = withStrategy (parListChunk 128 rseq) (map runOne ents)
                   stepRes (pAcc, outAcc, localsAcc) (pE, outE, localsE) =

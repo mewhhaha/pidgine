@@ -54,15 +54,41 @@ main = defaultMain
       , bench "spawn-10k" $ nf (length . E.entities . buildWorld) 10000
       ]
   , bgroup "system"
-      [ let w = buildWorld 10000
-        in bench "run-10k-each" $ nf (\w0 ->
-            let (w1, _, _) = S.run 0.016 w0 [] graphEach
-            in length (E.entities w1)
-          ) w
-      , let w = buildWorld 10000
-        in bench "run-10k-eachm" $ nf (\w0 ->
-            let (w1, _, _) = S.run 0.016 w0 [] graphEachM
-            in length (E.entities w1)
-          ) w
+      [ bgroup "10k"
+          [ let w = buildWorld 10000
+            in bench "each" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "eachm" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                in length (E.entities w1)
+              ) w
+          ]
+      , bgroup "50k"
+          [ let w = buildWorld 50000
+            in bench "each" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 50000
+            in bench "eachm" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                in length (E.entities w1)
+              ) w
+          ]
+      , bgroup "100k"
+          [ let w = buildWorld 100000
+            in bench "each" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 100000
+            in bench "eachm" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                in length (E.entities w1)
+              ) w
+          ]
       ]
   ]
