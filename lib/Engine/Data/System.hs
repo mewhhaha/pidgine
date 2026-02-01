@@ -75,6 +75,7 @@ import Prelude hiding ((.), id)
 
 import Control.Category (Category(..))
 import Control.Monad (ap)
+import Control.Parallel.Strategies (parListChunk, rseq, withStrategy)
 import Data.Dynamic (Dynamic, fromDynamic, toDyn)
 import Data.Kind (Type)
 import qualified Data.Map as Map
@@ -448,11 +449,15 @@ instance {-# OVERLAPPING #-} EachField (E.Not a) where
 
 eachW :: Eachable a => E.Query a -> (a -> a) -> World -> Patch
 eachW q f w =
-  E.foldq q (\e a acc -> acc <> eachPatch e (f a)) mempty w
+  let ents = E.runq q w
+      patches = withStrategy (parListChunk 128 rseq) (map (\(e, a) -> eachPatch e (f a)) ents)
+  in foldr (\p acc -> acc <> p) mempty patches
 
 eachPW :: E.Query a -> (Entity -> a -> Patch) -> World -> Patch
 eachPW q f w =
-  E.foldq q (\e a acc -> acc <> f e a) mempty w
+  let ents = E.runq q w
+      patches = withStrategy (parListChunk 128 rseq) (map (\(e, a) -> f e a) ents)
+  in foldr (\p acc -> acc <> p) mempty patches
 
 data Op msg k where
   Each :: Eachable a => E.Query a -> (a -> a) -> k -> Op msg k
@@ -583,27 +588,25 @@ runSystemM d w inbox locals0 = go mempty [] locals0
             EachP q f k -> go (patchAcc <> eachPW q f w) out locals k
             EachM key (q :: E.Query a) (f :: Entity -> a -> SystemM msg ()) k ->
               let ents = E.runq q w
-                  runEachM (pAcc, outAcc, localsAcc) (e, a) =
+                  runOne (e, a) =
                     let progKey = LocalKey key (Just e)
                         prog0 =
-                          case Map.lookup progKey localsAcc >>= fromDynamic of
+                          case Map.lookup progKey locals >>= fromDynamic of
                             Just p -> p
                             Nothing -> f e a
                         curKey = LocalKey (typeRep (Proxy @CurrentEntity)) Nothing
-                        prevCur = Map.lookup curKey localsAcc
-                        localsWithCur = Map.insert curKey (toDyn e) localsAcc
+                        localsWithCur = Map.insert curKey (toDyn e) locals
                         (t, localsNext, prog', ma) = runSystemM d w inbox localsWithCur prog0
                         progNext = case ma of
                           Nothing -> prog'
                           Just _ -> f e a
-                        locals'' = Map.insert progKey (toDyn progNext) localsNext
-                        localsFinal = case prevCur of
-                          Nothing -> Map.delete curKey locals''
-                          Just v -> Map.insert curKey v locals''
-                        pAcc' = pAcc <> patchT t
-                        outAcc' = outAcc <> outT t
-                    in (pAcc', outAcc', localsFinal)
-                  (p', out', locals') = foldl' runEachM (patchAcc, out, locals) ents
+                        localsEnt = Map.filterWithKey (\key' _ -> localEnt key' == Just e) localsNext
+                        localsFinal = Map.insert progKey (toDyn progNext) localsEnt
+                    in (patchT t, outT t, localsFinal)
+                  results = withStrategy (parListChunk 128 rseq) (map runOne ents)
+                  stepRes (pAcc, outAcc, localsAcc) (pE, outE, localsE) =
+                    (pAcc <> pE, outAcc <> outE, Map.union localsE localsAcc)
+                  (p', out', locals') = foldl' stepRes (patchAcc, out, locals) results
               in go p' out' locals' k
             Collect q k -> go patchAcc out locals (k (E.runq q w))
             Await t k ->

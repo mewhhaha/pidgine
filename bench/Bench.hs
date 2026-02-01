@@ -13,7 +13,9 @@ data Pos = Pos Double Double
 data Vel = Vel Double Double
   deriving (Eq, Show)
 
-data Move
+data MoveEach
+data MoveEachM
+data MoveLoop
 
 buildWorld :: Int -> E.World
 buildWorld n = snd (foldl' add (0 :: Int, E.empty) [1 .. n])
@@ -26,12 +28,23 @@ qPV :: E.Query (Pos, Vel)
 qPV = (,) <$> (E.comp :: E.Query Pos) <*> (E.comp :: E.Query Vel)
 
 moveSys :: S.System String
-moveSys = S.system @Move $ do
+moveSys = S.system @MoveEach $ do
   S.each qPV (\(Pos x y, Vel vx vy) -> (Pos (x + vx) (y + vy), Vel vx vy))
   pure ()
 
-graph :: S.Graph String
-graph = S.graph @String moveSys
+moveSysM :: S.System String
+moveSysM = S.system @MoveEachM $ do
+  S.eachM @MoveLoop qPV $ \e (Pos x y, Vel vx vy) -> do
+    let p = Pos (x + vx) (y + vy)
+        v = Vel vx vy
+    S.edit (S.set e p <> S.set e v)
+  pure ()
+
+graphEach :: S.Graph String
+graphEach = S.graph @String moveSys
+
+graphEachM :: S.Graph String
+graphEachM = S.graph @String moveSysM
 
 main :: IO ()
 main = defaultMain
@@ -42,8 +55,13 @@ main = defaultMain
       ]
   , bgroup "system"
       [ let w = buildWorld 10000
-        in bench "run-10k" $ nf (\w0 ->
-            let (w1, _, _) = S.run 0.016 w0 [] graph
+        in bench "run-10k-each" $ nf (\w0 ->
+            let (w1, _, _) = S.run 0.016 w0 [] graphEach
+            in length (E.entities w1)
+          ) w
+      , let w = buildWorld 10000
+        in bench "run-10k-eachm" $ nf (\w0 ->
+            let (w1, _, _) = S.run 0.016 w0 [] graphEachM
             in length (E.entities w1)
           ) w
       ]

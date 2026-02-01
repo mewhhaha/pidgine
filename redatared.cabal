@@ -28,6 +28,7 @@ library
     -- other-extensions:
     build-depends:    base ^>=4.21.0.0
                       , containers
+                      , parallel
     hs-source-dirs:   lib
     default-language: GHC2024
 
@@ -40,6 +41,7 @@ test-suite redatared-tests
                       SystemProps
     build-depends:    base ^>=4.21.0.0
                       , containers
+                      , parallel
                       , QuickCheck
                       , redatared
     default-language: GHC2024
@@ -50,6 +52,7 @@ benchmark redatared-bench
     main-is:          Bench.hs
     build-depends:    base ^>=4.21.0.0
                       , containers
+                      , parallel
                       , criterion
                       , redatared
     default-language: GHC2024
