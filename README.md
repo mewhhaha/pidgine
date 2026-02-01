@@ -17,6 +17,8 @@ Note: Some examples use `do` with Applicative only; enable `ApplicativeDo`.
 
 ## FRP: Practical examples
 
+These `Step`s can run standalone via `F.run` or inside systems via `S.step`.
+
 ### 1) A constant signal
 
 ```haskell
@@ -74,6 +76,36 @@ move1s = map (*5) (F.run (F.progress (0, 1)) [(0.5,()), (0.5,()), (0.5,())])
 gated :: [Maybe Int]
 gated = F.run (F.window (1,2) (pure 9)) [(0.5,()), (0.6,()), (0.6,())]
 -- [Nothing,Just 9,Just 9]
+
+-- First-class time: Span + Tween
+easeInOut :: Double -> Double
+easeInOut u = u*u*(3 - 2*u)
+
+lerp :: Double -> Double -> Double -> Double
+lerp a b u = a + (b - a) * u
+
+moveTween :: F.Tween Double
+moveTween = F.tween (F.Span 0 1) easeInOut (lerp 0 10)
+
+moveOut :: [Double]
+moveOut = F.run (F.sample moveTween) [(0.5,()), (0.5,()), (0.5,())]
+-- [5.0,10.0,10.0]
+
+-- Platform ping-pong tween (back and forth)
+pingPong :: Double -> Double
+pingPong x =
+  let u = x - fromIntegral (floor x :: Int)
+  in if u <= 0.5 then 2 * u else 2 * (1 - u)
+
+platformX :: F.Step () Double
+platformX =
+  let period = 2.0
+      tweenX = F.tween (F.Span 0 1) easeInOut (lerp (-3) 3)
+  in F.at tweenX . pingPong . (/ period) <$> F.time
+
+platformOut :: [Double]
+platformOut = F.run platformX [(0.5,()), (0.5,()), (0.5,()), (0.5,())]
+-- [~0.0,~3.0,~0.0,~-3.0]
 ```
 
 ### 2c) Relative timers (event-driven)
@@ -92,6 +124,24 @@ dashTime = F.run (F.since (I.press (I.Button "dash")))
 invuln :: F.Step I.Input Bool
 invuln = F.forFrom (I.press (I.Button "hit")) 1.0
 ```
+
+### 2d) Step inside System (composition)
+
+```haskell
+-- Run a Step inside a System (state is kept per-system).
+data Pos = Pos Double
+data WiggleTween
+
+wiggleSys :: S.System msg
+wiggleSys = S.system @WiggleTween $ do
+  let tweenX = F.tween (F.Span 0 1) easeInOut (lerp (-2) 2)
+  x <- S.step @WiggleTween (F.sample tweenX) ()
+  S.each (E.comp @Pos) (\_ -> Pos x)
+```
+
+Note: `S.step @Key` stores Step state under a type key. Use a unique key per independent Step.
+`S.stepE @Key` stores per‑entity Step state; `S.eachM @Key` stores per‑entity coroutine state.
+Bind `S.step`/`S.time` once per tick if you need the value multiple times.
 
 ### 3) Delay and hold
 
@@ -261,27 +311,28 @@ q = do
 ### 3) Patches as Monoid (merge systems)
 
 ```haskell
-physics :: F.Step I.Input S.Patch
+data Game
+data Physics
+data AI
+
+physics :: F.Step () S.Patch
 physics = pure (S.patch id)
 
-ai :: F.Step I.Input S.Patch
+ai :: F.Step () S.Patch
 ai = pure (S.patch id)
 
-game :: F.Step I.Input S.Patch
-game = do
-  p <- physics
-  a <- ai
-  pure (p <> a)
-
-tick :: F.DTime -> I.Input -> E.World -> (E.World, F.Step I.Input S.Patch)
-tick dt inp w =
-  let (p, game') = F.stepS game dt inp
-  in (S.apply p w, game')
+gameSys :: S.System msg
+gameSys = S.system @Game $ do
+  p <- S.step @Physics physics ()
+  a <- S.step @AI ai ()
+  S.edit (p <> a)
 ```
 
 ---
 
 ## ECS: Practical examples
+
+These examples use direct `E.spawn` calls. It keeps world building explicit and easy to reason about.
 
 ### 1) Spawn and access components
 
@@ -316,15 +367,6 @@ instance E.Bundle PlayerBundle where
 
 (p, w3) = E.spawn (PlayerBundle (Pos 0 0) (Vel 1 0)) w2
 (q, w4) = E.spawn (PlayerBundle (Pos 2 3) (Vel 0 1), Player) w3
-```
-
-You can also build a world without threading `w` manually:
-
-```haskell
-(player, w5) = E.build do
-  p <- E.spawnB (Player, Pos 0 0)
-  _ <- E.spawnB (Enemy, Pos 10 0)
-  pure p
 ```
 
 ### 2) Simple queries
@@ -518,6 +560,11 @@ and restart from the top once they return.
 For “gathered” systems, use `system`: it batches `each`/`edit`/`send` operations and
 applies them once per tick, while `await` provides gating without manual `wait`.
 Use `sysP`/`sysE` only for low‑level patch or stateful `Step` systems.
+
+For per‑entity continuations, use `eachM @Key` with `stepE @Key` inside. This gives
+each entity its own time/state machine without storing Steps in components.
+`eachM` resumes the per‑entity program; if you need fresh data mid‑run, query inside
+the program (or use `stepE` with the data as input).
 
 Graph construction is variadic: `S.graph sys1 sys2 sys3` (no list needed).
 
@@ -818,10 +865,10 @@ syncSys = S.system @Sync $ do
 ```haskell
 data Job = LoadTex String | PlaySound String
 
-jobs :: F.Step I.Input (F.Events Job)
-jobs = do
-  jump <- I.press (I.Button "jump")
-  pure (if null jump then [] else [PlaySound "jump.wav"])
+jobsSys :: S.System I.Input
+jobsSys = S.system @Jobs $ do
+  _ <- S.await (I.justPressed (I.Button "jump"))
+  S.send [PlaySound "jump.wav"]
 
 -- Runtime: drain Events Job and perform IO outside the pure core.
 ```
@@ -848,6 +895,12 @@ tween2 :: Double -> Double -> Double -> F.Step a Double
 tween2 duration from to = do
   u <- F.progress (0, duration)
   pure (from + u * (to - from))
+
+-- System form (sample a tween with system time)
+-- assume Pos component
+-- tweenSys = S.system @Tween $ do
+--   x <- S.sample (F.tween (F.Span 0 duration) id (lerp 0 target))
+--   S.each (E.comp @Pos) (\_ -> Pos x)
 ```
 
 ### 2) Animated sprites (frame selection)
@@ -866,6 +919,12 @@ sprite fps frames = do
 
 -- Example: 4 frames at 12 fps
 -- F.run (sprite 12 [0,1,2,3]) [(0.1,()), (0.1,()), (0.1,())]
+
+-- System form:
+-- spriteSys = S.system @Sprite $ do
+--   t <- S.time
+--   let i = floor (t * fps) `mod` n
+--   S.send [Frame (frames !! i)]
 ```
 
 ### 3) Collisions (AABB)
@@ -896,17 +955,14 @@ collisions w =
 ### 4) Parallelism (compose independent systems)
 
 ```haskell
-physics :: F.Step I.Input S.Patch
-physics = pure (S.patch id)
+physicsSys :: S.System msg
+physicsSys = S.system @Physics (pure ())
 
-ai :: F.Step I.Input S.Patch
-ai = pure (S.patch id)
+aiSys :: S.System msg
+aiSys = S.system @AI (pure ())
 
-game :: F.Step I.Input S.Patch
-game = do
-  p <- physics
-  a <- ai
-  pure (p <> a)
+gameGraph :: S.Graph msg
+gameGraph = S.graph physicsSys aiSys
 ```
 
 ### 5) Fixed timestep accumulator
@@ -915,6 +971,11 @@ game = do
 -- Convert variable dt to fixed 60Hz steps.
 fixed60 :: F.Step a (F.Events ())
 fixed60 = F.every (1 / 60)
+
+-- System form:
+-- fixedSys = S.system @Fixed $ do
+--   ticks <- S.step @Fixed fixed60 ()
+--   S.send (map (const Tick) ticks)
 ```
 
 ### 6) Cooldown / rate limiter
@@ -1006,12 +1067,30 @@ This pattern is explicit: each state returns `(state, events)` where events
 carry the next state. Time‑based transitions use `F.after`. The state machine
 runs continuously during gameplay; it is not a one‑time “startup” action.
 
+System form:
+
+```haskell
+data EnemyAIKey
+data EnemyLoop
+
+data EnemyQ = EnemyQ { sense :: Sense }
+  deriving (Generic, E.Queryable)
+
+enemySys :: S.System msg
+enemySys = S.system @EnemyLoop $ do
+  S.eachM @EnemyLoop (E.query @EnemyQ) $ \e q -> do
+    st <- S.stepE @EnemyAIKey e enemy (sense q)
+    S.edit (S.set e st)
+```
+
+Tip: for per‑entity time, use `S.stepE @Key e F.time ()` rather than `S.time`.
+
 ---
 
 ## Mini‑games (practical sketches)
 
 The examples below are intentionally small and practical. They show how you can
-structure a game loop using `Step`, `World`, and `Query`.
+structure a game loop using `System` (Step‑style time), `World`, and `Query`.
 
 ### 1) Pong (ECS + FRP)
 
@@ -1029,11 +1108,10 @@ data Ball = Ball deriving (Show, Eq)
 
 initWorld :: E.World
 initWorld =
-  E.exec do
-    _p1 <- E.spawnB (Paddle, Pos (-8) 0)
-    _p2 <- E.spawnB (Paddle, Pos 8 0)
-    _b  <- E.spawnB (Ball, Pos 0 0, Vel 5 2)
-    pure ()
+  let (_, w1) = E.spawn (Paddle, Pos (-8) 0) E.empty
+      (_, w2) = E.spawn (Paddle, Pos 8 0) w1
+      (_, w3) = E.spawn (Ball, Pos 0 0, Vel 5 2) w2
+  in w3
 
 data Move
 data Bounce
@@ -1207,6 +1285,14 @@ stepBullet b0 = do
   let Bullet p v = b0
       t = u * 2
   pure (if u >= 1 then Nothing else Just (Bullet (advance t p v) v))
+
+-- System form:
+-- shipSys = S.system @Ship $ do
+--   ship <- S.step @Ship (stepShip s0) ()
+--   ...
+-- bulletSys = S.system @Bullet $ do
+--   b <- S.step @Bullet (stepBullet b0) ()
+--   ...
 ```
 
 ### 7) Flappy (simple physics + threshold)
@@ -1257,6 +1343,120 @@ push d s =
           then move d p' : Prelude.filter (/= p') (boxes s)
           else boxes s
   in s { player = p', boxes = boxes' }
+```
+
+### 10) Platformer (jump + gravity)
+
+```haskell
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeApplications #-}
+
+import qualified Engine.Data.ECS as E
+import qualified Engine.Data.System as S
+import qualified Engine.Data.Input as I
+
+data Pos = Pos Double Double deriving (Eq, Show)
+data Vel = Vel Double Double deriving (Eq, Show)
+data Player = Player deriving (Eq, Show)
+data OnGround = OnGround deriving (Eq, Show)
+
+data MoveQ = MoveQ { pos :: Pos, vel :: Vel }
+  deriving (Generic, E.Queryable)
+
+data JumpQ = JumpQ { vel :: Vel, ground :: E.Has OnGround }
+  deriving (Generic, E.Queryable)
+
+data Gravity
+data Move
+data Jump
+
+gravitySys :: S.System I.Input
+gravitySys = S.system @Gravity $ do
+  dt <- S.dt
+  S.each (E.comp @Vel) $ \(Vel vx vy) ->
+    Vel vx (vy - 9.8 * dt)
+
+moveSys :: S.System I.Input
+moveSys = S.system @Move $ do
+  dt <- S.dt
+  S.eachP (E.query @MoveQ) $ \e (MoveQ (Pos x y) (Vel vx vy)) ->
+    S.set e (Pos (x + vx * dt) (y + vy * dt))
+
+jumpSys :: S.System I.Input
+jumpSys = S.system @Jump $ do
+  _ <- S.await (I.justPressed (I.Button "jump"))
+  S.eachP (E.query @JumpQ) $ \e (JumpQ (Vel vx _) _) ->
+    S.set e (Vel vx 12) <> S.del @OnGround e
+
+platGraph :: S.Graph I.Input
+platGraph = S.graph gravitySys moveSys jumpSys
+```
+
+### 11) Vampire Survivors (waves + enemy pool)
+
+```haskell
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeApplications #-}
+
+import qualified Engine.Data.ECS as E
+import qualified Engine.Data.FRP as F
+import qualified Engine.Data.System as S
+
+data Msg = SpawnEnemy | Reward deriving (Eq, Show)
+data Enemy = Enemy deriving (Eq, Show)
+data HP = HP Int deriving (Eq, Show)
+data Pos = Pos Double Double deriving (Eq, Show)
+data SpawnTick
+
+spawnTickSys :: S.System Msg
+spawnTickSys = S.system @SpawnTick $ do
+  evs <- S.step @SpawnTick (F.every 0.5) ()
+  S.send (map (const SpawnEnemy) evs)
+
+data PoolQ = PoolQ { free :: E.Not Enemy }
+  deriving (Generic, E.Queryable)
+
+spawnSys :: S.System Msg
+spawnSys = S.system @SpawnSys $ do
+  spawns <- S.await (S.Event (== SpawnEnemy))
+  pool <- S.collect (E.query @PoolQ)
+  let targets = take (length spawns) pool
+      p = foldMap (\(e, _) ->
+            S.set e Enemy <> S.set e (HP 5) <> S.set e (Pos 0 0)
+          ) targets
+  S.edit p
+```
+
+### 12) RPG (quest state + rewards)
+
+```haskell
+{-# LANGUAGE TypeApplications #-}
+
+import qualified Engine.Data.ECS as E
+import qualified Engine.Data.System as S
+
+data Msg = TalkNPC | BossDown | GiveReward deriving (Eq, Show)
+data Quest = NotStarted | InProgress | Complete deriving (Eq, Show)
+
+data QuestStart
+data QuestFinish
+
+questStartSys :: S.System Msg
+questStartSys = S.system @QuestStart $ do
+  _ <- S.await (S.Event (== TalkNPC))
+  S.each (E.comp @Quest) $ \q ->
+    case q of
+      NotStarted -> InProgress
+      _ -> q
+
+questFinishSys :: S.System Msg
+questFinishSys = S.system @QuestFinish $ do
+  _ <- S.await (S.Event (== BossDown))
+  S.each (E.comp @Quest) $ \q ->
+    case q of
+      InProgress -> Complete
+      _ -> q
+  S.send [GiveReward]
 ```
 
 ---

@@ -32,9 +32,14 @@ module Engine.Data.System
   , selfId
   , each
   , eachP
+  , eachM
   , edit
   , send
   , dt
+  , time
+  , sample
+  , step
+  , stepE
   , Await(..)
   , Awaitable
   , collect
@@ -78,6 +83,7 @@ import GHC.Generics
 import Data.Proxy (Proxy(..))
 import Engine.Data.ECS (Entity, World)
 import Engine.Data.FRP (DTime, Events, Step(..))
+import qualified Engine.Data.FRP as F
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.Input as I
 
@@ -135,6 +141,12 @@ type GroupId = TypeRep
 
 type Done = Set.Set SystemId
 type Seen = Set.Set SystemId
+data LocalKey = LocalKey
+  { localType :: TypeRep
+  , localEnt :: Maybe Entity
+  } deriving (Eq, Ord, Show)
+
+type Locals = Map.Map LocalKey Dynamic
 
 class Typeable tag => Tags tag where
   tagsOf :: Proxy tag -> Set.Set SystemId
@@ -369,10 +381,10 @@ sysM m =
       extras = Set.delete sid (tagsOf (Proxy @tag))
   in Sys sid extras Set.empty go
   where
-    go = stepLoop m
+    go = stepLoop Map.empty m
 
-    stepLoop prog = Step $ \d (w, inbox) ->
-      let (t0, prog', ma) = runSystemM d w inbox prog
+    stepLoop locals prog = Step $ \d (w, inbox) ->
+      let (t0, locals', prog', ma) = runSystemM d w inbox locals prog
           out' = outT t0 <> maybe [] retEvents ma
           t1 = t0 { outT = out' }
           t2 = case ma of
@@ -381,7 +393,7 @@ sysM m =
           nextProg = case ma of
             Nothing -> prog'
             Just _ -> m
-      in (t2, stepLoop nextProg)
+      in (t2, stepLoop locals' nextProg)
 
 system :: forall tag msg a. (Tags tag, Return msg a, Typeable a) => SystemM msg a -> SystemV msg a
 system = sysM @tag
@@ -444,9 +456,11 @@ eachPW q f w =
 data Op msg k where
   Each :: Eachable a => E.Query a -> (a -> a) -> k -> Op msg k
   EachP :: E.Query a -> (Entity -> a -> Patch) -> k -> Op msg k
+  EachM :: Typeable msg => TypeRep -> E.Query a -> (Entity -> a -> SystemM msg ()) -> k -> Op msg k
   Edit :: Patch -> k -> Op msg k
   Send :: Events msg -> k -> Op msg k
   Dt :: (DTime -> k) -> Op msg k
+  Local :: Typeable s => LocalKey -> s -> (s -> (a, s)) -> (a -> k) -> Op msg k
   Collect :: E.Query a -> ([(Entity, a)] -> k) -> Op msg k
   Await :: Awaitable t msg => t -> (AwaitResult t msg -> k) -> Op msg k
 
@@ -455,9 +469,11 @@ mapOp f op =
   case op of
     Each q g k -> Each q g (f k)
     EachP q g k -> EachP q g (f k)
+    EachM key q g k -> EachM key q g (f k)
     Edit p k -> Edit p (f k)
     Send out k -> Send out (f k)
     Dt k -> Dt (f . k)
+    Local key def g k -> Local key def g (f . k)
     Collect q k -> Collect q (f . k)
     Await t k -> Await t (f . k)
 
@@ -486,19 +502,49 @@ send out = Free (Send out (Pure ()))
 dt :: SystemM msg DTime
 dt = Free (Dt Pure)
 
+localState :: forall key s msg a. (Typeable key, Typeable s) => s -> (s -> (a, s)) -> SystemM msg a
+localState s0 f =
+  let key = LocalKey (typeRep (Proxy @key)) Nothing
+  in Free (Local key s0 f Pure)
+
+localStateE :: forall key s msg a. (Typeable key, Typeable s) => Entity -> s -> (s -> (a, s)) -> SystemM msg a
+localStateE e s0 f =
+  let key = LocalKey (typeRep (Proxy @key)) (Just e)
+  in Free (Local key s0 f Pure)
+
+data TimeKey
+
+time :: SystemM msg F.Time
+time = step @TimeKey F.time ()
+
+sample :: F.Tween a -> SystemM msg a
+sample tw = do
+  t <- time
+  pure (F.at tw t)
+
+step :: forall key a b msg. (Typeable key, Typeable a, Typeable b) => F.Step a b -> a -> SystemM msg b
+step s0 a = do
+  d <- dt
+  localState @key s0 (\s -> stepS s d a)
+
+stepE :: forall key a b msg. (Typeable key, Typeable a, Typeable b) => Entity -> F.Step a b -> a -> SystemM msg b
+stepE e s0 a = do
+  d <- dt
+  localStateE @key e s0 (\s -> stepS s d a)
+
 each :: Eachable a => E.Query a -> (a -> a) -> SystemM msg ()
 each q f = Free (Each q f (Pure ()))
 
 eachP :: E.Query a -> (Entity -> a -> Patch) -> SystemM msg ()
 eachP q f = Free (EachP q f (Pure ()))
 
+eachM :: forall key a msg. (Typeable key, Typeable msg) => E.Query a -> (Entity -> a -> SystemM msg ()) -> SystemM msg ()
+eachM q f = Free (EachM (typeRep (Proxy @key)) q f (Pure ()))
+
 class Return msg a where
   retEvents :: a -> Events msg
 
 instance {-# OVERLAPPABLE #-} Return msg a where
-  retEvents _ = []
-
-instance {-# OVERLAPPING #-} Return msg () where
   retEvents _ = []
 
 instance {-# OVERLAPPING #-} Return msg msg where
@@ -507,20 +553,45 @@ instance {-# OVERLAPPING #-} Return msg msg where
 instance {-# OVERLAPPING #-} Return msg (Events msg) where
   retEvents = id
 
-runSystemM :: DTime -> World -> Inbox msg -> SystemM msg a -> (Tick msg, SystemM msg a, Maybe a)
-runSystemM d w inbox = go mempty []
+runSystemM :: DTime -> World -> Inbox msg -> Locals -> SystemM msg a -> (Tick msg, Locals, SystemM msg a, Maybe a)
+runSystemM d w inbox locals0 = go mempty [] locals0
   where
-    go patchAcc out prog =
+    go patchAcc out locals prog =
       case prog of
-        Pure a -> (Tick patchAcc out False Nothing, Pure a, Just a)
+        Pure a -> (Tick patchAcc out False Nothing, locals, Pure a, Just a)
         Free op ->
           case op of
-            Edit p k -> go (patchAcc <> p) out k
-            Send out' k -> go patchAcc (out <> out') k
-            Dt k -> go patchAcc out (k d)
-            Each q f k -> go (patchAcc <> eachW q f w) out k
-            EachP q f k -> go (patchAcc <> eachPW q f w) out k
-            Collect q k -> go patchAcc out (k (E.runq q w))
+            Edit p k -> go (patchAcc <> p) out locals k
+            Send out' k -> go patchAcc (out <> out') locals k
+            Dt k -> go patchAcc out locals (k d)
+            Local key def f k ->
+              let s = case Map.lookup key locals >>= fromDynamic of
+                    Just v -> v
+                    Nothing -> def
+                  (a, s') = f s
+                  locals' = Map.insert key (toDyn s') locals
+              in go patchAcc out locals' (k a)
+            Each q f k -> go (patchAcc <> eachW q f w) out locals k
+            EachP q f k -> go (patchAcc <> eachPW q f w) out locals k
+            EachM key (q :: E.Query a) (f :: Entity -> a -> SystemM msg ()) k ->
+              let ents = E.runq q w
+                  runEachM (pAcc, outAcc, localsAcc) (e, a) =
+                    let progKey = LocalKey key (Just e)
+                        prog0 =
+                          case Map.lookup progKey localsAcc >>= fromDynamic of
+                            Just p -> p
+                            Nothing -> f e a
+                        (t, localsNext, prog', ma) = runSystemM d w inbox localsAcc prog0
+                        progNext = case ma of
+                          Nothing -> prog'
+                          Just _ -> f e a
+                        locals'' = Map.insert progKey (toDyn progNext) localsNext
+                        pAcc' = pAcc <> patchT t
+                        outAcc' = outAcc <> outT t
+                    in (pAcc', outAcc', locals'')
+                  (p', out', locals') = foldl' runEachM (patchAcc, out, locals) ents
+              in go p' out' locals' k
+            Collect q k -> go patchAcc out locals (k (E.runq q w))
             Await t k ->
               let (ma, gate) = awaitGateA t inbox
                   baseTick = Tick patchAcc out False Nothing
@@ -528,8 +599,9 @@ runSystemM d w inbox = go mempty []
                 Nothing ->
                   let t0 = gate baseTick
                       t1 = t0 { waitT = True }
-                  in (t1, Free (Await t k), Nothing)
-                Just a -> go patchAcc out (k a)
+                  in (t1, locals, Free (Await t k), Nothing)
+                Just a -> go patchAcc out locals (k a)
+
 
 run :: DTime -> World -> Events a -> Graph a -> (World, Events a, Graph a)
 run d w0 inbox g0 = go w0 (Graph systems0) (repeat True) Set.empty Set.empty Map.empty []

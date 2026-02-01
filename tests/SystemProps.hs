@@ -3,17 +3,24 @@
 module SystemProps
   ( system_resume_once
   , system_await_value
+  , system_eachm_entity_state
   , prop_system_resume
   , prop_system_await_value
   ) where
 
 import Data.List (foldl')
 import qualified Engine.Data.ECS as E
+import qualified Engine.Data.FRP as F
 import qualified Engine.Data.System as S
 
 data WaitGo
 data Speed
 data Use
+data CountLoop
+data CountStep
+
+newtype Count = Count Int
+  deriving (Eq, Show)
 
 system_resume_once :: Bool
 system_resume_once =
@@ -48,6 +55,28 @@ system_await_value =
       g0 = S.graph @String useSys speedSys
       (w1, _, _) = S.run 0.1 w0 [] g0
   in E.get @Int e w1 == Just 3
+
+countStep :: F.Step (F.Events (Int -> Int)) Int
+countStep = F.acc 0
+
+countSys :: S.System ()
+countSys = S.system @CountLoop $ do
+  S.eachM @CountLoop (E.comp @Count) $ \e _ -> do
+    n <- S.stepE @CountStep e countStep [(+1)]
+    S.edit (S.set e (Count n))
+
+system_eachm_entity_state :: Bool
+system_eachm_entity_state =
+  let (e1, w1) = E.spawn (Count 0) E.empty
+      (e2, w2) = E.spawn (Count 0) w1
+      g0 :: S.Graph ()
+      g0 = S.graph @() countSys
+      (w3, _, g1) = S.run 0.1 w2 [] g0
+      (w4, _, _) = S.run 0.1 w3 [] g1
+  in E.get @Count e1 w3 == Just (Count 1)
+      && E.get @Count e2 w3 == Just (Count 1)
+      && E.get @Count e1 w4 == Just (Count 2)
+      && E.get @Count e2 w4 == Just (Count 2)
 
 data Phase = Start | Wait
   deriving (Eq, Show)

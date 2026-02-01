@@ -3,6 +3,8 @@ module Engine.Data.FRP
   , DTime
   , Step(..)
   , id
+  , Span(..)
+  , Tween(..)
   , Signal
   , Events
   , run
@@ -12,15 +14,21 @@ module Engine.Data.FRP
   , after
   , every
   , during
+  , duringSpan
   , within
   , range
+  , rangeSpan
   , window
+  , windowSpan
   , for
   , progress
+  , progressSpan
   , since
   , forFrom
   , progressFrom
   , afterFrom
+  , tween
+  , sample
   , delay
   , hold
   , acc
@@ -38,6 +46,28 @@ import Control.Category (Category(..))
 
 type Time = Double
 type DTime = Double
+
+data Span = Span
+  { start :: Time
+  , end :: Time
+  } deriving (Eq, Show)
+
+newtype Tween a = Tween
+  { at :: Time -> a
+  }
+
+instance Functor Tween where
+  fmap f (Tween g) = Tween (f . g)
+
+instance Applicative Tween where
+  pure x = Tween (\_ -> x)
+  Tween f <*> Tween g = Tween (\t -> f t (g t))
+
+instance Monad Tween where
+  Tween g >>= k = Tween (\t ->
+    let Tween h = k (g t)
+    in h t
+    )
 
 newtype Step a b = Step
   { stepS :: DTime -> a -> (b, Step a b)
@@ -89,21 +119,28 @@ every t =
       in (replicate n (), go carry')
 
 during :: (Time, Time) -> Step a Bool
-during (t0, t1) = fmap (\t -> t >= t0 && t < t1) time
+during (t0, t1) = duringSpan (Span t0 t1)
+
+duringSpan :: Span -> Step a Bool
+duringSpan sp = fmap (\t -> inSpan sp t) time
 
 within :: (Time, Time) -> Step a (Events b) -> Step a (Events b)
 within rng evs = gate . ((,) <$> during rng <*> evs)
 
 range :: (Time, Time) -> Step a (Maybe Double)
-range (t0, t1) = fmap toRange time
-  where
-    toRange t
-      | t1 <= t0 = Nothing
-      | t < t0 || t >= t1 = Nothing
-      | otherwise = Just ((t - t0) / (t1 - t0))
+range (t0, t1) = fmap (rangeSpan (Span t0 t1)) time
+
+rangeSpan :: Span -> Time -> Maybe Double
+rangeSpan (Span t0 t1) t
+  | t1 <= t0 = Nothing
+  | t < t0 || t >= t1 = Nothing
+  | otherwise = Just ((t - t0) / (t1 - t0))
 
 window :: (Time, Time) -> Step a b -> Step a (Maybe b)
-window rng s0 = go (during rng) s0
+window rng s0 = windowSpan (Span (fst rng) (snd rng)) s0
+
+windowSpan :: Span -> Step a b -> Step a (Maybe b)
+windowSpan sp s0 = go (duringSpan sp) s0
   where
     go okS s = Step $ \d a ->
       let (ok, okS') = stepS okS d a
@@ -116,13 +153,22 @@ for :: Time -> Step a b -> Step a (Maybe b)
 for t = window (0, t)
 
 progress :: (Time, Time) -> Step a Double
-progress (t0, t1) = fmap toProg time
-  where
-    toProg t
-      | t1 <= t0 = 0
-      | t <= t0 = 0
-      | t >= t1 = 1
-      | otherwise = (t - t0) / (t1 - t0)
+progress (t0, t1) = fmap (progressSpan (Span t0 t1)) time
+
+progressSpan :: Span -> Time -> Double
+progressSpan (Span t0 t1) t
+  | t1 <= t0 = 0
+  | t <= t0 = 0
+  | t >= t1 = 1
+  | otherwise = (t - t0) / (t1 - t0)
+
+tween :: Span -> (Double -> Double) -> (Double -> a) -> Tween a
+tween sp ease f = Tween $ \t ->
+  let u = progressSpan sp t
+  in f (ease u)
+
+sample :: Tween a -> Step b a
+sample (Tween f) = fmap f time
 
 since :: Step a (Events ()) -> Step a Double
 since start = go 0 start
@@ -152,6 +198,9 @@ afterFrom start t = go 0 start
           elapsed' = if null evs then elapsed + realToFrac d else 0
           out = if elapsed' >= t && null evs then [()] else []
       in (out, go elapsed' s')
+
+inSpan :: Span -> Time -> Bool
+inSpan (Span t0 t1) t = t >= t0 && t < t1
 
 delay :: b -> Step b b
 delay b0 = Step $ \_ b -> (b0, delay b)

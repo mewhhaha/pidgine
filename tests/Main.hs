@@ -72,12 +72,16 @@ main = do
 
   assert "system resume" system_resume_once
   assert "system await value" system_await_value
+  assert "eachM per-entity" system_eachm_entity_state
 
   results <-
     sequence
       [ quickCheckResult prop_edge
       , quickCheckResult prop_once
       , quickCheckResult prop_app
+      , quickCheckResult prop_span_range
+      , quickCheckResult prop_span_progress
+      , quickCheckResult prop_tween_progress
       , quickCheckResult prop_spawn_get
       , quickCheckResult prop_set_get
       , quickCheckResult prop_query_superset
