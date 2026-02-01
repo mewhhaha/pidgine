@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -31,8 +32,8 @@ module Engine.Data.System
   , allIds
   , selfId
   , each
-  , eachP
   , eachM
+  , eachP
   , edit
   , send
   , dt
@@ -457,6 +458,7 @@ data Op msg k where
   Each :: Eachable a => E.Query a -> (a -> a) -> k -> Op msg k
   EachP :: E.Query a -> (Entity -> a -> Patch) -> k -> Op msg k
   EachM :: Typeable msg => TypeRep -> E.Query a -> (Entity -> a -> SystemM msg ()) -> k -> Op msg k
+  StepOp :: (Typeable a, Typeable b) => TypeRep -> F.Step a b -> a -> (b -> k) -> Op msg k
   Edit :: Patch -> k -> Op msg k
   Send :: Events msg -> k -> Op msg k
   Dt :: (DTime -> k) -> Op msg k
@@ -470,6 +472,7 @@ mapOp f op =
     Each q g k -> Each q g (f k)
     EachP q g k -> EachP q g (f k)
     EachM key q g k -> EachM key q g (f k)
+    StepOp key s a k -> StepOp key s a (f . k)
     Edit p k -> Edit p (f k)
     Send out k -> Send out (f k)
     Dt k -> Dt (f . k)
@@ -502,17 +505,14 @@ send out = Free (Send out (Pure ()))
 dt :: SystemM msg DTime
 dt = Free (Dt Pure)
 
-localState :: forall key s msg a. (Typeable key, Typeable s) => s -> (s -> (a, s)) -> SystemM msg a
-localState s0 f =
-  let key = LocalKey (typeRep (Proxy @key)) Nothing
-  in Free (Local key s0 f Pure)
-
 localStateE :: forall key s msg a. (Typeable key, Typeable s) => Entity -> s -> (s -> (a, s)) -> SystemM msg a
 localStateE e s0 f =
   let key = LocalKey (typeRep (Proxy @key)) (Just e)
   in Free (Local key s0 f Pure)
 
 data TimeKey
+data CurrentEntity
+data Program (key :: Type)
 
 time :: SystemM msg F.Time
 time = step @TimeKey F.time ()
@@ -523,9 +523,7 @@ sample tw = do
   pure (F.at tw t)
 
 step :: forall key a b msg. (Typeable key, Typeable a, Typeable b) => F.Step a b -> a -> SystemM msg b
-step s0 a = do
-  d <- dt
-  localState @key s0 (\s -> stepS s d a)
+step s0 a = Free (StepOp (typeRep (Proxy @key)) s0 a Pure)
 
 stepE :: forall key a b msg. (Typeable key, Typeable a, Typeable b) => Entity -> F.Step a b -> a -> SystemM msg b
 stepE e s0 a = do
@@ -535,11 +533,11 @@ stepE e s0 a = do
 each :: Eachable a => E.Query a -> (a -> a) -> SystemM msg ()
 each q f = Free (Each q f (Pure ()))
 
+eachM :: forall (key :: Type) msg a. (Typeable key, Typeable msg) => E.Query a -> (Entity -> a -> SystemM msg ()) -> SystemM msg ()
+eachM q f = Free (EachM (typeRep (Proxy @(Program key))) q f (Pure ()))
+
 eachP :: E.Query a -> (Entity -> a -> Patch) -> SystemM msg ()
 eachP q f = Free (EachP q f (Pure ()))
-
-eachM :: forall key a msg. (Typeable key, Typeable msg) => E.Query a -> (Entity -> a -> SystemM msg ()) -> SystemM msg ()
-eachM q f = Free (EachM (typeRep (Proxy @key)) q f (Pure ()))
 
 class Return msg a where
   retEvents :: a -> Events msg
@@ -571,6 +569,16 @@ runSystemM d w inbox locals0 = go mempty [] locals0
                   (a, s') = f s
                   locals' = Map.insert key (toDyn s') locals
               in go patchAcc out locals' (k a)
+            StepOp keyRep s0 a k ->
+              let currentKey = LocalKey (typeRep (Proxy @CurrentEntity)) Nothing
+                  curEnt = Map.lookup currentKey locals >>= fromDynamic :: Maybe Entity
+                  stepKey = LocalKey keyRep curEnt
+                  s = case Map.lookup stepKey locals >>= fromDynamic of
+                        Just v -> v
+                        Nothing -> s0
+                  (b, s') = stepS s d a
+                  locals' = Map.insert stepKey (toDyn s') locals
+              in go patchAcc out locals' (k b)
             Each q f k -> go (patchAcc <> eachW q f w) out locals k
             EachP q f k -> go (patchAcc <> eachPW q f w) out locals k
             EachM key (q :: E.Query a) (f :: Entity -> a -> SystemM msg ()) k ->
@@ -581,14 +589,20 @@ runSystemM d w inbox locals0 = go mempty [] locals0
                           case Map.lookup progKey localsAcc >>= fromDynamic of
                             Just p -> p
                             Nothing -> f e a
-                        (t, localsNext, prog', ma) = runSystemM d w inbox localsAcc prog0
+                        curKey = LocalKey (typeRep (Proxy @CurrentEntity)) Nothing
+                        prevCur = Map.lookup curKey localsAcc
+                        localsWithCur = Map.insert curKey (toDyn e) localsAcc
+                        (t, localsNext, prog', ma) = runSystemM d w inbox localsWithCur prog0
                         progNext = case ma of
                           Nothing -> prog'
                           Just _ -> f e a
                         locals'' = Map.insert progKey (toDyn progNext) localsNext
+                        localsFinal = case prevCur of
+                          Nothing -> Map.delete curKey locals''
+                          Just v -> Map.insert curKey v locals''
                         pAcc' = pAcc <> patchT t
                         outAcc' = outAcc <> outT t
-                    in (pAcc', outAcc', locals'')
+                    in (pAcc', outAcc', localsFinal)
                   (p', out', locals') = foldl' runEachM (patchAcc, out, locals) ents
               in go p' out' locals' k
             Collect q k -> go patchAcc out locals (k (E.runq q w))

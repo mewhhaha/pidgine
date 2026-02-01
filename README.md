@@ -140,7 +140,7 @@ wiggleSys = S.system @WiggleTween $ do
 ```
 
 Note: `S.step @Key` stores Step state under a type key. Use a unique key per independent Step.
-`S.stepE @Key` stores per‑entity Step state; `S.eachM @Key` stores per‑entity coroutine state.
+Inside `eachM @Key`, `S.step @Key` becomes per‑entity automatically.
 Bind `S.step`/`S.time` once per tick if you need the value multiple times.
 
 ### 3) Delay and hold
@@ -561,10 +561,10 @@ For “gathered” systems, use `system`: it batches `each`/`edit`/`send` operat
 applies them once per tick, while `await` provides gating without manual `wait`.
 Use `sysP`/`sysE` only for low‑level patch or stateful `Step` systems.
 
-For per‑entity continuations, use `eachM @Key` with `stepE @Key` inside. This gives
-each entity its own time/state machine without storing Steps in components.
-`eachM` resumes the per‑entity program; if you need fresh data mid‑run, query inside
-the program (or use `stepE` with the data as input).
+For per‑entity continuations, use `eachM @Key` with a monadic body. This gives each
+entity its own time/state machine without storing Steps in components.
+`eachM @Key` resumes the per‑entity program; if you need fresh data mid‑run, query inside
+the program (or pass it into `step`).
 
 Graph construction is variadic: `S.graph sys1 sys2 sys3` (no list needed).
 
@@ -1079,11 +1079,11 @@ data EnemyQ = EnemyQ { sense :: Sense }
 enemySys :: S.System msg
 enemySys = S.system @EnemyLoop $ do
   S.eachM @EnemyLoop (E.query @EnemyQ) $ \e q -> do
-    st <- S.stepE @EnemyAIKey e enemy (sense q)
+    st <- S.step @EnemyAIKey enemy (sense q)
     S.edit (S.set e st)
 ```
 
-Tip: for per‑entity time, use `S.stepE @Key e F.time ()` rather than `S.time`.
+Tip: for per‑entity time, use `S.step @Key F.time ()` inside `eachM @Key`.
 
 ---
 

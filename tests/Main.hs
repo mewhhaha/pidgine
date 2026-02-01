@@ -72,7 +72,7 @@ main = do
 
   assert "system resume" system_resume_once
   assert "system await value" system_await_value
-  assert "eachM per-entity" system_eachm_entity_state
+  assert "each per-entity" system_eachm_entity_state
 
   results <-
     sequence

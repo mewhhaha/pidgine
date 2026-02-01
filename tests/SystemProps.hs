@@ -62,7 +62,7 @@ countStep = F.acc 0
 countSys :: S.System ()
 countSys = S.system @CountLoop $ do
   S.eachM @CountLoop (E.comp @Count) $ \e _ -> do
-    n <- S.stepE @CountStep e countStep [(+1)]
+    n <- S.step @CountStep countStep [(+1)]
     S.edit (S.set e (Count n))
 
 system_eachm_entity_state :: Bool
