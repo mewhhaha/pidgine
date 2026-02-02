@@ -10,6 +10,31 @@ import qualified Engine.Data.FRP as F
 import System.Exit (exitFailure)
 import Test.QuickCheck (isSuccess, quickCheckResult)
 
+data C
+  = CInt Int
+  | CString String
+  | CBool Bool
+
+instance E.Component C Int where
+  inj = CInt
+  prj c = case c of
+    CInt v -> Just v
+    _ -> Nothing
+
+instance E.Component C String where
+  inj = CString
+  prj c = case c of
+    CString v -> Just v
+    _ -> Nothing
+
+instance E.Component C Bool where
+  inj = CBool
+  prj c = case c of
+    CBool v -> Just v
+    _ -> Nothing
+
+type World = E.World C
+
 assert :: String -> Bool -> IO ()
 assert name cond =
   if cond
@@ -59,14 +84,14 @@ main = do
   let sOut = F.run (F.since (F.after 0.2)) [(0.1,()), (0.1,()), (0.1,())]
   assert "since" (approxList sOut [0.1, 0.0, 0.1])
 
-  let w0 = E.empty
-      (e1, w1) = E.spawn ((10 :: Int), ("hi" :: String)) w0
+  let w0 = E.emptyWorld
+      (e1, w1) = E.spawn ((10 :: Int), ("hi" :: String)) (w0 :: World)
   assert "get" (E.get e1 w1 == Just (10 :: Int))
 
   let w2 = E.set e1 True w1
   assert "has" (E.has @Bool e1 w2)
 
-  let q = (E.comp :: E.Query Int)
+  let q = (E.comp :: E.Query C Int)
       qOut = E.runq q w2
   assert "query" (qOut == [(e1, 10)])
 

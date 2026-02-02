@@ -174,43 +174,43 @@ newtype Global = Global Mat4
 identityLocal :: Local
 identityLocal = Local identity
 
-attach :: Entity -> Entity -> World -> World
+attach :: Entity -> Entity -> World c -> World c
 attach p c w =
   let w1 = detach c w
   in E.relate @ParentOf p c w1
 
-detach :: Entity -> World -> World
+detach :: Entity -> World c -> World c
 detach c w =
   case parent c w of
     Nothing -> w
     Just p -> E.unrelate @ParentOf p c w
 
-parent :: Entity -> World -> Maybe Entity
+parent :: Entity -> World c -> Maybe Entity
 parent e w =
   case E.inn @ParentOf e w of
     [] -> Nothing
     (p : _) -> Just p
 
-children :: Entity -> World -> [Entity]
+children :: Entity -> World c -> [Entity]
 children = E.out @ParentOf
 
-propagate :: World -> World
+propagate :: (E.Component c Local, E.Component c Global) => World c -> World c
 propagate w0 =
   let roots = Prelude.filter (\e -> parent e w0 == Nothing) (E.entities w0)
   in foldl' (propRoot w0) w0 roots
 
-propRoot :: World -> World -> Entity -> World
+propRoot :: (E.Component c Local, E.Component c Global) => World c -> World c -> Entity -> World c
 propRoot w0 w e =
   let l = localOrIdentity w0 e
       g = toGlobal l
       w1 = E.set e g w
   in propChildren w0 w1 (IntSet.singleton (E.eid e)) e g
 
-propChildren :: World -> World -> IntSet -> Entity -> Global -> World
+propChildren :: (E.Component c Local, E.Component c Global) => World c -> World c -> IntSet -> Entity -> Global -> World c
 propChildren w0 w visited p gp =
   foldl' (propChild w0 visited gp) w (children p w0)
 
-propChild :: World -> IntSet -> Global -> World -> Entity -> World
+propChild :: (E.Component c Local, E.Component c Global) => World c -> IntSet -> Global -> World c -> Entity -> World c
 propChild w0 visited gp w e =
   if IntSet.member (E.eid e) visited
     then w
@@ -221,7 +221,7 @@ propChild w0 visited gp w e =
           visited' = IntSet.insert (E.eid e) visited
       in propChildren w0 w1 visited' e g
 
-localOrIdentity :: World -> Entity -> Local
+localOrIdentity :: E.Component c Local => World c -> Entity -> Local
 localOrIdentity w e =
   case E.get @Local e w of
     Just l -> l

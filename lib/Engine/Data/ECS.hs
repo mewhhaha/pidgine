@@ -1,474 +1,410 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 module Engine.Data.ECS
-  ( Entity
-  , eid
-  , Component
-  , component
+  ( Entity(..)
   , World
-  , empty
+  , Bag
+  , emptyWorld
+  , entities
+  , foldEntities
+  , mapEntities
+  , setEntities
   , spawn
-  , Bundle(..)
   , kill
+  , Component(..)
+  , Bundle(..)
+  , Has(..)
+  , Not(..)
+  , has
   , get
   , set
   , del
-  , has
-  , entities
-  , put
-  , getr
-  , tag
-  , untag
-  , hastag
-  , Query
+  , Query(..)
   , comp
   , opt
+  , hasQ
+  , notQ
   , runq
   , foldq
+  , filterQ
   , Queryable(..)
   , QueryableSum(..)
-  , Has(..)
-  , Not(..)
-  , hasQ
-  , notHasQ
-  , mapMaybeQ
-  , filterQ
-  , Out(..)
-  , In(..)
+  , query
+  , querySum
+  , TypeId
+  , typeIdOf
+  , put
+  , getr
   , relate
   , unrelate
   , out
   , inn
-  , Build(..)
-  , build
-  , exec
-  , spawnB
   ) where
 
-import Prelude
-
-import qualified Control.Applicative as A
-import Data.Dynamic (Dynamic, fromDynamic, toDyn)
-import Data.IntMap (IntMap)
+import Control.Applicative (Alternative(..))
+import Data.Bits (xor)
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
-import Data.Map (Map)
-import Data.Kind (Type)
-import Data.Proxy (Proxy(..))
-import Data.Typeable (TypeRep, Typeable, typeOf, typeRep)
-import GHC.Generics
-import GHC.TypeLits (ErrorMessage(..), TypeError)
-import qualified Data.IntMap as IntMap
 import qualified Data.IntSet as IntSet
-import qualified Data.Map as Map
-import qualified Data.Set as Set
+import Data.Maybe (isJust, isNothing)
+import Data.Proxy (Proxy(..))
+import Data.Typeable (Typeable, typeRep, typeRepFingerprint)
+import GHC.Exts (Any)
+import GHC.Fingerprint (Fingerprint(..))
+import GHC.Generics
+import Unsafe.Coerce (unsafeCoerce)
 
-newtype Entity = Entity { eid :: Int }
-  deriving (Eq, Ord, Show)
+newtype Entity = Entity
+  { eid :: Int
+  } deriving (Eq, Ord, Show)
 
-data Component = forall c. Typeable c => Component c
+type TypeId = Int
 
-component :: Typeable c => c -> Component
-component = Component
+typeIdOf :: forall a. Typeable a => TypeId
+typeIdOf =
+  let Fingerprint w1 w2 = typeRepFingerprint (typeRep (Proxy @a))
+  in fromIntegral (w1 `xor` w2)
 
-class Bundle a where
-  bundle :: a -> [Component]
+type Bag c = [c]
 
-instance {-# OVERLAPPABLE #-} Typeable a => Bundle a where
-  bundle a = [component a]
+type EntityRow c = (Int, Bag c)
 
-instance Bundle Component where
-  bundle c = [c]
-
-instance {-# OVERLAPPING #-} Bundle () where
-  bundle () = []
-
-instance Bundle [Component] where
-  bundle = id
-
-instance {-# OVERLAPPING #-} (Bundle a, Bundle b) => Bundle (a, b) where
-  bundle (a, b) = bundle a ++ bundle b
-
-instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c) => Bundle (a, b, c) where
-  bundle (a, b, c) = bundle a ++ bundle b ++ bundle c
-
-instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d) => Bundle (a, b, c, d) where
-  bundle (a, b, c, d) = bundle a ++ bundle b ++ bundle c ++ bundle d
-
-instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e)
-  => Bundle (a, b, c, d, e) where
-  bundle (a, b, c, d, e) = bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e
-
-instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e, Bundle f)
-  => Bundle (a, b, c, d, e, f) where
-  bundle (a, b, c, d, e, f) =
-    bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e ++ bundle f
-
-instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e, Bundle f, Bundle g)
-  => Bundle (a, b, c, d, e, f, g) where
-  bundle (a, b, c, d, e, f, g) =
-    bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e ++ bundle f ++ bundle g
-
-instance {-# OVERLAPPING #-} (Bundle a, Bundle b, Bundle c, Bundle d, Bundle e, Bundle f, Bundle g, Bundle h)
-  => Bundle (a, b, c, d, e, f, g, h) where
-  bundle (a, b, c, d, e, f, g, h) =
-    bundle a ++ bundle b ++ bundle c ++ bundle d ++ bundle e ++ bundle f ++ bundle g ++ bundle h
-
-newtype Build a = Build { runBuild :: World -> (a, World) }
-
-instance Functor Build where
-  fmap f (Build g) = Build $ \w ->
-    let (a, w') = g w
-    in (f a, w')
-
-instance Applicative Build where
-  pure a = Build $ \w -> (a, w)
-  Build f <*> Build a = Build $ \w ->
-    let (f', w1) = f w
-        (a', w2) = a w1
-    in (f' a', w2)
-
-instance Monad Build where
-  Build a >>= f = Build $ \w ->
-    let (a', w1) = a w
-        Build b = f a'
-    in b w1
-
-build :: Build a -> (a, World)
-build b = runBuild b empty
-
-exec :: Build a -> World
-exec = snd . build
-
-spawnB :: Bundle a => a -> Build Entity
-spawnB cs = Build $ \w -> spawn cs w
-
-data World = World
-  { next :: Int
-  , ents :: IntSet
-  , comps :: Map TypeRep (IntMap Dynamic)
-  , tags :: Map String IntSet
-  , res :: Map TypeRep Dynamic
+data World c = World
+  { nextIdW :: !Int
+  , entitiesW :: ![EntityRow c]
+  , resourcesW :: !(IntMap Any)
+  , relOutW :: !(IntMap (IntMap IntSet))
+  , relInW :: !(IntMap (IntMap IntSet))
   }
 
-empty :: World
-empty = World
-  { next = 0
-  , ents = IntSet.empty
-  , comps = Map.empty
-  , tags = Map.empty
-  , res = Map.empty
-  }
+emptyWorld :: World c
+emptyWorld =
+  World
+    { nextIdW = 0
+    , entitiesW = []
+    , resourcesW = IntMap.empty
+    , relOutW = IntMap.empty
+    , relInW = IntMap.empty
+    }
 
-spawn :: Bundle a => a -> World -> (Entity, World)
-spawn cs w =
-  let ent = Entity (next w)
-      w1 = w { next = next w + 1, ents = IntSet.insert (eid ent) (ents w) }
-      comps' = foldl' (insertComp ent) (comps w1) (bundle cs)
-  in (ent, w1 { comps = comps' })
+entities :: World c -> [Entity]
+entities = map (Entity . rowId) . entitiesW
 
-kill :: Entity -> World -> World
-kill ent w =
-  let eid' = eid ent
-      comps' = Map.mapMaybe (dropEnt eid') (comps w)
-      tags' = Map.mapMaybe (dropTag eid') (tags w)
-  in w
-      { ents = IntSet.delete eid' (ents w)
-      , comps = comps'
-      , tags = tags'
-      }
+foldEntities :: (Entity -> Bag c -> s -> s) -> s -> World c -> s
+foldEntities f s0 w =
+  foldl'
+    (\acc (eid', bag) -> f (Entity eid') bag acc)
+    s0
+    (entitiesW w)
 
-get :: forall c. Typeable c => Entity -> World -> Maybe c
-get ent w =
-  case Map.lookup (typeRep (Proxy :: Proxy c)) (comps w) of
+mapEntities :: (Entity -> Bag c -> (Bag c)) -> World c -> World c
+mapEntities f w =
+  w
+    { entitiesW = map
+        (\(eid', bag) ->
+          let bag' = f (Entity eid') bag
+          in (eid', bag')
+        )
+        (entitiesW w)
+    }
+
+setEntities :: [(Entity, Bag c)] -> World c -> World c
+setEntities rows w =
+  w { entitiesW = map (\(Entity eid', bag) -> (eid', bag)) rows }
+
+rowId :: EntityRow c -> Int
+rowId (eid', _) = eid'
+
+lookupRow :: Int -> [EntityRow c] -> Maybe (Bag c)
+lookupRow _ [] = Nothing
+lookupRow eid' ((eid'', bag) : rest)
+  | eid' == eid'' = Just bag
+  | otherwise = lookupRow eid' rest
+
+adjustRow :: Int -> (Bag c -> Bag c) -> [EntityRow c] -> [EntityRow c]
+adjustRow _ _ [] = []
+adjustRow eid' f ((eid'', bag) : rest)
+  | eid' == eid'' =
+      let bag' = f bag
+      in (eid'', bag') : rest
+  | otherwise = (eid'', bag) : adjustRow eid' f rest
+
+deleteRow :: Int -> [EntityRow c] -> [EntityRow c]
+deleteRow eid' = filter (\(eid'', _) -> eid'' /= eid')
+
+class Component c a where
+  inj :: a -> c
+  prj :: c -> Maybe a
+
+class Bundle c a where
+  bundle :: a -> [c]
+
+instance {-# OVERLAPPING #-} Bundle c () where
+  bundle _ = []
+
+instance {-# OVERLAPPABLE #-} Component c a => Bundle c a where
+  bundle a = [inj a]
+
+instance {-# OVERLAPPING #-} Bundle c a => Bundle c (Maybe a) where
+  bundle = maybe [] bundle
+
+instance (Bundle c a, Bundle c b) => Bundle c (a, b) where
+  bundle (a, b) = bundle a <> bundle b
+
+instance (Bundle c a, Bundle c b, Bundle c d) => Bundle c (a, b, d) where
+  bundle (a, b, d) = bundle a <> bundle b <> bundle d
+
+instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e) => Bundle c (a, b, d, e) where
+  bundle (a, b, d, e) = bundle a <> bundle b <> bundle d <> bundle e
+
+instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f) => Bundle c (a, b, d, e, f) where
+  bundle (a, b, d, e, f) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f
+
+instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g) => Bundle c (a, b, d, e, f, g) where
+  bundle (a, b, d, e, f, g) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f <> bundle g
+
+instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g, Bundle c h) => Bundle c (a, b, d, e, f, g, h) where
+  bundle (a, b, d, e, f, g, h) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f <> bundle g <> bundle h
+
+instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g, Bundle c h, Bundle c i) => Bundle c (a, b, d, e, f, g, h, i) where
+  bundle (a, b, d, e, f, g, h, i) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f <> bundle g <> bundle h <> bundle i
+
+spawn :: Bundle c a => a -> World c -> (Entity, World c)
+spawn a w =
+  let e = Entity (nextIdW w)
+      row = (eid e, bundle a)
+      ents' = row : entitiesW w
+      w' = w { nextIdW = nextIdW w + 1, entitiesW = ents' }
+  in (e, w')
+
+kill :: Entity -> World c -> World c
+kill e w =
+  let eid' = eid e
+      ents' = deleteRow eid' (entitiesW w)
+      out' = dropRelEntity eid' (relOutW w)
+      in' = dropRelEntity eid' (relInW w)
+  in w { entitiesW = ents', relOutW = out', relInW = in' }
+
+dropRelEntity :: Int -> IntMap (IntMap IntSet) -> IntMap (IntMap IntSet)
+dropRelEntity eid' =
+  IntMap.mapMaybe (\m ->
+    let m' = IntMap.map (IntSet.delete eid') (IntMap.delete eid' m)
+        m'' = IntMap.filter (not . IntSet.null) m'
+    in if IntMap.null m'' then Nothing else Just m'')
+
+bagGet :: Component c a => Bag c -> Maybe a
+bagGet = foldr (\c acc -> prj c <|> acc) Nothing
+
+bagSet :: forall a c. Component c a => a -> Bag c -> Bag c
+bagSet a = (inj a :) . filter (isNothing . prj @c @a)
+
+bagDel :: forall a c. Component c a => Bag c -> Bag c
+bagDel = filter (isNothing . prj @c @a)
+
+get :: forall a c. Component c a => Entity -> World c -> Maybe a
+get e w =
+  case lookupRow (eid e) (entitiesW w) of
     Nothing -> Nothing
-    Just im -> IntMap.lookup (eid ent) im >>= fromDynamic
+    Just bag -> bagGet bag
 
-set :: Typeable c => Entity -> c -> World -> World
-set ent c w =
-  if not (exists ent w)
-    then w
-    else w { comps = insertComp ent (comps w) (Component c) }
+set :: forall a c. Component c a => Entity -> a -> World c -> World c
+set e a w =
+  w { entitiesW = adjustRow (eid e) (bagSet a) (entitiesW w) }
 
-del :: forall c. Typeable c => Entity -> World -> World
-del ent w =
-  if not (exists ent w)
-    then w
-    else case Map.lookup rep (comps w) of
-      Nothing -> w
-      Just im ->
-        let im' = IntMap.delete (eid ent) im
-            comps' =
-              if IntMap.null im'
-                then Map.delete rep (comps w)
-                else Map.insert rep im' (comps w)
-        in w { comps = comps' }
-  where
-    rep = typeRep (Proxy :: Proxy c)
+del :: forall a c. Component c a => Entity -> World c -> World c
+del e w =
+  w { entitiesW = adjustRow (eid e) (bagDel @a) (entitiesW w) }
 
-has :: forall (c :: Type). Typeable c => Entity -> World -> Bool
-has ent w =
-  case (get ent w :: Maybe c) of
-    Just _ -> True
-    Nothing -> False
+has :: forall a c. Component c a => Entity -> World c -> Bool
+has e w = isJust (get @a e w)
 
-entities :: World -> [Entity]
-entities w = map Entity (IntSet.toList (ents w))
-
-put :: Typeable r => r -> World -> World
-put r w =
-  w { res = Map.insert (typeOf r) (toDyn r) (res w) }
-
-getr :: forall r. Typeable r => World -> Maybe r
-getr w =
-  Map.lookup (typeRep (Proxy :: Proxy r)) (res w) >>= fromDynamic
-
-tag :: String -> Entity -> World -> World
-tag t ent w =
-  if not (exists ent w)
-    then w
-    else w { tags = Map.alter (insertTag (eid ent)) t (tags w) }
-
-untag :: String -> Entity -> World -> World
-untag t ent w =
-  if not (exists ent w)
-    then w
-    else w { tags = Map.update (removeTag (eid ent)) t (tags w) }
-
-hastag :: String -> Entity -> World -> Bool
-hastag t ent w =
-  if not (exists ent w)
-    then False
-    else case Map.lookup t (tags w) of
-      Nothing -> False
-      Just s -> IntSet.member (eid ent) s
-
-data Query a = Query
-  { need :: [TypeRep]
-  , run :: Entity -> World -> Maybe a
+newtype Query c a = Query
+  { runQuery :: Entity -> Bag c -> Maybe a
   }
 
-instance Functor Query where
-  fmap f q = q { run = \e w -> fmap f (run q e w) }
+instance Functor (Query c) where
+  fmap f (Query q) = Query (\e bag -> fmap f (q e bag))
 
-instance Applicative Query where
-  pure a = Query [] (\_ _ -> Just a)
-  qf <*> qa = Query
-    { need = need qf ++ need qa
-    , run = \e w -> do
-        f <- run qf e w
-        a <- run qa e w
-        pure (f a)
-    }
+instance Applicative (Query c) where
+  pure a = Query (\_ _ -> Just a)
+  Query f <*> Query g = Query (\e bag -> f e bag <*> g e bag)
 
-instance A.Alternative Query where
-  empty = Query [] (\_ _ -> Nothing)
-  q1 <|> q2 = Query
-    { need = []
-    , run = \e w -> run q1 e w A.<|> run q2 e w
-    }
+instance Monad (Query c) where
+  Query q >>= f = Query (\e bag -> q e bag >>= \a -> runQuery (f a) e bag)
 
-comp :: forall c. Typeable c => Query c
-comp = Query
-  { need = [typeRep (Proxy :: Proxy c)]
-  , run = \e w -> get e w
-  }
+instance Alternative (Query c) where
+  empty = Query (\_ _ -> Nothing)
+  Query a <|> Query b = Query (\e bag -> a e bag <|> b e bag)
 
-opt :: forall c. Typeable c => Query (Maybe c)
-opt = Query
-  { need = []
-  , run = \e w -> Just (get e w)
-  }
+comp :: forall a c. Component c a => Query c a
+comp = Query (\_ bag -> bagGet bag)
 
-runq :: Query a -> World -> [(Entity, a)]
+opt :: forall a c. Component c a => Query c (Maybe a)
+opt = Query (\_ bag -> Just (bagGet bag))
+
+data Has a = Has deriving (Eq, Show)
+data Not a = Not deriving (Eq, Show)
+
+hasQ :: forall a c. Component c a => Query c (Has a)
+hasQ = Query (\_ bag -> if isJust (bagGet bag :: Maybe a) then Just Has else Nothing)
+
+notQ :: forall a c. Component c a => Query c (Not a)
+notQ = Query (\_ bag -> if isJust (bagGet bag :: Maybe a) then Nothing else Just Not)
+
+runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
-  foldq q (\e a acc -> (e, a) : acc) [] w
+  foldr
+    (\(eid', bag) acc ->
+      case runQuery q (Entity eid') bag of
+        Nothing -> acc
+        Just a -> (Entity eid', a) : acc
+    ) [] (entitiesW w)
 
-foldq :: Query a -> (Entity -> a -> s -> s) -> s -> World -> s
+foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
-  IntSet.foldr go s0 (candidates q w)
-  where
-    go eid' acc =
-      let ent = Entity eid'
-      in case run q ent w of
-          Just a -> step ent a acc
-          Nothing -> acc
+  foldl'
+    (\acc (eid', bag) ->
+      case runQuery q (Entity eid') bag of
+        Nothing -> acc
+        Just a -> step (Entity eid') a acc
+    ) s0 (entitiesW w)
 
-exists :: Entity -> World -> Bool
-exists ent w = IntSet.member (eid ent) (ents w)
+filterQ :: (a -> Bool) -> Query c a -> Query c a
+filterQ f (Query q) =
+  Query (\e bag -> do
+    a <- q e bag
+    if f a then Just a else Nothing
+  )
 
-insertComp :: Entity -> Map TypeRep (IntMap Dynamic) -> Component -> Map TypeRep (IntMap Dynamic)
-insertComp ent m (Component c) =
-  Map.alter (insertAt (eid ent) (toDyn c)) (typeOf c) m
+class QueryField c a where
+  fieldQuery :: Query c a
 
-insertAt :: Int -> Dynamic -> Maybe (IntMap Dynamic) -> Maybe (IntMap Dynamic)
-insertAt eid' d Nothing = Just (IntMap.singleton eid' d)
-insertAt eid' d (Just im) = Just (IntMap.insert eid' d im)
+instance {-# OVERLAPPABLE #-} Component c a => QueryField c a where
+  fieldQuery = comp
 
-dropEnt :: Int -> IntMap Dynamic -> Maybe (IntMap Dynamic)
-dropEnt eid' im =
-  let im' = IntMap.delete eid' im
-  in if IntMap.null im' then Nothing else Just im'
+instance {-# OVERLAPPING #-} Component c a => QueryField c (Maybe a) where
+  fieldQuery = opt
 
-insertTag :: Int -> Maybe IntSet -> Maybe IntSet
-insertTag eid' Nothing = Just (IntSet.singleton eid')
-insertTag eid' (Just s) = Just (IntSet.insert eid' s)
+instance {-# OVERLAPPING #-} Component c a => QueryField c (Has a) where
+  fieldQuery = hasQ
 
-removeTag :: Int -> IntSet -> Maybe IntSet
-removeTag eid' s =
-  let s' = IntSet.delete eid' s
-  in if IntSet.null s' then Nothing else Just s'
+instance {-# OVERLAPPING #-} Component c a => QueryField c (Not a) where
+  fieldQuery = notQ
 
-dropTag :: Int -> IntSet -> Maybe IntSet
-dropTag eid' = removeTag eid'
+class Queryable c a where
+  queryC :: Query c a
+  default queryC :: (Generic a, GQueryable c (Rep a)) => Query c a
+  queryC = to <$> gquery
 
-candidates :: Query a -> World -> IntSet
-candidates q w =
-  case dedupe (need q) of
-    [] -> ents w
-    reps -> intersectAll (map (componentSet w) reps)
+class QueryableSum c a where
+  querySumC :: Query c a
+  default querySumC :: (Generic a, GQueryableSum c (Rep a)) => Query c a
+  querySumC = to <$> gquerySum
 
-dedupe :: [TypeRep] -> [TypeRep]
-dedupe = Set.toList . Set.fromList
+query :: forall a c. Queryable c a => Query c a
+query = queryC @c @a
 
-componentSet :: World -> TypeRep -> IntSet
-componentSet w rep =
-  case Map.lookup rep (comps w) of
-    Nothing -> IntSet.empty
-    Just im -> IntMap.keysSet im
+querySum :: forall a c. QueryableSum c a => Query c a
+querySum = querySumC @c @a
 
-intersectAll :: [IntSet] -> IntSet
-intersectAll [] = IntSet.empty
-intersectAll (s:xs) = foldl' IntSet.intersection s xs
-mapMaybeQ :: (a -> Maybe b) -> Query a -> Query b
-mapMaybeQ f q = q { run = \e w -> run q e w >>= f }
+class GQueryable c f where
+  gquery :: Query c (f p)
 
-filterQ :: (a -> Bool) -> Query a -> Query a
-filterQ p = mapMaybeQ (\a -> if p a then Just a else Nothing)
-
-newtype Has (a :: Type) = Has ()
-  deriving (Eq, Show)
-
-newtype Not (a :: Type) = Not ()
-  deriving (Eq, Show)
-
-hasQ :: forall a. Typeable a => Query (Has a)
-hasQ = Has () <$ comp @a
-
-notHasQ :: forall a. Typeable a => Query (Not a)
-notHasQ =
-  mapMaybeQ
-    (\m -> case m of
-      Nothing -> Just (Not ())
-      Just _ -> Nothing
-    )
-    (opt @a)
-
-class FieldQuery a where
-  fieldQ :: Query a
-
-instance {-# OVERLAPPABLE #-} Typeable a => FieldQuery a where
-  fieldQ = comp
-
-instance {-# OVERLAPPING #-} Typeable a => FieldQuery (Maybe a) where
-  fieldQ = opt
-
-instance {-# OVERLAPPING #-} Typeable a => FieldQuery (Has a) where
-  fieldQ = hasQ
-
-instance {-# OVERLAPPING #-} Typeable a => FieldQuery (Not a) where
-  fieldQ = notHasQ
-
-newtype Out (r :: Type) = Out [Entity]
-  deriving (Eq, Show)
-
-newtype In (r :: Type) = In [Entity]
-  deriving (Eq, Show)
-
-out :: forall (r :: Type). Typeable r => Entity -> World -> [Entity]
-out e w =
-  case get @(Out r) e w of
-    Nothing -> []
-    Just (Out xs) -> xs
-
-inn :: forall (r :: Type). Typeable r => Entity -> World -> [Entity]
-inn e w =
-  case get @(In r) e w of
-    Nothing -> []
-    Just (In xs) -> xs
-
-relate :: forall (r :: Type). Typeable r => Entity -> Entity -> World -> World
-relate a b w =
-  let outs = out @r a w
-      ins = inn @r b w
-      w1 = set a (Out @r (b : Prelude.filter (/= b) outs)) w
-      w2 = set b (In @r (a : Prelude.filter (/= a) ins)) w1
-  in w2
-
-unrelate :: forall (r :: Type). Typeable r => Entity -> Entity -> World -> World
-unrelate a b w =
-  let outs = Prelude.filter (/= b) (out @r a w)
-      ins = Prelude.filter (/= a) (inn @r b w)
-      w1 = if null outs then del @(Out r) a w else set a (Out @r outs) w
-      w2 = if null ins then del @(In r) b w1 else set b (In @r ins) w1
-  in w2
-
-class GQuery f where
-  gquery :: Query (f p)
-
-instance GQuery f => GQuery (M1 i c f) where
-  gquery = M1 <$> gquery
-
-instance (GQuery a, GQuery b) => GQuery (a :*: b) where
-  gquery = (:*:) <$> gquery <*> gquery
-
-instance
-  TypeError
-    ( 'Text "Queryable does not support sum types."
-    ':$$: 'Text "Use QueryableSum for sums (querySum)."
-    )
-  => GQuery (a :+: b) where
-  gquery = error "unreachable"
-
-instance GQuery U1 where
+instance GQueryable c U1 where
   gquery = pure U1
 
-instance FieldQuery a => GQuery (K1 i a) where
-  gquery = K1 <$> fieldQ
+instance GQueryable c f => GQueryable c (M1 i m f) where
+  gquery = M1 <$> gquery
 
-class Queryable a where
-  query :: Query a
-  default query :: (Generic a, GQuery (Rep a)) => Query a
-  query = to <$> gquery
+instance (GQueryable c a, GQueryable c b) => GQueryable c (a :*: b) where
+  gquery = (:*:) <$> gquery <*> gquery
 
-class GQuerySum f where
-  gquerySum :: Query (f p)
+instance QueryField c a => GQueryable c (K1 i a) where
+  gquery = K1 <$> fieldQuery
 
-instance GQuerySum f => GQuerySum (M1 i c f) where
+class GQueryableSum c f where
+  gquerySum :: Query c (f p)
+
+instance (GQueryableSum c a, GQueryableSum c b) => GQueryableSum c (a :+: b) where
+  gquerySum = (L1 <$> gquerySum) <|> (R1 <$> gquerySum)
+
+instance GQueryableSum c f => GQueryableSum c (M1 D m f) where
   gquerySum = M1 <$> gquerySum
 
-instance (GQuerySum a, GQuerySum b) => GQuerySum (a :*: b) where
-  gquerySum = (:*:) <$> gquerySum <*> gquerySum
+instance GQueryableSum c f => GQueryableSum c (M1 S m f) where
+  gquerySum = M1 <$> gquerySum
 
-instance (GQuerySum a, GQuerySum b) => GQuerySum (a :+: b) where
-  gquerySum = (L1 <$> gquerySum) A.<|> (R1 <$> gquerySum)
+instance GQueryable c f => GQueryableSum c (M1 C m f) where
+  gquerySum = M1 <$> gquery
 
-instance GQuerySum U1 where
-  gquerySum = pure U1
+put :: forall a c. Typeable a => a -> World c -> World c
+put a w =
+  w { resourcesW = IntMap.insert (typeIdOf @a) (unsafeCoerce a) (resourcesW w) }
 
-instance FieldQuery a => GQuerySum (K1 i a) where
-  gquerySum = K1 <$> fieldQ
+getr :: forall a c. Typeable a => World c -> Maybe a
+getr w = unsafeCoerce <$> IntMap.lookup (typeIdOf @a) (resourcesW w)
 
-class QueryableSum a where
-  querySum :: Query a
-  default querySum :: (Generic a, GQuerySum (Rep a)) => Query a
-  querySum = to <$> gquerySum
+relate :: forall r c. Typeable r => Entity -> Entity -> World c -> World c
+relate a b w =
+  let rid = typeIdOf @r
+      aId = eid a
+      bId = eid b
+      out' = insertRel rid aId bId (relOutW w)
+      in' = insertRel rid bId aId (relInW w)
+  in w { relOutW = out', relInW = in' }
+
+unrelate :: forall r c. Typeable r => Entity -> Entity -> World c -> World c
+unrelate a b w =
+  let rid = typeIdOf @r
+      aId = eid a
+      bId = eid b
+      out' = deleteRel rid aId bId (relOutW w)
+      in' = deleteRel rid bId aId (relInW w)
+  in w { relOutW = out', relInW = in' }
+
+out :: forall r c. Typeable r => Entity -> World c -> [Entity]
+out e w =
+  let rid = typeIdOf @r
+      rels = IntMap.findWithDefault IntMap.empty rid (relOutW w)
+  in case IntMap.lookup (eid e) rels of
+      Nothing -> []
+      Just s -> map Entity (IntSet.toList s)
+
+inn :: forall r c. Typeable r => Entity -> World c -> [Entity]
+inn e w =
+  let rid = typeIdOf @r
+      rels = IntMap.findWithDefault IntMap.empty rid (relInW w)
+  in case IntMap.lookup (eid e) rels of
+      Nothing -> []
+      Just s -> map Entity (IntSet.toList s)
+
+insertRel :: TypeId -> Int -> Int -> IntMap (IntMap IntSet) -> IntMap (IntMap IntSet)
+insertRel rid src dst table =
+  let rels = IntMap.findWithDefault IntMap.empty rid table
+      targets = IntMap.findWithDefault IntSet.empty src rels
+      rels' = IntMap.insert src (IntSet.insert dst targets) rels
+  in IntMap.insert rid rels' table
+
+deleteRel :: TypeId -> Int -> Int -> IntMap (IntMap IntSet) -> IntMap (IntMap IntSet)
+deleteRel rid src dst table =
+  let rels = IntMap.findWithDefault IntMap.empty rid table
+      targets = IntMap.findWithDefault IntSet.empty src rels
+      targets' = IntSet.delete dst targets
+      rels' =
+        if IntSet.null targets'
+          then IntMap.delete src rels
+          else IntMap.insert src targets' rels
+      table' =
+        if IntMap.null rels'
+          then IntMap.delete rid table
+          else IntMap.insert rid rels' table
+  in table'

@@ -2,6 +2,7 @@ dist-newstyle/
 dist/
 .ghc.environment.*
 /.cabal/
+.cabal-logs/
 *.hi
 *.o
 *.dyn_hi

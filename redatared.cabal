@@ -27,6 +27,7 @@ library
     -- other-modules:
     -- other-extensions:
     build-depends:    base ^>=4.21.0.0
+                      , array
                       , containers
                       , parallel
     hs-source-dirs:   lib
@@ -40,6 +41,7 @@ test-suite redatared-tests
                       ECSProps
                       SystemProps
     build-depends:    base ^>=4.21.0.0
+                      , array
                       , containers
                       , parallel
                       , QuickCheck
@@ -50,7 +52,9 @@ benchmark redatared-bench
     type:             exitcode-stdio-1.0
     hs-source-dirs:   bench
     main-is:          Bench.hs
+    ghc-options:      -threaded -rtsopts
     build-depends:    base ^>=4.21.0.0
+                      , array
                       , containers
                       , parallel
                       , criterion
