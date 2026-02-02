@@ -12,6 +12,7 @@ module Engine.Data.ECS
   ( Entity(..)
   , World
   , Bag
+  , Sig
   , emptyWorld
   , entities
   , foldEntities
@@ -20,6 +21,8 @@ module Engine.Data.ECS
   , spawn
   , kill
   , Component(..)
+  , ComponentId(..)
+  , ComponentBit(..)
   , Bundle(..)
   , Has(..)
   , Not(..)
@@ -28,6 +31,9 @@ module Engine.Data.ECS
   , set
   , del
   , Query(..)
+  , QueryInfo(..)
+  , queryInfo
+  , runQuerySig
   , comp
   , opt
   , hasQ
@@ -50,7 +56,7 @@ module Engine.Data.ECS
   ) where
 
 import Control.Applicative (Alternative(..))
-import Data.Bits (xor)
+import Data.Bits (bit, (.&.), (.|.), xor)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
@@ -76,7 +82,9 @@ typeIdOf =
 
 type Bag c = [c]
 
-type EntityRow c = (Int, Bag c)
+type Sig = Integer
+
+type EntityRow c = (Int, Sig, Bag c)
 
 data World c = World
   { nextIdW :: !Int
@@ -99,51 +107,129 @@ emptyWorld =
 entities :: World c -> [Entity]
 entities = map (Entity . rowId) . entitiesW
 
-foldEntities :: (Entity -> Bag c -> s -> s) -> s -> World c -> s
+foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
 foldEntities f s0 w =
   foldl'
-    (\acc (eid', bag) -> f (Entity eid') bag acc)
+    (\acc (eid', sig, bag) -> f (Entity eid') sig bag acc)
     s0
     (entitiesW w)
 
-mapEntities :: (Entity -> Bag c -> (Bag c)) -> World c -> World c
+mapEntities :: ComponentId c => (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
 mapEntities f w =
   w
     { entitiesW = map
-        (\(eid', bag) ->
-          let bag' = f (Entity eid') bag
-          in (eid', bag')
+        (\(eid', sig, bag) ->
+          let bag' = f (Entity eid') sig bag
+              sig' = sigFromBag bag'
+          in (eid', sig', bag')
         )
         (entitiesW w)
     }
 
-setEntities :: [(Entity, Bag c)] -> World c -> World c
+setEntities :: ComponentId c => [(Entity, Bag c)] -> World c -> World c
 setEntities rows w =
-  w { entitiesW = map (\(Entity eid', bag) -> (eid', bag)) rows }
+  w { entitiesW = map (\(Entity eid', bag) -> (eid', sigFromBag bag, bag)) rows }
 
 rowId :: EntityRow c -> Int
-rowId (eid', _) = eid'
+rowId (eid', _, _) = eid'
 
 lookupRow :: Int -> [EntityRow c] -> Maybe (Bag c)
 lookupRow _ [] = Nothing
-lookupRow eid' ((eid'', bag) : rest)
+lookupRow eid' ((eid'', _, bag) : rest)
   | eid' == eid'' = Just bag
   | otherwise = lookupRow eid' rest
 
-adjustRow :: Int -> (Bag c -> Bag c) -> [EntityRow c] -> [EntityRow c]
+adjustRow :: ComponentId c => Int -> (Bag c -> Bag c) -> [EntityRow c] -> [EntityRow c]
 adjustRow _ _ [] = []
-adjustRow eid' f ((eid'', bag) : rest)
+adjustRow eid' f ((eid'', sig, bag) : rest)
   | eid' == eid'' =
       let bag' = f bag
-      in (eid'', bag') : rest
-  | otherwise = (eid'', bag) : adjustRow eid' f rest
+          sig' = sigFromBag bag'
+      in (eid'', sig', bag') : rest
+  | otherwise = (eid'', sig, bag) : adjustRow eid' f rest
 
 deleteRow :: Int -> [EntityRow c] -> [EntityRow c]
-deleteRow eid' = filter (\(eid'', _) -> eid'' /= eid')
+deleteRow eid' = filter (\(eid'', _, _) -> eid'' /= eid')
 
-class Component c a where
+class Typeable a => Component c a where
   inj :: a -> c
   prj :: c -> Maybe a
+
+class ComponentId c where
+  componentBit :: c -> Int
+  default componentBit :: (Generic c, GConstrIndex (Rep c)) => c -> Int
+  componentBit = gConstrIndex . from
+
+class GCount f where
+  gCount :: Int
+
+instance (GCount l, GCount r) => GCount (l :+: r) where
+  gCount = gCount @l + gCount @r
+
+instance GCount f => GCount (M1 i c f) where
+  gCount = gCount @f
+
+instance GCount (K1 i a) where
+  gCount = 1
+
+instance GCount U1 where
+  gCount = 1
+
+instance (GCount a, GCount b) => GCount (a :*: b) where
+  gCount = error "ComponentId: product constructors not supported"
+
+class GConstrIndex f where
+  gConstrIndex :: f p -> Int
+
+instance (GConstrIndex l, GConstrIndex r, GCount l) => GConstrIndex (l :+: r) where
+  gConstrIndex (L1 l) = gConstrIndex l
+  gConstrIndex (R1 r) = gCount @l + gConstrIndex r
+
+instance GConstrIndex f => GConstrIndex (M1 i c f) where
+  gConstrIndex (M1 x) = gConstrIndex x
+
+instance GConstrIndex (K1 i a) where
+  gConstrIndex _ = 0
+
+instance GConstrIndex U1 where
+  gConstrIndex _ = 0
+
+instance (GConstrIndex a, GConstrIndex b) => GConstrIndex (a :*: b) where
+  gConstrIndex _ = error "ComponentId: product constructors not supported"
+
+class ComponentBit c a where
+  componentBitOf :: Int
+  default componentBitOf :: (Typeable a, Generic c, GComponentBit (Rep c) a, GCount (Rep c)) => Int
+  componentBitOf =
+    case gComponentBit @(Rep c) @a 0 of
+      Just ix -> ix
+      Nothing -> error "ComponentBit: type not present in component wrapper"
+
+instance {-# OVERLAPPABLE #-} (Typeable a, Component c a, Generic c, GComponentBit (Rep c) a, GCount (Rep c)) => ComponentBit c a
+
+class GComponentBit f a where
+  gComponentBit :: Int -> Maybe Int
+
+instance (GComponentBit l a, GComponentBit r a, GCount l) => GComponentBit (l :+: r) a where
+  gComponentBit n =
+    case gComponentBit @l @a n of
+      Just ix -> Just ix
+      Nothing -> gComponentBit @r @a (n + gCount @l)
+
+instance GComponentBit f a => GComponentBit (M1 i c f) a where
+  gComponentBit n = gComponentBit @f @a n
+
+instance (Typeable a, Typeable b) => GComponentBit (K1 i b) a where
+  gComponentBit n =
+    if typeRep (Proxy @a) == typeRep (Proxy @b)
+      then Just n
+      else Nothing
+
+instance GComponentBit U1 a where
+  gComponentBit _ = Nothing
+
+instance (GComponentBit a a1, GComponentBit b a1) => GComponentBit (a :*: b) a1 where
+  gComponentBit _ = error "ComponentBit: product constructors not supported"
 
 class Bundle c a where
   bundle :: a -> [c]
@@ -178,10 +264,12 @@ instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g
 instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g, Bundle c h, Bundle c i) => Bundle c (a, b, d, e, f, g, h, i) where
   bundle (a, b, d, e, f, g, h, i) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f <> bundle g <> bundle h <> bundle i
 
-spawn :: Bundle c a => a -> World c -> (Entity, World c)
+spawn :: (Bundle c a, ComponentId c) => a -> World c -> (Entity, World c)
 spawn a w =
   let e = Entity (nextIdW w)
-      row = (eid e, bundle a)
+      bag = bundle a
+      sig = sigFromBag bag
+      row = (eid e, sig, bag)
       ents' = row : entitiesW w
       w' = w { nextIdW = nextIdW w + 1, entitiesW = ents' }
   in (e, w')
@@ -201,6 +289,20 @@ dropRelEntity eid' =
         m'' = IntMap.filter (not . IntSet.null) m'
     in if IntMap.null m'' then Nothing else Just m'')
 
+sigFromBag :: ComponentId c => Bag c -> Sig
+sigFromBag = foldl' (\acc c -> acc .|. bit (componentBit c)) 0
+
+matchSig :: QueryInfo -> Sig -> Bool
+matchSig info sig =
+  (sig .&. requireQ info) == requireQ info
+    && (sig .&. forbidQ info) == 0
+
+runQuerySig :: Query c a -> Sig -> Entity -> Bag c -> Maybe a
+runQuerySig q sig e bag =
+  if matchSig (queryInfoQ q) sig
+    then runQuery q e bag
+    else Nothing
+
 bagGet :: Component c a => Bag c -> Maybe a
 bagGet = foldr (\c acc -> prj c <|> acc) Nothing
 
@@ -216,88 +318,109 @@ get e w =
     Nothing -> Nothing
     Just bag -> bagGet bag
 
-set :: forall a c. Component c a => Entity -> a -> World c -> World c
+set :: forall a c. (Component c a, ComponentId c) => Entity -> a -> World c -> World c
 set e a w =
   w { entitiesW = adjustRow (eid e) (bagSet a) (entitiesW w) }
 
-del :: forall a c. Component c a => Entity -> World c -> World c
+del :: forall a c. (Component c a, ComponentId c) => Entity -> World c -> World c
 del e w =
   w { entitiesW = adjustRow (eid e) (bagDel @a) (entitiesW w) }
 
 has :: forall a c. Component c a => Entity -> World c -> Bool
 has e w = isJust (get @a e w)
 
-newtype Query c a = Query
+data QueryInfo = QueryInfo
+  { requireQ :: Sig
+  , forbidQ :: Sig
+  } deriving (Eq, Show)
+
+instance Semigroup QueryInfo where
+  QueryInfo r1 f1 <> QueryInfo r2 f2 = QueryInfo (r1 .|. r2) (f1 .|. f2)
+
+instance Monoid QueryInfo where
+  mempty = QueryInfo 0 0
+
+data Query c a = Query
   { runQuery :: Entity -> Bag c -> Maybe a
+  , queryInfoQ :: QueryInfo
   }
 
+queryInfo :: Query c a -> QueryInfo
+queryInfo = queryInfoQ
+
 instance Functor (Query c) where
-  fmap f (Query q) = Query (\e bag -> fmap f (q e bag))
+  fmap f (Query q qi) = Query (\e bag -> fmap f (q e bag)) qi
 
 instance Applicative (Query c) where
-  pure a = Query (\_ _ -> Just a)
-  Query f <*> Query g = Query (\e bag -> f e bag <*> g e bag)
+  pure a = Query (\_ _ -> Just a) mempty
+  Query f qiF <*> Query g qiG = Query (\e bag -> f e bag <*> g e bag) (qiF <> qiG)
 
 instance Monad (Query c) where
-  Query q >>= f = Query (\e bag -> q e bag >>= \a -> runQuery (f a) e bag)
+  Query q _ >>= f = Query (\e bag -> q e bag >>= \a -> runQuery (f a) e bag) mempty
 
 instance Alternative (Query c) where
-  empty = Query (\_ _ -> Nothing)
-  Query a <|> Query b = Query (\e bag -> a e bag <|> b e bag)
+  empty = Query (\_ _ -> Nothing) mempty
+  Query a _ <|> Query b _ = Query (\e bag -> a e bag <|> b e bag) mempty
 
-comp :: forall a c. Component c a => Query c a
-comp = Query (\_ bag -> bagGet bag)
+comp :: forall a c. (Component c a, ComponentBit c a) => Query c a
+comp = Query (\_ bag -> bagGet bag) (QueryInfo (bit (componentBitOf @c @a)) 0)
 
 opt :: forall a c. Component c a => Query c (Maybe a)
-opt = Query (\_ bag -> Just (bagGet bag))
+opt = Query (\_ bag -> Just (bagGet bag)) mempty
 
 data Has a = Has deriving (Eq, Show)
 data Not a = Not deriving (Eq, Show)
 
-hasQ :: forall a c. Component c a => Query c (Has a)
+hasQ :: forall a c. (Component c a, ComponentBit c a) => Query c (Has a)
 hasQ = Query (\_ bag -> if isJust (bagGet bag :: Maybe a) then Just Has else Nothing)
+  (QueryInfo (bit (componentBitOf @c @a)) 0)
 
-notQ :: forall a c. Component c a => Query c (Not a)
+notQ :: forall a c. (Component c a, ComponentBit c a) => Query c (Not a)
 notQ = Query (\_ bag -> if isJust (bagGet bag :: Maybe a) then Nothing else Just Not)
+  (QueryInfo 0 (bit (componentBitOf @c @a)))
 
 runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
   foldr
-    (\(eid', bag) acc ->
-      case runQuery q (Entity eid') bag of
-        Nothing -> acc
-        Just a -> (Entity eid', a) : acc
+    (\(eid', sig, bag) acc ->
+      if matchSig (queryInfoQ q) sig
+        then case runQuery q (Entity eid') bag of
+          Nothing -> acc
+          Just a -> (Entity eid', a) : acc
+        else acc
     ) [] (entitiesW w)
 
 foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
   foldl'
-    (\acc (eid', bag) ->
-      case runQuery q (Entity eid') bag of
-        Nothing -> acc
-        Just a -> step (Entity eid') a acc
+    (\acc (eid', sig, bag) ->
+      if matchSig (queryInfoQ q) sig
+        then case runQuery q (Entity eid') bag of
+          Nothing -> acc
+          Just a -> step (Entity eid') a acc
+        else acc
     ) s0 (entitiesW w)
 
 filterQ :: (a -> Bool) -> Query c a -> Query c a
-filterQ f (Query q) =
+filterQ f (Query q qi) =
   Query (\e bag -> do
     a <- q e bag
     if f a then Just a else Nothing
-  )
+  ) qi
 
 class QueryField c a where
   fieldQuery :: Query c a
 
-instance {-# OVERLAPPABLE #-} Component c a => QueryField c a where
+instance {-# OVERLAPPABLE #-} (Component c a, ComponentBit c a) => QueryField c a where
   fieldQuery = comp
 
 instance {-# OVERLAPPING #-} Component c a => QueryField c (Maybe a) where
   fieldQuery = opt
 
-instance {-# OVERLAPPING #-} Component c a => QueryField c (Has a) where
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Has a) where
   fieldQuery = hasQ
 
-instance {-# OVERLAPPING #-} Component c a => QueryField c (Not a) where
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Not a) where
   fieldQuery = notQ
 
 class Queryable c a where

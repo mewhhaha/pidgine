@@ -168,16 +168,16 @@ update f = EntityPatch $ \bag ->
 del :: forall a c. E.Component c a => EntityPatch c
 del = EntityPatch (bagDel @a)
 
-setAt :: forall a c. E.Component c a => Entity -> a -> Patch c
+setAt :: forall a c. (E.Component c a, E.ComponentId c) => Entity -> a -> Patch c
 setAt e a = patch (E.set e a)
 
-updateAt :: forall a c. E.Component c a => Entity -> (a -> a) -> Patch c
+updateAt :: forall a c. (E.Component c a, E.ComponentId c) => Entity -> (a -> a) -> Patch c
 updateAt e f = patch $ \w ->
   case E.get @a e w of
     Nothing -> w
     Just v -> E.set e (f v) w
 
-delAt :: forall a c. E.Component c a => Entity -> Patch c
+delAt :: forall a c. (E.Component c a, E.ComponentId c) => Entity -> Patch c
 delAt e = patch (E.del @a e)
 
 put :: Typeable a => a -> Patch c
@@ -532,107 +532,11 @@ instance {-# OVERLAPPING #-} EachField c (E.Not a) where
   eachField _ = mempty
 
 
-eachWWith :: Eachable c a => Maybe ParCfg -> E.Query c a -> (a -> a) -> World c -> Patch c
-eachWWith parCfg q f w =
-  case parCfg of
-    Nothing ->
-      let rowsRev =
-            E.foldEntities
-              (\e bag acc ->
-                case E.runQuery q e bag of
-                  Nothing -> (e, bag) : acc
-                  Just a ->
-                    let bag' = runEntityPatch (eachPatch (f a)) bag
-                    in (e, bag') : acc
-              ) [] w
-      in patch (E.setEntities (reverse rowsRev))
-    Just pcfg ->
-      let (nRows, rowsAccRev) =
-            E.foldEntities
-              (\e bag (n, acc) -> (n + 1, (e, bag) : acc))
-              (0 :: Int, [])
-              w
-          rows = reverse rowsAccRev
-          applyRow (e, bag) =
-            case E.runQuery q e bag of
-              Nothing -> (e, bag)
-              Just a ->
-                let bag' = runEntityPatch (eachPatch (f a)) bag
-                in (e, bag')
-          seqRows = map applyRow rows
-      in if nRows <= 0
-          then patch (E.setEntities [])
-          else if nRows < parMin pcfg
-            then patch (E.setEntities seqRows)
-            else
-              let rowsArr = listArray (0, nRows - 1) rows
-                  ranges = [(i, min (i + parChunk pcfg - 1) (nRows - 1)) | i <- [0, parChunk pcfg .. nRows - 1]]
-                  evalChunk (lo, hi) =
-                    let goChunk i acc
-                          | i > hi = reverse acc
-                          | otherwise =
-                              let row = rowsArr ! i
-                                  row' = applyRow row
-                              in goChunk (i + 1) (row' : acc)
-                    in goChunk lo []
-                  chunkResults0 = map evalChunk ranges
-                  chunkResults = withStrategy (parListChunk 1 rseq) chunkResults0
-                  rowsFinal = concat chunkResults
-              in patch (E.setEntities rowsFinal)
-
-eachPWWith :: Maybe ParCfg -> E.Query c a -> (a -> EntityPatch c) -> World c -> Patch c
-eachPWWith parCfg q f w =
-  case parCfg of
-    Nothing ->
-      let rowsRev =
-            E.foldEntities
-              (\e bag acc ->
-                case E.runQuery q e bag of
-                  Nothing -> (e, bag) : acc
-                  Just a ->
-                    let bag' = runEntityPatch (f a) bag
-                    in (e, bag') : acc
-              ) [] w
-      in patch (E.setEntities (reverse rowsRev))
-    Just pcfg ->
-      let (nRows, rowsAccRev) =
-            E.foldEntities
-              (\e bag (n, acc) -> (n + 1, (e, bag) : acc))
-              (0 :: Int, [])
-              w
-          rows = reverse rowsAccRev
-          applyRow (e, bag) =
-            case E.runQuery q e bag of
-              Nothing -> (e, bag)
-              Just a ->
-                let bag' = runEntityPatch (f a) bag
-                in (e, bag')
-          seqRows = map applyRow rows
-      in if nRows <= 0
-          then patch (E.setEntities [])
-          else if nRows < parMin pcfg
-            then patch (E.setEntities seqRows)
-            else
-              let rowsArr = listArray (0, nRows - 1) rows
-                  ranges = [(i, min (i + parChunk pcfg - 1) (nRows - 1)) | i <- [0, parChunk pcfg .. nRows - 1]]
-                  evalChunk (lo, hi) =
-                    let goChunk i acc
-                          | i > hi = reverse acc
-                          | otherwise =
-                              let row = rowsArr ! i
-                                  row' = applyRow row
-                              in goChunk (i + 1) (row' : acc)
-                    in goChunk lo []
-                  chunkResults0 = map evalChunk ranges
-                  chunkResults = withStrategy (parListChunk 1 rseq) chunkResults0
-                  rowsFinal = concat chunkResults
-              in patch (E.setEntities rowsFinal)
-
 data Op c msg k where
-  Each :: Eachable c a => E.Query c a -> (a -> a) -> k -> Op c msg k
-  EachP :: E.Query c a -> (a -> EntityPatch c) -> k -> Op c msg k
-  EachM :: Typeable msg => E.TypeId -> E.Query c a -> (a -> EntityM c msg ()) -> k -> Op c msg k
-  EachS :: (Typeable a, Typeable b) => E.TypeId -> E.Query c a -> F.Step a b -> (a -> b -> EntityPatch c) -> k -> Op c msg k
+  Each :: (Eachable c a, E.ComponentId c) => E.Query c a -> (a -> a) -> k -> Op c msg k
+  EachP :: E.ComponentId c => E.Query c a -> (a -> EntityPatch c) -> k -> Op c msg k
+  EachM :: (Typeable msg, E.ComponentId c) => E.TypeId -> E.Query c a -> (a -> EntityM c msg ()) -> k -> Op c msg k
+  EachS :: (Typeable a, Typeable b, E.ComponentId c) => E.TypeId -> E.Query c a -> F.Step a b -> (a -> b -> EntityPatch c) -> k -> Op c msg k
   StepOp :: (Typeable a, Typeable b) => E.TypeId -> F.Step a b -> a -> (b -> k) -> Op c msg k
   EditW :: Patch c -> k -> Op c msg k
   EditE :: EntityPatch c -> k -> Op c msg k
@@ -785,16 +689,16 @@ stepE e s0 a = do
   d <- dt
   localStateE @key e s0 (\s -> stepS s d a)
 
-each :: Eachable c a => E.Query c a -> (a -> a) -> SystemM c msg ()
+each :: (Eachable c a, E.ComponentId c) => E.Query c a -> (a -> a) -> SystemM c msg ()
 each q f = Free (Each q f (Pure ()))
 
-eachM :: forall (key :: Type) c msg a. (Typeable key, Typeable msg) => E.Query c a -> (a -> EntityM c msg ()) -> SystemM c msg ()
+eachM :: forall (key :: Type) c msg a. (Typeable key, Typeable msg, E.ComponentId c) => E.Query c a -> (a -> EntityM c msg ()) -> SystemM c msg ()
 eachM q f = Free (EachM (E.typeIdOf @(Program key)) q f (Pure ()))
 
-eachStep :: forall (key :: Type) c a b msg. (Typeable key, Typeable a, Typeable b) => E.Query c a -> F.Step a b -> (a -> b -> EntityPatch c) -> SystemM c msg ()
+eachStep :: forall (key :: Type) c a b msg. (Typeable key, Typeable a, Typeable b, E.ComponentId c) => E.Query c a -> F.Step a b -> (a -> b -> EntityPatch c) -> SystemM c msg ()
 eachStep q s f = Free (EachS (E.typeIdOf @key) q s f (Pure ()))
 
-eachP :: E.Query c a -> (a -> EntityPatch c) -> SystemM c msg ()
+eachP :: E.ComponentId c => E.Query c a -> (a -> EntityPatch c) -> SystemM c msg ()
 eachP q f = Free (EachP q f (Pure ()))
 
 class Return msg a where
@@ -839,6 +743,86 @@ data ChunkRes c msg = ChunkRes
   , crRows :: ![(Entity, E.Bag c)]
   , crProg :: !(IntMap.IntMap Any)
   }
+
+data EachOp c where
+  EachOpSimple :: E.Query c a -> (a -> EntityPatch c) -> EachOp c
+
+collectEachOps :: SystemM c msg a -> ([EachOp c], SystemM c msg a)
+collectEachOps prog =
+  case prog of
+    Pure _ -> ([], prog)
+    Free op ->
+      case op of
+        Each q f k ->
+          let op' = EachOpSimple q (eachPatch . f)
+              (ops, rest) = collectEachOps k
+          in (op' : ops, rest)
+        EachP q f k ->
+          let op' = EachOpSimple q f
+              (ops, rest) = collectEachOps k
+          in (op' : ops, rest)
+        _ -> ([], prog)
+
+fusedEachWith :: E.ComponentId c => Maybe ParCfg -> [EachOp c] -> World c -> Patch c
+fusedEachWith _ [] _ = mempty
+fusedEachWith parCfg ops w =
+  case parCfg of
+    Nothing ->
+      let rowsRev =
+            E.foldEntities
+              (\e sig bag acc ->
+                let patchE =
+                      foldl'
+                        (\p (EachOpSimple q f) ->
+                          case E.runQuerySig q sig e bag of
+                            Nothing -> p
+                            Just a -> p <> f a
+                        )
+                        mempty
+                        ops
+                    bag' = runEntityPatch patchE bag
+                in (e, bag') : acc
+              ) [] w
+      in patch (E.setEntities (reverse rowsRev))
+    Just pcfg ->
+      let (nRows, rowsAccRev) =
+            E.foldEntities
+              (\e sig bag (n, acc) -> (n + 1, (e, sig, bag) : acc))
+              (0 :: Int, [])
+              w
+          rows = reverse rowsAccRev
+          applyRow (e, sig, bag) =
+            let patchE =
+                  foldl'
+                    (\p (EachOpSimple q f) ->
+                      case E.runQuerySig q sig e bag of
+                        Nothing -> p
+                        Just a -> p <> f a
+                    )
+                    mempty
+                    ops
+                bag' = runEntityPatch patchE bag
+            in (e, bag')
+          seqRows = map applyRow rows
+      in if nRows <= 0
+          then patch (E.setEntities [])
+          else if nRows < parMin pcfg
+            then patch (E.setEntities seqRows)
+            else
+              let rowsArr = listArray (0, nRows - 1) rows
+                  ranges = [(i, min (i + parChunk pcfg - 1) (nRows - 1)) | i <- [0, parChunk pcfg .. nRows - 1]]
+                  evalChunk (lo, hi) =
+                    let goChunk i acc
+                          | i > hi = reverse acc
+                          | otherwise =
+                              let row = rowsArr ! i
+                                  row' = applyRow row
+                              in goChunk (i + 1) (row' : acc)
+                    in goChunk lo []
+                  chunkResults0 = map evalChunk ranges
+                  chunkResults = withStrategy (parListChunk 1 rseq) chunkResults0
+                  rowsFinal = concat chunkResults
+              in patch (E.setEntities rowsFinal)
 
 runSystemMWith :: DTime -> World c -> Inbox msg -> Locals c msg -> SystemM c msg a -> (Tick c msg, Locals c msg, SystemM c msg a, Maybe a)
 runSystemMWith d w inbox locals0 = go mempty [] False locals0
@@ -909,8 +893,14 @@ runSystemMWith d w inbox locals0 = go mempty [] False locals0
                       globals' = IntMap.insert keyRep (unsafeCoerce store') (localsGlobal locals)
                       locals' = locals { localsGlobal = globals' }
                   in go patchAcc out waitAcc locals' (k b)
-            Each q f k -> go (patchAcc <> eachWWith parCfgMaybe q f w) out waitAcc locals k
-            EachP q f k -> go (patchAcc <> eachPWWith parCfgMaybe q f w) out waitAcc locals k
+            Each {} ->
+              let (ops, rest) = collectEachOps prog
+                  p = fusedEachWith parCfgMaybe ops w
+              in go (patchAcc <> p) out waitAcc locals rest
+            EachP {} ->
+              let (ops, rest) = collectEachOps prog
+                  p = fusedEachWith parCfgMaybe ops w
+              in go (patchAcc <> p) out waitAcc locals rest
             EachM key (q :: E.Query c a) (f :: a -> EntityM c msg ()) k ->
               let progKey = key
                   outStart = outFrom out
@@ -919,8 +909,8 @@ runSystemMWith d w inbox locals0 = go mempty [] False locals0
                     case IntMap.lookup progKey (localsGlobal locals) of
                       Just v -> unsafeCoerce v
                       Nothing -> IntMap.empty
-                  stepRowSeq e bag (outAcc, waitAcc', rowsAcc, progAcc) =
-                    case E.runQuery q e bag of
+                  stepRowSeq e sig bag (outAcc, waitAcc', rowsAcc, progAcc) =
+                    case E.runQuerySig q sig e bag of
                       Nothing -> (outAcc, waitAcc', (e, bag) : rowsAcc, progAcc)
                       Just a ->
                         let eid' = E.eid e
@@ -948,7 +938,7 @@ runSystemMWith d w inbox locals0 = go mempty [] False locals0
                   parResult pcfg =
                     let (nRows, rowsAccRev) =
                           E.foldEntities
-                            (\e bag (n, acc) -> (n + 1, (e, bag) : acc))
+                            (\e sig bag (n, acc) -> (n + 1, (e, sig, bag) : acc))
                             (0 :: Int, [])
                             w
                         rows = reverse rowsAccRev
@@ -964,8 +954,8 @@ runSystemMWith d w inbox locals0 = go mempty [] False locals0
                           let goChunk i (outAcc, waitAcc', rowsAcc, progAcc)
                                 | i > hi = (outAcc, waitAcc', rowsAcc, progAcc)
                                 | otherwise =
-                                    let (e, bag) = rowsArr ! i
-                                    in case E.runQuery q e bag of
+                                    let (e, sig, bag) = rowsArr ! i
+                                    in case E.runQuerySig q sig e bag of
                                         Nothing -> goChunk (i + 1) (outAcc, waitAcc', (e, bag) : rowsAcc, progAcc)
                                         Just a ->
                                           let eid' = E.eid e
@@ -1018,8 +1008,8 @@ runSystemMWith d w inbox locals0 = go mempty [] False locals0
               let stepMap0 = case IntMap.lookup key (localsGlobal locals) of
                     Just v -> unsafeCoerce v
                     Nothing -> IntMap.empty
-                  stepRow e bag (rowsAcc, stepAcc) =
-                    case E.runQuery q e bag of
+                  stepRow e sig bag (rowsAcc, stepAcc) =
+                    case E.runQuerySig q sig e bag of
                       Nothing -> ((e, bag) : rowsAcc, stepAcc)
                       Just a ->
                         let eid' = E.eid e
@@ -1036,11 +1026,11 @@ runSystemMWith d w inbox locals0 = go mempty [] False locals0
                   parResult pcfg =
                     let (nRows, rowsAccRev) =
                           E.foldEntities
-                            (\e bag (n, acc) -> (n + 1, (e, bag) : acc))
+                            (\e sig bag (n, acc) -> (n + 1, (e, sig, bag) : acc))
                             (0 :: Int, [])
                             w
                         rows = reverse rowsAccRev
-                        rowsArr :: Array Int (Entity, E.Bag c)
+                        rowsArr :: Array Int (Entity, E.Sig, E.Bag c)
                         rowsArr =
                           if nRows == 0
                             then listArray (0, -1) []
@@ -1053,8 +1043,8 @@ runSystemMWith d w inbox locals0 = go mempty [] False locals0
                           let goChunk i (rowsAcc, stepAcc)
                                 | i > hi = (reverse rowsAcc, stepAcc)
                                 | otherwise =
-                                    let (e, bag) = rowsArr ! i
-                                    in case E.runQuery q e bag of
+                                    let (e, sig, bag) = rowsArr ! i
+                                    in case E.runQuerySig q sig e bag of
                                         Nothing -> goChunk (i + 1) ((e, bag) : rowsAcc, stepAcc)
                                         Just a ->
                                           let eid' = E.eid e

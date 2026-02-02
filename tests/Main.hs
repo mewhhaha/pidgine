@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Main where
@@ -7,6 +8,7 @@ import FRPProps
 import SystemProps
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
+import GHC.Generics (Generic)
 import System.Exit (exitFailure)
 import Test.QuickCheck (isSuccess, quickCheckResult)
 
@@ -14,6 +16,9 @@ data C
   = CInt Int
   | CString String
   | CBool Bool
+  deriving (Generic)
+
+instance E.ComponentId C
 
 instance E.Component C Int where
   inj = CInt

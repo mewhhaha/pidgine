@@ -26,6 +26,9 @@ data C
   | CBool Bool
   | CLocal T.Local
   | CGlobal T.Global
+  deriving (Generic)
+
+instance E.ComponentId C
 
 instance E.Component C Int where
   inj = CInt

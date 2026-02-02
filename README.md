@@ -338,7 +338,7 @@ These examples use direct `E.spawn` calls. It keeps world building explicit and 
 
 ```
 World
-  entities  : [(EntityId, Bag C)]
+  entities  : [(EntityId, Sig, Bag C)]   -- Sig is a component bitset
   resources : IntMap Any
   relations : out/in (edge type -> adjacency)
 
@@ -357,6 +357,7 @@ Entities own only components; system-local programs/state are not stored on enti
 ### 1) Spawn and access components
 
 ```haskell
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeApplications #-}
 
 data Pos = Pos Double Double deriving (Show, Eq)
@@ -370,6 +371,12 @@ data C
   | CVel Vel
   | CPlayer Player
   | CEnemy Enemy
+  deriving (Generic)
+
+instance E.ComponentId C
+
+-- Note: component wrappers should be a sum of unary constructors so the
+-- bitset index can be derived automatically.
 
 instance E.Component C Pos where
   inj = CPos
@@ -515,7 +522,7 @@ instance E.QueryableSum C Who
 whoQ = E.querySum @Who
 ```
 
-Sum queries use `<|>` and therefore skip `need` pruning.
+Sum queries use `<|>` and therefore skip signature pruning.
 
 ### 6) Filter and map queries
 
@@ -1581,7 +1588,7 @@ questFinishSys = S.system (S.handle 1) $ do
 - System graph runs sequentially; parallelism is data‑parallel inside `each`/`eachM`/`eachStep` only.
 - Patch conflicts are resolved by list order; no merge policy beyond `Semigroup` order.
 - Waiting systems are re-run within a frame; misbehaving systems can loop forever.
-- `QueryableSum` skips `need` pruning; sum queries scan all entities.
+- `QueryableSum` skips signature pruning; sum queries scan all entities.
 - Queries are applicative; no dependent queries without giving up pruning.
 - No spatial index; collision queries are naive unless you build your own structure.
 - `Events` are plain lists: no timestamps, priorities, or guaranteed ordering across systems.

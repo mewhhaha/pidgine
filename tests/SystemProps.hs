@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeApplications #-}
 
 module SystemProps
@@ -9,6 +10,7 @@ module SystemProps
   ) where
 
 import Data.List (foldl')
+import GHC.Generics (Generic)
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
 import qualified Engine.Data.System as S
@@ -25,6 +27,9 @@ newtype Count = Count Int
 data C
   = CInt Int
   | CCount Count
+  deriving (Generic)
+
+instance E.ComponentId C
 
 instance E.Component C Int where
   inj = CInt
