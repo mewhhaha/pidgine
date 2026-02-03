@@ -307,6 +307,8 @@ data PendingBatch c msg where
     (a -> ProgramM c msg b) ->
     PendingBatch c msg
 
+type RowVec c = V.Vector (E.EntityRow c)
+
 data BatchGroup c msg = BatchGroup
   { bgPid :: !ProgramId
   , bgLocals :: !(Locals c msg)
@@ -322,7 +324,7 @@ data PendingStep c msg where
     (Entity -> E.Sig -> E.Bag c -> s -> (E.Sig, E.Bag c, s)) ->
     (s -> (Any, BatchOut c msg)) ->
     (s -> s -> s) ->
-    ([E.EntityRow c] -> s -> (s, s)) ->
+    (RowVec c -> s -> (s, s)) ->
     PendingStep c msg
 
 data StepStatic c msg = StepStatic
@@ -330,7 +332,7 @@ data StepStatic c msg = StepStatic
   , ssStep :: !(Entity -> Sig -> E.Bag c -> Any -> (Sig, E.Bag c, Any))
   , ssDone :: !(Any -> (Any, BatchOut c msg))
   , ssMerge :: !(Any -> Any -> Any)
-  , ssSplit :: !([E.EntityRow c] -> Any -> (Any, Any))
+  , ssSplit :: !(RowVec c -> Any -> (Any, Any))
   }
 
 data PendingState c msg = PendingState
@@ -484,7 +486,7 @@ data Gather c msg a where
     (Entity -> E.Sig -> E.Bag c -> s -> (E.Sig, E.Bag c, s)) ->
     (s -> a) ->
     (s -> s -> s) ->
-    ([E.EntityRow c] -> s -> (s, s)) ->
+    (RowVec c -> s -> (s, s)) ->
     Gather c msg a
 
 instance Functor (Gather c msg) where
@@ -617,14 +619,23 @@ eachM q f =
       | pid > eid' = popProg eid' ps
       | otherwise = (Nothing, all)
     dropRemoved eid' = snd . popProg eid'
-    splitProg [] prog = ([], prog)
-    splitProg (_ : rows) [] = ([], [])
-    splitProg rows@((eidRow, _, _) : restRows) prog@((pid, st) : restProg)
-      | pid == eidRow =
-          let (chunk, rest) = splitProg restRows restProg
-          in ((pid, st) : chunk, rest)
-      | pid > eidRow = splitProg rows restProg
-      | otherwise = splitProg restRows prog
+    splitProg rows prog = go 0 prog
+      where
+        len = V.length rows
+        go i progList =
+          if i >= len
+            then ([], progList)
+            else case progList of
+              [] -> ([], [])
+              p@(pid, st) : restProg ->
+                let (eidRow, _, _) = V.unsafeIndex rows i
+                in if pid == eidRow
+                    then
+                      let (chunk, rest) = go (i + 1) restProg
+                      in ((pid, st) : chunk, rest)
+                    else if pid > eidRow
+                      then go i restProg
+                      else go (i + 1) progList
 
 eachMP :: forall (key :: Type) c msg a.
   (Typeable key, Typeable msg) =>
@@ -687,7 +698,7 @@ instance Monoid (Out msg) where
   mempty = Out id
 
 outFrom :: Events msg -> Out msg
-outFrom xs = Out (xs ++)
+outFrom xs = Out (\ys -> foldr (:) ys xs)
 
 outToList :: Out msg -> Events msg
 outToList (Out f) = f []
@@ -702,6 +713,9 @@ instance Monoid (Build a) where
 
 buildOne :: a -> Build a
 buildOne a = Build (a :)
+
+buildFromList :: [a] -> Build a
+buildFromList xs = Build (\ys -> foldr (:) ys xs)
 
 buildToList :: Build a -> [a]
 buildToList (Build f) = f []
@@ -976,8 +990,12 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
           wStep = if stepped0 then w else E.stepWorld d w
           stepped1 = True
           compiled = zipWith (compilePending d) [0..] pendingSorted
-          steps = concatMap fst compiled
-          groups = V.fromList (map snd compiled)
+          steps =
+            buildToList $
+              foldl' (\acc (xs, _) -> acc <> buildFromList xs) mempty compiled
+          groups =
+            V.fromList $
+              foldr (\(_, g) acc -> g : acc) [] compiled
           parOk = all pendingPar pendingSorted
           rows = E.entityRows wStep
           state0 = stepsFromPending steps
@@ -1005,7 +1023,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
               , bgCont = contAny
               , bgOpCount = n
               }
-          steps = map (opToStep gid) (buildToList ops)
+          steps = foldr (\op acc -> opToStep gid op : acc) [] (buildToList ops)
       in (steps, group)
 
     opToStep gid (BatchOp g) =
@@ -1013,33 +1031,35 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
         Gather s step done merge split -> PendingStep gid s step done merge split
 
     runPendingSteps rows state0 wStep =
-      let (rows', state1) = processRows rows state0
-          w' = E.setEntityRows rows' wStep
+      let rowsV = V.fromList rows
+          (rowsV', state1) = processRows rowsV state0
+          w' = E.setEntityRows (V.toList rowsV') wStep
       in (w', state1)
 
     runPendingStepsPar rows state0 wStep =
       let chunkSize = 1024
-          rowChunks = chunkRows chunkSize rows
+          rowsV = V.fromList rows
+          rowChunks = chunkRows chunkSize rowsV
           stateChunks = splitStateChunks rowChunks state0
           chunkResults =
             withStrategy (parListChunk 1 rseq) $
               zipWith (\st rs -> forceChunk (processRows rs st)) stateChunks rowChunks
-          rows' = concatMap fst chunkResults
-          state' = mergeStateChunks state0 (map snd chunkResults)
-          w' = E.setEntityRows rows' wStep
+          rows' = V.concat (foldr ((:) . fst) [] chunkResults)
+          state' =
+            mergeStateChunks state0 (foldr ((:) . snd) [] chunkResults)
+          w' = E.setEntityRows (V.toList rows') wStep
       in (w', state')
 
-    forceChunk (rows', st) = length rows' `seq` (rows', st)
+    forceChunk (rows', st) = V.length rows' `seq` (rows', st)
 
-    chunkRows n xs =
-      let rowsV = V.fromList xs
-          total = V.length rowsV
+    chunkRows n rowsV =
+      let total = V.length rowsV
           go i acc =
             if i >= total
               then reverse acc
               else
                 let chunkLen = min n (total - i)
-                    chunk = V.toList (V.slice i chunkLen rowsV)
+                    chunk = V.slice i chunkLen rowsV
                 in go (i + chunkLen) (chunk : acc)
       in if n <= 0 || total == 0
           then []
@@ -1070,8 +1090,8 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       let stepRow (build, states) row =
             let (row', states') = processRow statics states row
             in (build . (row' :), states')
-          (build, states') = foldl' stepRow (id, states0) rows
-      in (build [], PendingState statics states')
+          (build, states') = V.foldl' stepRow (id, states0) rows
+      in (V.fromList (build []), PendingState statics states')
 
     processRow :: V.Vector (StepStatic c msg) -> V.Vector Any -> E.EntityRow c
                -> (E.EntityRow c, V.Vector Any)
