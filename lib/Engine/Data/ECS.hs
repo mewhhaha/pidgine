@@ -19,13 +19,18 @@ module Engine.Data.ECS
   , Steps
   , StepSlot(..)
   , Sig
+  , EntityRow
   , emptyWorld
   , entities
+  , entityRows
   , stepWorld
   , foldEntities
+  , foldEntitiesFrom
   , mapEntities
   , setEntities
   , setEntityRows
+  , updateEntityRows
+  , updateEntityRow
   , nextId
   , spawn
   , kill
@@ -200,49 +205,63 @@ emptyWorld =
     }
 
 entities :: World c -> [Entity]
-entities = map (Entity . rowId) . entitiesW
+entities = map (Entity . (\(eid', _, _) -> eid')) . entitiesW
+
+entityRows :: World c -> [EntityRow c]
+entityRows = entitiesW
 
 nextId :: World c -> Int
 nextId = nextIdW
 
-foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
-foldEntities f s0 w =
+foldEntitiesFrom :: [EntityRow c] -> (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
+foldEntitiesFrom rows f s0 _ =
   foldl'
     (\acc (eid', sig, bag) -> f (Entity eid') sig bag acc)
     s0
-    (entitiesW w)
+    rows
+
+foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
+foldEntities f s0 w = foldEntitiesFrom (entitiesW w) f s0 w
 
 mapEntities :: (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
 mapEntities f w =
-  w
-    { entitiesW = map
-        (\(eid', sig, bag) ->
-          let bag' = f (Entity eid') sig bag
-              sig' = sigFromBag bag'
-          in (eid', sig', bag')
-        )
-        (entitiesW w)
-    }
+  let ents' =
+        map
+          (\(eid', sig, bag) ->
+            let bag' = f (Entity eid') sig bag
+                sig' = sigFromBag bag'
+            in (eid', sig', bag')
+          )
+          (entitiesW w)
+  in w { entitiesW = ents' }
 
 setEntities :: [(Entity, Bag c)] -> World c -> World c
 setEntities rows w =
-  w { entitiesW = map (\(Entity eid', bag) -> (eid', sigFromBag bag, bag)) rows }
+  let ents' = [(eid', sigFromBag bag, bag) | (Entity eid', bag) <- rows]
+  in w { entitiesW = ents' }
 
 setEntityRows :: [EntityRow c] -> World c -> World c
-setEntityRows rows w =
-  w { entitiesW = rows }
+setEntityRows rows w = w { entitiesW = rows }
 
-rowId :: EntityRow c -> Int
-rowId (eid', _, _) = eid'
+updateEntityRows :: [EntityRow c] -> World c -> World c
+updateEntityRows rows w = foldl' (\acc (eid', sig, bag) -> updateEntityRow eid' sig bag acc) w rows
 
-lookupRow :: Int -> [EntityRow c] -> Maybe (Bag c)
-lookupRow _ [] = Nothing
-lookupRow eid' ((eid'', _, bag) : rest)
-  | eid' == eid'' = Just bag
-  | otherwise = lookupRow eid' rest
+updateEntityRow :: Int -> Sig -> Bag c -> World c -> World c
+updateEntityRow eid' sig' bag w =
+  let (ents', inserted) = insertRow eid' sig' bag (entitiesW w)
+      nextId' = if inserted && eid' >= nextIdW w then eid' + 1 else nextIdW w
+  in w { entitiesW = ents', nextIdW = nextId' }
 
-deleteRow :: Int -> [EntityRow c] -> [EntityRow c]
-deleteRow eid' = filter (\(eid'', _, _) -> eid'' /= eid')
+insertRow :: Int -> Sig -> Bag c -> [EntityRow c] -> ([EntityRow c], Bool)
+insertRow eid' sig' bag = go
+  where
+    go [] = ([(eid', sig', bag)], True)
+    go (row@(eid0, _, _) : rest)
+      | eid' == eid0 = ((eid', sig', bag) : rest, False)
+      | eid' < eid0 =
+          let (rest', inserted) = go rest
+          in (row : rest', inserted)
+      | otherwise = ((eid', sig', bag) : row : rest, True)
 
 class Typeable a => Component c a where
   inj :: a -> c
@@ -441,18 +460,26 @@ spawn a w =
   let e = Entity (nextIdW w)
       bag = bundle a
       sig = sigFromBag bag
-      row = (eid e, sig, bag)
-      ents' = row : entitiesW w
-      w' = w { nextIdW = nextIdW w + 1, entitiesW = ents' }
+      eid' = eid e
+      ents' = (eid', sig, bag) : entitiesW w
+      w' =
+        w
+          { nextIdW = nextIdW w + 1
+          , entitiesW = ents'
+          }
   in (e, w')
 
 kill :: Entity -> World c -> World c
 kill e w =
   let eid' = eid e
-      ents' = deleteRow eid' (entitiesW w)
+      ents' = filter (\(eid0, _, _) -> eid0 /= eid') (entitiesW w)
       out' = dropRelEntity eid' (relOutW w)
       in' = dropRelEntity eid' (relInW w)
-  in w { entitiesW = ents', relOutW = out', relInW = in' }
+  in w
+      { entitiesW = ents'
+      , relOutW = out'
+      , relInW = in'
+      }
 
 dropRelEntity :: Int -> IntMap (IntMap IntSet) -> IntMap (IntMap IntSet)
 dropRelEntity eid' =
@@ -541,34 +568,48 @@ get :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> May
 get e w =
   case lookupRow (eid e) (entitiesW w) of
     Nothing -> Nothing
-    Just bag -> bagGet bag
+    Just (_, bag) -> bagGet bag
 
 set :: forall a c. (Component c a, ComponentBit c a) => Entity -> a -> World c -> World c
 set e a w =
   let eid' = eid e
       bitC = bit (componentBitOf @c @a)
-      step (eid'', sig, bag)
-        | eid'' == eid' =
-            let bag' = bagSet a bag
-                sig' = sig .|. bitC
-            in (eid'', sig', bag')
-        | otherwise = (eid'', sig, bag)
-  in w { entitiesW = map step (entitiesW w) }
+  in case lookupRow eid' (entitiesW w) of
+      Nothing -> w
+      Just (sig, bag) ->
+        let bag' = bagSet a bag
+            sig' = sig .|. bitC
+            ents' = replaceRow eid' sig' bag' (entitiesW w)
+        in w { entitiesW = ents' }
 
 del :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> World c
 del e w =
   let eid' = eid e
       bitC = bit (componentBitOf @c @a)
-      step (eid'', sig, bag)
-        | eid'' == eid' =
-            let bag' = bagDel @a bag
-                sig' = sig .&. complement bitC
-            in (eid'', sig', bag')
-        | otherwise = (eid'', sig, bag)
-  in w { entitiesW = map step (entitiesW w) }
+  in case lookupRow eid' (entitiesW w) of
+      Nothing -> w
+      Just (sig, bag) ->
+        let bag' = bagDel @a bag
+            sig' = sig .&. complement bitC
+            ents' = replaceRow eid' sig' bag' (entitiesW w)
+        in w { entitiesW = ents' }
 
 has :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Bool
 has e w = isJust (get @a e w)
+
+lookupRow :: Int -> [EntityRow c] -> Maybe (Sig, Bag c)
+lookupRow _ [] = Nothing
+lookupRow eid' ((eid0, sig, bag) : rest)
+  | eid' == eid0 = Just (sig, bag)
+  | eid' > eid0 = Nothing
+  | otherwise = lookupRow eid' rest
+
+replaceRow :: Int -> Sig -> Bag c -> [EntityRow c] -> [EntityRow c]
+replaceRow _ _ _ [] = []
+replaceRow eid' sig' bag' (row@(eid0, sig0, bag0) : rest)
+  | eid' == eid0 = (eid', sig', bag') : rest
+  | eid' > eid0 = row : rest
+  | otherwise = row : replaceRow eid' sig' bag' rest
 
 data QueryInfo = QueryInfo
   { requireQ :: Sig
@@ -636,14 +677,13 @@ notQ =
 
 runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
-  foldr
-    (\(eid', sig, bag) acc ->
-      if matchSig (queryInfoQ q) sig
-        then case runQuery q (Entity eid') bag of
-          Nothing -> acc
-          Just a -> (Entity eid', a) : acc
-        else acc
-    ) [] (entitiesW w)
+  let step (eid', sig, bag) acc =
+        if matchSig (queryInfoQ q) sig
+          then case runQuery q (Entity eid') bag of
+            Nothing -> acc
+            Just a -> (Entity eid', a) : acc
+          else acc
+  in foldr step [] (entitiesW w)
 
 foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
@@ -654,7 +694,9 @@ foldq q step s0 w =
           Nothing -> acc
           Just a -> step (Entity eid') a acc
         else acc
-    ) s0 (entitiesW w)
+    )
+    s0
+    (entitiesW w)
 
 filterQ :: (a -> Bool) -> Query c a -> Query c a
 filterQ f (Query q qi) =
@@ -850,15 +892,15 @@ deleteRel rid src dst table =
   in table'
 stepWorld :: F.DTime -> World c -> World c
 stepWorld d w =
-  let rows = entitiesW w
-      hasSteps = any (\(_, _, bag) -> not (stepsNull (bagSteps bag))) rows
+  let ents = entitiesW w
+      hasSteps = any (\(_, _, bag) -> not (stepsNull (bagSteps bag))) ents
+      stepRow (eid', sig, bag)
+        | stepsNull (bagSteps bag) = (eid', sig, bag)
+        | otherwise = (eid', sig, stepBag d bag)
+      ents' = map stepRow ents
   in if not hasSteps
       then w
-      else w { entitiesW = map stepRow rows }
-  where
-    stepRow (eid', sig, bag)
-      | stepsNull (bagSteps bag) = (eid', sig, bag)
-      | otherwise = (eid', sig, stepBag d bag)
+      else w { entitiesW = ents' }
 
 stepBag :: F.DTime -> Bag c -> Bag c
 stepBag d bag = bag { bagSteps = stepsStepAll d (bagSteps bag) }
