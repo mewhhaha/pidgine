@@ -55,6 +55,7 @@ module Engine.Data.Program
   , step
   , drive
   , Await(..)
+  , Awaitable(..)
   , await
   , awaitProgram
   , awaitEvent
@@ -252,14 +253,29 @@ data Await c msg a where
   Update :: Await c msg ()
   BatchWait :: Batch c msg a -> Await c msg a
 
+class Awaitable c msg a b | a -> b where
+  toAwait :: a -> Await c msg b
+
+instance Awaitable c msg (Await c msg a) a where
+  toAwait = id
+
+instance Awaitable c msg (Handle a) a where
+  toAwait = ProgramAwait
+
+instance Awaitable c msg (msg -> Bool) (Events msg) where
+  toAwait = Event
+
+instance Awaitable c I.Input I.InputPred (Events I.Input) where
+  toAwait (I.InputPred p) = Event p
+
 awaitEvent :: forall c msg m. MonadProgram c msg m => (msg -> Bool) -> m (Events msg)
-awaitEvent p = await (Event @msg @c p)
+awaitEvent = await
 
 awaitProgram :: forall c msg m a. MonadProgram c msg m => Handle a -> m a
-awaitProgram h = await (ProgramAwait h)
+awaitProgram = await
 
 awaitInput :: MonadProgram c I.Input m => I.InputPred -> m (Events I.Input)
-awaitInput p = await (Event (I.matchInput p))
+awaitInput = await
 
 awaitGate :: Await c msg a -> Inbox msg -> Maybe a
 awaitGate waitOn inbox =
@@ -762,15 +778,18 @@ instance Monad (EntityM c msg) where
 class Monad m => MonadProgram c msg m | m -> c msg where
   send :: Events msg -> m ()
   dt :: m DTime
-  await :: Await c msg a -> m a
+  awaitM :: Await c msg a -> m a
   stepId :: (Typeable a, Typeable b) => E.TypeId -> F.Step a b -> a -> m b
+
+await :: (MonadProgram c msg m, Awaitable c msg a b) => a -> m b
+await = awaitM . toAwait
 
 instance MonadProgram c msg (ProgramM c msg) where
   send out = ProgramM $ \ctx ->
     let out' = sysOut ctx <> outFrom out
     in (ctx { sysOut = out' }, ProgDone ())
   dt = ProgramM $ \ctx -> (ctx, ProgDone (sysDt ctx))
-  await waitOn = ProgramM $ \ctx ->
+  awaitM waitOn = ProgramM $ \ctx ->
     case waitOn of
       BatchWait _ ->
         (ctx, ProgAwait waitOn pure)
@@ -794,12 +813,12 @@ instance MonadProgram c msg (EntityM c msg) where
     let out' = ctxOut ctx <> outFrom out
     in (ctx { ctxOut = out' }, Done ())
   dt = EntityM $ \ctx -> (ctx, Done (ctxDt ctx))
-  await waitOn = EntityM $ \ctx ->
+  awaitM waitOn = EntityM $ \ctx ->
     case waitOn of
       BatchWait _ -> error "await: batch is only valid in ProgramM"
       _ ->
         case awaitGate waitOn (ctxInbox ctx) of
-          Nothing -> (ctx, Wait (await waitOn))
+          Nothing -> (ctx, Wait (awaitM waitOn))
           Just a -> (ctx, Done a)
   stepId key s0 a = EntityM $ \ctx ->
     let machines0 = ctxMachines ctx
@@ -847,8 +866,8 @@ sample tw = do
 step :: forall key a b c msg m. (MonadProgram c msg m, Typeable key, Typeable a, Typeable b) => F.Step a b -> a -> m b
 step s0 a = stepId (E.typeIdOf @key) s0 a
 
-batch :: Batch c msg a -> Await c msg a
-batch = BatchWait
+batch :: Batch c msg a -> ProgramM c msg a
+batch b = awaitM (BatchWait b)
 
 runEntityM :: forall c msg a. DTime -> Inbox msg -> E.Sig -> E.Bag c -> Machines -> EntityM c msg a
   -> (E.Bag c, E.Sig, Machines, Out msg, Bool, EntityM c msg a, Maybe a)

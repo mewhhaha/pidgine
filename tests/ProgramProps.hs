@@ -40,11 +40,11 @@ program_resume_once =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
       sys :: Program String ()
       sys = S.program (S.handle 0) $ do
-        _ <- S.await $ S.batch $ do
+        _ <- S.batch $ do
           S.each (E.comp @Int) $ \n ->
             S.set (n + 1)
         _ <- S.awaitEvent (== "go")
-        _ <- S.await $ S.batch $ do
+        _ <- S.batch $ do
           S.each (E.comp @Int) $ \n ->
             S.set (n + 10)
         pure ()
@@ -67,7 +67,7 @@ program_await_value =
       useProg :: Program String ()
       useProg = S.program (S.handle 1) $ do
         v <- S.awaitProgram (S.handle 0)
-        _ <- S.await $ S.batch $ do
+        _ <- S.batch $ do
           S.each (E.comp @Int) $ \_ ->
             S.set (v :: Int)
         pure ()
@@ -81,7 +81,7 @@ countStep = F.acc 0
 
 countProg :: Program () ()
 countProg = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $ do
+  _ <- S.batch $ do
     S.eachM @CountLoop (E.comp @Count) $ \_ -> do
       n <- S.step @CountStep countStep [(+1)]
       S.edit (S.set (Count n))
@@ -126,11 +126,11 @@ runFrames evs =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
       sys :: Program String ()
       sys = S.program (S.handle 0) $ do
-        _ <- S.await $ S.batch $ do
+        _ <- S.batch $ do
           S.each (E.comp @Int) $ \n ->
             S.set (n + 1)
         _ <- S.awaitEvent (== "go")
-        _ <- S.await $ S.batch $ do
+        _ <- S.batch $ do
           S.each (E.comp @Int) $ \n ->
             S.set (n + 10)
         pure ()
@@ -157,7 +157,7 @@ prop_program_await_value v =
       useProg :: Program String ()
       useProg = S.program (S.handle 1) $ do
         v' <- S.awaitProgram (S.handle 0)
-        _ <- S.await $ S.batch $ do
+        _ <- S.batch $ do
           S.each (E.comp @Int) $ \_ ->
             S.set (v' :: Int)
         pure ()

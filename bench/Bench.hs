@@ -83,7 +83,7 @@ qPQ = E.comp
 
 moveProg :: Program String ()
 moveProg = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachP pPV $ \(Pos x y, Vel vx vy) ->
       let p = Pos (x + vx) (y + vy)
           v = Vel vx vy
@@ -92,7 +92,7 @@ moveProg = S.program (S.handle 0) $ do
 
 moveProgSmall :: Program String ()
 moveProgSmall = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachP pP $ \(Pos x y) ->
       let p = Pos (x + 1) y
       in S.set p
@@ -100,7 +100,7 @@ moveProgSmall = S.program (S.handle 0) $ do
 
 moveProgJoin3 :: Program String ()
 moveProgJoin3 = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachP pMove3 $ \q ->
       let Pos x y = pos3 q
           Vel vx vy = vel3 q
@@ -113,7 +113,7 @@ moveProgJoin3 = S.program (S.handle 0) $ do
 
 moveProgTwoEach :: Program String ()
 moveProgTwoEach = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     (S.eachP pPV $ \(Pos x y, Vel vx vy) ->
       let p = Pos (x + vx) (y + vy)
       in S.set p)
@@ -136,7 +136,7 @@ advance dt (Pos x y) (Vel vx vy) =
 moveProgLogic :: Program String ()
 moveProgLogic = S.program (S.handle 0) $ do
   dt <- S.dt
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachP pPV $ \(p, v) ->
       let (p', v') = advance dt p v
       in S.set p' <> S.set v'
@@ -150,7 +150,7 @@ moveStep = F.Step $ \dt (Pos x y, Vel vx vy) ->
 
 moveProgStep :: Program String ()
 moveProgStep = S.program (S.handle 1) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachMP @MoveLoop pPV $ \(p, v) -> do
       (p', v') <- S.step @MoveLoop moveStep (p, v)
       S.edit (S.set p' <> S.set v')
@@ -158,7 +158,7 @@ moveProgStep = S.program (S.handle 1) $ do
 
 moveProgM :: Program String ()
 moveProgM = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachMP @MoveLoop pPV $ \(Pos x y, Vel vx vy) -> do
       let p = Pos (x + vx) (y + vy)
           v = Vel vx vy
@@ -167,7 +167,7 @@ moveProgM = S.program (S.handle 0) $ do
 
 moveProgMSmall :: Program String ()
 moveProgMSmall = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachMP @MoveLoop pP $ \(Pos x y) -> do
       let p = Pos (x + 1) y
       S.edit (S.set p)
@@ -175,7 +175,7 @@ moveProgMSmall = S.program (S.handle 0) $ do
 
 moveProgMJoin3 :: Program String ()
 moveProgMJoin3 = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachMP @MoveLoop pMove3 $ \q -> do
       let Pos x y = pos3 q
           Vel vx vy = vel3 q
@@ -188,7 +188,7 @@ moveProgMJoin3 = S.program (S.handle 0) $ do
 
 moveProgMTwoEach :: Program String ()
 moveProgMTwoEach = S.program (S.handle 0) $ do
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     (S.eachMP @MoveLoop1 pPV $ \(Pos x y, Vel vx vy) -> do
       let p = Pos (x + vx) (y + vy)
       S.edit (S.set p))
@@ -201,7 +201,7 @@ moveProgMTwoEach = S.program (S.handle 0) $ do
 moveProgMLogic :: Program String ()
 moveProgMLogic = S.program (S.handle 0) $ do
   dt <- S.dt
-  _ <- S.await $ S.batch $
+  _ <- S.batch $
     S.eachMP @MoveLoop pPV $ \(p, v) -> do
       let (p', v') = advance dt p v
       S.edit (S.set p' <> S.set v')
