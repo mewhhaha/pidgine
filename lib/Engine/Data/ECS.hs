@@ -514,7 +514,10 @@ bagSet a (Bag static steps) =
   in case stepsLookup bitIx steps of
       Just (StepSlot _ sAny) ->
         let steps' = stepsInsert bitIx (StepSlot vAny sAny) steps
-            static' = static // [(bitIx, Nothing)]
+            static' =
+              case static ! bitIx of
+                Nothing -> static
+                Just _ -> static // [(bitIx, Nothing)]
         in Bag static' steps'
       Nothing ->
         Bag (static // [(bitIx, Just vAny)]) steps
@@ -864,12 +867,12 @@ deleteRel rid src dst table =
   in table'
 stepWorld :: F.DTime -> World c -> World c
 stepWorld d w =
-  let ents = entitiesW w
-      hasSteps = any (\(_, _, bag) -> not (stepsNull (bagSteps bag))) ents
-      stepRow (eid', sig, bag)
-        | stepsNull (bagSteps bag) = (eid', sig, bag)
-        | otherwise = (eid', sig, stepBag d bag)
-      ents' = map stepRow ents
+  let stepRow (eid', sig, bag) (hasSteps, acc)
+        | stepsNull (bagSteps bag) = (hasSteps, (eid', sig, bag) : acc)
+        | otherwise =
+            let bag' = stepBag d bag
+            in (True, (eid', sig, bag') : acc)
+      (hasSteps, ents') = foldr stepRow (False, []) (entitiesW w)
   in if not hasSteps
       then w
       else w { entitiesW = ents' }

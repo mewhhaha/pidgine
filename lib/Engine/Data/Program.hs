@@ -346,6 +346,7 @@ data ProgramUpdate c msg = ProgramUpdate
 data Acc c msg = Acc
   { accRes :: !(Build Any)
   , accOut :: !(BatchOut c msg)
+  , accCount :: !Int
   }
 
 data RunRes c msg where
@@ -881,18 +882,19 @@ runProgramM d w0 inbox locals0 prog0 =
 
 run :: DTime -> World c -> Events a -> Graph c a -> (World c, Events a, Graph c a)
 run d w0 inbox g0 =
-  go w0 programs0 (repeat True) IntSet.empty IntSet.empty IntMap.empty [] False
+  go w0 programs0 (repeat True) IntSet.empty IntSet.empty IntMap.empty mempty False
   where
     Graph programs0 = g0
     allSet = IntSet.fromList (map programId programs0)
+    inboxOut = outFrom inbox
 
     go w programs toRun doneSet seenSet values accOut stepped =
-      let available = inbox ++ accOut
+      let available = outToList (inboxOut <> accOut)
           (w', roundOut, programs', nextRun, done1, seen1, values1, progressed, stepped') =
             stepRound d w available programs toRun doneSet seenSet values allSet stepped
-          accOut' = accOut ++ roundOut
+          accOut' = accOut <> roundOut
       in if not (or nextRun) || not progressed
-          then (w', accOut', Graph programs')
+          then (w', outToList accOut', Graph programs')
           else go w' programs' nextRun done1 seen1 values1 accOut' stepped'
 
 stepRound :: DTime
@@ -905,7 +907,7 @@ stepRound :: DTime
           -> IntMap.IntMap Any
           -> IntSet
           -> Bool
-          -> (World c, Events a, [AnyProgram c a], [Bool], Done, Seen, IntMap.IntMap Any, Bool, Bool)
+          -> (World c, Out a, [AnyProgram c a], [Bool], Done, Seen, IntMap.IntMap Any, Bool, Bool)
 stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
   let (w1, out1, programs1, run1, done1, seen1, values1, progressed1, pending) =
         runProgramsPhase events0 done0 seen0 values0 w0 (zip programs toRun)
@@ -914,14 +916,14 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       _ ->
         let (w2, out2, programs2, run2, progressed2, stepped1) =
               runBatchesPhase d w1 pending programs1 run1 stepped0
-        in (w2, out1 ++ out2, programs2, run2, done1, seen1, values1, progressed1 || progressed2, stepped1)
+        in (w2, out1 <> out2, programs2, run2, done1, seen1, values1, progressed1 || progressed2, stepped1)
   where
     runProgramsPhase inb doneSet seenSet valuesSet w pairs =
       let results =
             withStrategy (parListChunk 1 rseq) $
               map (runOne inb doneSet seenSet valuesSet w) pairs
           (w', out', progs', runs', dSet', sSet', vSet', progressed', pending') =
-            foldl' applyOne (w, [], [], [], doneSet, seenSet, valuesSet, False, []) results
+            foldl' applyOne (w, mempty, [], [], doneSet, seenSet, valuesSet, False, []) results
       in (w', out', reverse progs', reverse runs', dSet', sSet', vSet', progressed', reverse pending')
       where
         runOne inbox0 dSet sSet vSet w0 (AnyProgram (prog0 :: Program c msg a), runNow) =
@@ -941,7 +943,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
             Ran (prog0 :: Program c msg a) inbox0 t locals' resStep ->
               let sid = handleId (programHandle prog0)
                   out = outT t
-                  accOut' = accOut ++ out
+                  accOut' = accOut <> outFrom out
                   w' = apply (patchT t) wAcc
                   sSet' = IntSet.insert sid sSet
                   progressedSeen = not (IntSet.member sid sSet)
@@ -987,7 +989,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
           programs' = applyProgramUpdates programs updates
           runFlags' = updateRunFlags programs' runFlags (IntMap.keysSet updates)
           progressed = not (IntMap.null updates) || not (null out)
-      in (w', out, programs', runFlags', progressed, stepped1)
+      in (w', outFrom out, programs', runFlags', progressed, stepped1)
 
     pendingPar (PendingBatch _ _ _ b _) = batchPar b
 
@@ -1029,10 +1031,19 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
 
     forceChunk (rows', st) = length rows' `seq` (rows', st)
 
-    chunkRows _ [] = []
     chunkRows n xs =
-      let (h, t) = splitAt n xs
-      in h : chunkRows n t
+      let rowsV = V.fromList xs
+          total = V.length rowsV
+          go i acc =
+            if i >= total
+              then reverse acc
+              else
+                let chunkLen = min n (total - i)
+                    chunk = V.toList (V.slice i chunkLen rowsV)
+                in go (i + chunkLen) (chunk : acc)
+      in if n <= 0 || total == 0
+          then []
+          else go 0 []
 
     stepsFromPending steps =
       let statics = V.fromList (map mkStatic steps)
@@ -1085,15 +1096,11 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
 
     splitStates statics rows states0 =
       let len = V.length statics
-          go i accChunk accRest =
-            if i >= len
-              then (V.fromListN len (reverse accChunk), V.fromListN len (reverse accRest))
-              else
-                let stc = V.unsafeIndex statics i
-                    s = V.unsafeIndex states0 i
-                    (sChunk, sRest) = ssSplit stc rows s
-                in go (i + 1) (sChunk : accChunk) (sRest : accRest)
-      in go 0 [] []
+          both = V.generate len $ \i ->
+            let stc = V.unsafeIndex statics i
+                s = V.unsafeIndex states0 i
+            in ssSplit stc rows s
+      in V.unzip both
 
     mergeStateChunks base [] = base
     mergeStateChunks base (s:ss) =
@@ -1103,50 +1110,51 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
 
     mergeStates statics xs ys =
       let len = V.length statics
-          go i acc =
-            if i >= len
-              then V.fromListN len (reverse acc)
-              else
-                let stc = V.unsafeIndex statics i
-                    a = V.unsafeIndex xs i
-                    b = V.unsafeIndex ys i
-                    ab = ssMerge stc a b
-                in go (i + 1) (ab : acc)
-      in go 0 []
+      in V.generate len $ \i ->
+          let stc = V.unsafeIndex statics i
+              a = V.unsafeIndex xs i
+              b = V.unsafeIndex ys i
+          in ssMerge stc a b
 
     finalizePendingState (PendingState statics states0) groups =
       let len = V.length statics
-          go i accMap accOut =
+          groupCount = V.length groups
+          emptyAcc = Acc mempty mempty 0
+          combine acc delta =
+            Acc
+              { accRes = accRes acc <> accRes delta
+              , accOut = accOut acc <> accOut delta
+              , accCount = accCount acc + accCount delta
+              }
+          go i accUpdates accOut =
             if i >= len
-              then (accMap, outToList accOut)
+              then (accUpdates, outToList accOut)
               else
                 let stc = V.unsafeIndex statics i
                     st = V.unsafeIndex states0 i
                     StepStatic gid _ done _ _ = stc
                     (aAny, bout) = done st
+                    delta = Acc (buildOne aAny) bout 1
                     accOut' = accOut <> boOut bout
-                    accMap' = updateAcc gid aAny bout accMap
-                in go (i + 1) accMap' accOut'
-          updateAcc gid aAny bout accMap =
-            let acc = IntMap.findWithDefault emptyAcc gid accMap
-                acc' =
-                  Acc
-                    { accRes = accRes acc <> buildOne aAny
-                    , accOut = accOut acc <> bout
-                    }
-            in IntMap.insert gid acc' accMap
-          emptyAcc = Acc mempty mempty
+                in go (i + 1) ((gid, delta) : accUpdates) accOut'
+          (accUpdatesRev, outList) = go 0 [] mempty
+          accUpdates = reverse accUpdatesRev
+          accVec =
+            if groupCount == 0
+              then V.empty
+              else V.accum combine (V.replicate groupCount emptyAcc) accUpdates
           applyUpdate acc gid accVal =
-            case groups V.!? gid of
-              Nothing -> acc
-              Just grp ->
-                let results = V.fromList (buildToList (accRes accVal))
-                    aAny = bgK grp results
-                    progAny = bgCont grp aAny
-                    locals' = boLocals (accOut accVal) (bgLocals grp)
-                in IntMap.insert (bgPid grp) (ProgramUpdate locals' progAny) acc
-          (accMap0, outList) = go 0 IntMap.empty mempty
-          updates = IntMap.foldlWithKey' applyUpdate IntMap.empty accMap0
+            if accCount accVal == 0
+              then acc
+              else case groups V.!? gid of
+                Nothing -> acc
+                Just grp ->
+                  let results = V.fromList (buildToList (accRes accVal))
+                      aAny = bgK grp results
+                      progAny = bgCont grp aAny
+                      locals' = boLocals (accOut accVal) (bgLocals grp)
+                  in IntMap.insert (bgPid grp) (ProgramUpdate locals' progAny) acc
+          updates = V.ifoldl' applyUpdate IntMap.empty accVec
       in (updates, outList)
 
     applyProgramUpdates progs updates =
