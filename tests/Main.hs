@@ -5,7 +5,7 @@ module Main where
 
 import ECSProps
 import FRPProps
-import SystemProps
+import ProgramProps
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
 import GHC.Generics (Generic)
@@ -19,24 +19,6 @@ data C
   deriving (Generic)
 
 instance E.ComponentId C
-
-instance E.Component C Int where
-  inj = CInt
-  prj c = case c of
-    CInt v -> Just v
-    _ -> Nothing
-
-instance E.Component C String where
-  inj = CString
-  prj c = case c of
-    CString v -> Just v
-    _ -> Nothing
-
-instance E.Component C Bool where
-  inj = CBool
-  prj c = case c of
-    CBool v -> Just v
-    _ -> Nothing
 
 type World = E.World C
 
@@ -100,9 +82,9 @@ main = do
       qOut = E.runq q w2
   assert "query" (qOut == [(e1, 10)])
 
-  assert "system resume" system_resume_once
-  assert "system await value" system_await_value
-  assert "each per-entity" system_eachm_entity_state
+  assert "program resume" program_resume_once
+  assert "program await value" program_await_value
+  assert "each per-entity" program_eachm_entity_state
 
   results <-
     sequence
@@ -123,8 +105,8 @@ main = do
       , quickCheckResult prop_relations
       , quickCheckResult prop_parent_child
       , quickCheckResult prop_transform_inverse
-      , quickCheckResult prop_system_resume
-      , quickCheckResult prop_system_await_value
+      , quickCheckResult prop_program_resume
+      , quickCheckResult prop_program_await_value
       ]
 
   if all isSuccess results

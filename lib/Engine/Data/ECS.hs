@@ -1,10 +1,13 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -12,12 +15,18 @@ module Engine.Data.ECS
   ( Entity(..)
   , World
   , Bag
+  , Key
+  , Steps
+  , StepSlot(..)
   , Sig
   , emptyWorld
   , entities
+  , stepWorld
   , foldEntities
   , mapEntities
   , setEntities
+  , setEntityRows
+  , nextId
   , spawn
   , kill
   , Component(..)
@@ -33,7 +42,17 @@ module Engine.Data.ECS
   , Query(..)
   , QueryInfo(..)
   , queryInfo
+  , Plan(..)
+  , plan
+  , planRec
+  , sigFromBag
   , runQuerySig
+  , keyOf
+  , keyOfType
+  , bagGet
+  , bagSet
+  , bagSetStep
+  , bagDel
   , comp
   , opt
   , hasQ
@@ -56,18 +75,23 @@ module Engine.Data.ECS
   ) where
 
 import Control.Applicative (Alternative(..))
-import Data.Bits (bit, (.&.), (.|.), xor)
+import Data.Array (Array, (!), (//), bounds, listArray)
+import Data.Bits (bit, complement, (.&.), (.|.), xor)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
-import Data.Maybe (isJust, isNothing)
+import Data.List (foldl')
+import Data.Maybe (isJust)
+import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy(..))
-import Data.Typeable (Typeable, typeRep, typeRepFingerprint)
+import Data.Typeable (Typeable, cast, typeRep, typeRepFingerprint)
+import GHC.TypeLits (TypeError, ErrorMessage(..))
 import GHC.Exts (Any)
 import GHC.Fingerprint (Fingerprint(..))
 import GHC.Generics
 import Unsafe.Coerce (unsafeCoerce)
+import qualified Engine.Data.FRP as F
 
 newtype Entity = Entity
   { eid :: Int
@@ -80,11 +104,82 @@ typeIdOf =
   let Fingerprint w1 w2 = typeRepFingerprint (typeRep (Proxy @a))
   in fromIntegral (w1 `xor` w2)
 
-type Bag c = [c]
+newtype Key c = Key Int
+  deriving (Eq, Ord, Show)
+
+keyOf :: ComponentId c => c -> Key c
+keyOf = Key . componentBit
+
+data StepSlot = StepSlot
+  { stepVal :: !Any
+  , stepState :: !Any
+  }
+
+newtype Steps = Steps
+  { stepsMap :: IntMap StepSlot
+  }
+
+data Bag c = Bag
+  { bagStatic :: !(Array Int (Maybe Any))
+  , bagSteps :: !Steps
+  }
 
 type Sig = Integer
 
 type EntityRow c = (Int, Sig, Bag c)
+
+stepsEmpty :: Steps
+stepsEmpty = Steps IntMap.empty
+
+stepsLookup :: Int -> Steps -> Maybe StepSlot
+stepsLookup bitIx (Steps m) = IntMap.lookup bitIx m
+
+stepsInsert :: Int -> StepSlot -> Steps -> Steps
+stepsInsert bitIx slot (Steps m) = Steps (IntMap.insert bitIx slot m)
+
+stepsDelete :: Int -> Steps -> Steps
+stepsDelete bitIx (Steps m) = Steps (IntMap.delete bitIx m)
+
+stepsStepAll :: F.DTime -> Steps -> Steps
+stepsStepAll d (Steps m) =
+  let stepSlotD (StepSlot _ sAny) =
+        let s = unsafeCoerce sAny :: F.Step () Any
+            (v', s') = F.stepS s d ()
+        in StepSlot v' (unsafeCoerce s')
+  in Steps (IntMap.map stepSlotD m)
+
+stepsNull :: Steps -> Bool
+stepsNull (Steps m) = IntMap.null m
+
+emptyBag :: forall c. ComponentId c => Bag c
+emptyBag =
+  let size = componentCount @c
+      arr =
+        if size <= 0
+          then listArray (0, -1) []
+          else listArray (0, size - 1) (replicate size Nothing)
+  in Bag arr stepsEmpty
+
+stepsMerge :: Steps -> Steps -> Steps
+stepsMerge (Steps base) (Steps extra) =
+  Steps (IntMap.union extra base)
+
+mergeStatic :: Array Int (Maybe Any) -> Array Int (Maybe Any) -> Array Int (Maybe Any)
+mergeStatic s1 s2 =
+  let (lo, hi) = bounds s1
+  in if lo > hi
+      then s1
+      else listArray (lo, hi) [case s2 ! i of
+                                Just v -> Just v
+                                Nothing -> s1 ! i
+                              | i <- [lo .. hi]]
+
+instance ComponentId c => Semigroup (Bag c) where
+  Bag s1 st1 <> Bag s2 st2 =
+    Bag (mergeStatic s1 s2) (stepsMerge st1 st2)
+
+instance ComponentId c => Monoid (Bag c) where
+  mempty = emptyBag
 
 data World c = World
   { nextIdW :: !Int
@@ -107,6 +202,9 @@ emptyWorld =
 entities :: World c -> [Entity]
 entities = map (Entity . rowId) . entitiesW
 
+nextId :: World c -> Int
+nextId = nextIdW
+
 foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
 foldEntities f s0 w =
   foldl'
@@ -114,7 +212,7 @@ foldEntities f s0 w =
     s0
     (entitiesW w)
 
-mapEntities :: ComponentId c => (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
+mapEntities :: (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
 mapEntities f w =
   w
     { entitiesW = map
@@ -126,9 +224,13 @@ mapEntities f w =
         (entitiesW w)
     }
 
-setEntities :: ComponentId c => [(Entity, Bag c)] -> World c -> World c
+setEntities :: [(Entity, Bag c)] -> World c -> World c
 setEntities rows w =
   w { entitiesW = map (\(Entity eid', bag) -> (eid', sigFromBag bag, bag)) rows }
+
+setEntityRows :: [EntityRow c] -> World c -> World c
+setEntityRows rows w =
+  w { entitiesW = rows }
 
 rowId :: EntityRow c -> Int
 rowId (eid', _, _) = eid'
@@ -139,26 +241,96 @@ lookupRow eid' ((eid'', _, bag) : rest)
   | eid' == eid'' = Just bag
   | otherwise = lookupRow eid' rest
 
-adjustRow :: ComponentId c => Int -> (Bag c -> Bag c) -> [EntityRow c] -> [EntityRow c]
-adjustRow _ _ [] = []
-adjustRow eid' f ((eid'', sig, bag) : rest)
-  | eid' == eid'' =
-      let bag' = f bag
-          sig' = sigFromBag bag'
-      in (eid'', sig', bag') : rest
-  | otherwise = (eid'', sig, bag) : adjustRow eid' f rest
-
 deleteRow :: Int -> [EntityRow c] -> [EntityRow c]
 deleteRow eid' = filter (\(eid'', _, _) -> eid'' /= eid')
 
 class Typeable a => Component c a where
   inj :: a -> c
   prj :: c -> Maybe a
+  default inj :: (Generic c, GInj (Rep c) a) => a -> c
+  inj a =
+    case gInj @(Rep c) a of
+      Just v -> to v
+      Nothing -> error "Component: type not present in component wrapper"
+  default prj :: (Generic c, GPrj (Rep c) a) => c -> Maybe a
+  prj c = gPrj (from c)
+
+instance {-# OVERLAPPABLE #-} (Typeable a, Generic c, Assert (HasType (Rep c) a) a c, GInj (Rep c) a, GPrj (Rep c) a) => Component c a
+
+type family EqT (a :: Type) (b :: Type) :: Bool where
+  EqT a a = 'True
+  EqT _ _ = 'False
+
+type family Or (a :: Bool) (b :: Bool) :: Bool where
+  Or 'True _ = 'True
+  Or 'False b = b
+
+type family HasType (f :: Type -> Type) (a :: Type) :: Bool where
+  HasType (l :+: r) a = Or (HasType l a) (HasType r a)
+  HasType (M1 _ _ f) a = HasType f a
+  HasType (K1 _ b) a = EqT a b
+  HasType U1 _ = 'False
+  HasType (l :*: r) _ =
+    TypeError ('Text "Component wrapper must be a sum of unary constructors; product found")
+  HasType _ _ = 'False
+
+type family Assert (b :: Bool) (a :: Type) (c :: Type) :: Constraint where
+  Assert 'True _ _ = ()
+  Assert 'False a c =
+    TypeError
+      ( 'Text "Component type "
+          ':<>: 'ShowType a
+          ':<>: 'Text " not present in wrapper "
+          ':<>: 'ShowType c
+      )
+
+class GInj f a where
+  gInj :: a -> Maybe (f p)
+
+instance (GInj l a, GInj r a) => GInj (l :+: r) a where
+  gInj x =
+    case gInj @l x of
+      Just v -> Just (L1 v)
+      Nothing -> R1 <$> gInj @r x
+
+instance GInj f a => GInj (M1 i c f) a where
+  gInj x = M1 <$> gInj @f x
+
+instance (Typeable a, Typeable b) => GInj (K1 i b) a where
+  gInj x = K1 <$> cast x
+
+instance GInj U1 a where
+  gInj _ = Nothing
+
+instance (GInj a1 a, GInj b1 a) => GInj (a1 :*: b1) a where
+  gInj _ = error "Component: product constructors not supported"
+
+class GPrj f a where
+  gPrj :: f p -> Maybe a
+
+instance (GPrj l a, GPrj r a) => GPrj (l :+: r) a where
+  gPrj (L1 l) = gPrj l
+  gPrj (R1 r) = gPrj r
+
+instance GPrj f a => GPrj (M1 i c f) a where
+  gPrj (M1 x) = gPrj x
+
+instance (Typeable a, Typeable b) => GPrj (K1 i b) a where
+  gPrj (K1 b) = cast b
+
+instance GPrj U1 a where
+  gPrj _ = Nothing
+
+instance (GPrj a1 a, GPrj b1 a) => GPrj (a1 :*: b1) a where
+  gPrj _ = error "Component: product constructors not supported"
 
 class ComponentId c where
   componentBit :: c -> Int
+  componentCount :: Int
   default componentBit :: (Generic c, GConstrIndex (Rep c)) => c -> Int
   componentBit = gConstrIndex . from
+  default componentCount :: (Generic c, GCount (Rep c)) => Int
+  componentCount = gCount @(Rep c)
 
 class GCount f where
   gCount :: Int
@@ -231,40 +403,40 @@ instance GComponentBit U1 a where
 instance (GComponentBit a a1, GComponentBit b a1) => GComponentBit (a :*: b) a1 where
   gComponentBit _ = error "ComponentBit: product constructors not supported"
 
-class Bundle c a where
-  bundle :: a -> [c]
+class ComponentId c => Bundle c a where
+  bundle :: a -> Bag c
 
-instance {-# OVERLAPPING #-} Bundle c () where
-  bundle _ = []
+instance {-# OVERLAPPING #-} ComponentId c => Bundle c () where
+  bundle _ = emptyBag
 
-instance {-# OVERLAPPABLE #-} Component c a => Bundle c a where
-  bundle a = [inj a]
+instance {-# INCOHERENT #-} (ComponentId c, Component c a, ComponentBit c a) => Bundle c a where
+  bundle a = bagSet a emptyBag
 
-instance {-# OVERLAPPING #-} Bundle c a => Bundle c (Maybe a) where
-  bundle = maybe [] bundle
+instance Bundle c a => Bundle c (Maybe a) where
+  bundle = maybe emptyBag bundle
 
-instance (Bundle c a, Bundle c b) => Bundle c (a, b) where
+instance {-# OVERLAPPING #-} (Bundle c a, Bundle c b) => Bundle c (a, b) where
   bundle (a, b) = bundle a <> bundle b
 
-instance (Bundle c a, Bundle c b, Bundle c d) => Bundle c (a, b, d) where
+instance {-# OVERLAPPING #-} (Bundle c a, Bundle c b, Bundle c d) => Bundle c (a, b, d) where
   bundle (a, b, d) = bundle a <> bundle b <> bundle d
 
-instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e) => Bundle c (a, b, d, e) where
+instance {-# OVERLAPPING #-} (Bundle c a, Bundle c b, Bundle c d, Bundle c e) => Bundle c (a, b, d, e) where
   bundle (a, b, d, e) = bundle a <> bundle b <> bundle d <> bundle e
 
-instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f) => Bundle c (a, b, d, e, f) where
+instance {-# OVERLAPPING #-} (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f) => Bundle c (a, b, d, e, f) where
   bundle (a, b, d, e, f) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f
 
-instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g) => Bundle c (a, b, d, e, f, g) where
+instance {-# OVERLAPPING #-} (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g) => Bundle c (a, b, d, e, f, g) where
   bundle (a, b, d, e, f, g) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f <> bundle g
 
-instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g, Bundle c h) => Bundle c (a, b, d, e, f, g, h) where
+instance {-# OVERLAPPING #-} (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g, Bundle c h) => Bundle c (a, b, d, e, f, g, h) where
   bundle (a, b, d, e, f, g, h) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f <> bundle g <> bundle h
 
-instance (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g, Bundle c h, Bundle c i) => Bundle c (a, b, d, e, f, g, h, i) where
+instance {-# OVERLAPPING #-} (Bundle c a, Bundle c b, Bundle c d, Bundle c e, Bundle c f, Bundle c g, Bundle c h, Bundle c i) => Bundle c (a, b, d, e, f, g, h, i) where
   bundle (a, b, d, e, f, g, h, i) = bundle a <> bundle b <> bundle d <> bundle e <> bundle f <> bundle g <> bundle h <> bundle i
 
-spawn :: (Bundle c a, ComponentId c) => a -> World c -> (Entity, World c)
+spawn :: Bundle c a => a -> World c -> (Entity, World c)
 spawn a w =
   let e = Entity (nextIdW w)
       bag = bundle a
@@ -289,8 +461,20 @@ dropRelEntity eid' =
         m'' = IntMap.filter (not . IntSet.null) m'
     in if IntMap.null m'' then Nothing else Just m'')
 
-sigFromBag :: ComponentId c => Bag c -> Sig
-sigFromBag = foldl' (\acc c -> acc .|. bit (componentBit c)) 0
+sigFromBag :: Bag c -> Sig
+sigFromBag bag =
+  let static = bagStatic bag
+      steps = bagSteps bag
+      (lo, hi) = bounds static
+      sigStatic =
+        if lo > hi
+          then 0
+          else foldl' (\acc i -> case static ! i of
+                                  Just _ -> acc .|. bit i
+                                  Nothing -> acc
+                        ) 0 [lo .. hi]
+      sigSteps = IntMap.foldlWithKey' (\acc bitIx _ -> acc .|. bit bitIx) 0 (stepsMap steps)
+  in sigStatic .|. sigSteps
 
 matchSig :: QueryInfo -> Sig -> Bool
 matchSig info sig =
@@ -303,30 +487,87 @@ runQuerySig q sig e bag =
     then runQuery q e bag
     else Nothing
 
-bagGet :: Component c a => Bag c -> Maybe a
-bagGet = foldr (\c acc -> prj c <|> acc) Nothing
+keyOfType :: forall c a. (Component c a, ComponentBit c a) => Key c
+keyOfType = Key (componentBitOf @c @a)
 
-bagSet :: forall a c. Component c a => a -> Bag c -> Bag c
-bagSet a = (inj a :) . filter (isNothing . prj @c @a)
+bagGetBy :: Int -> Bag c -> Maybe Any
+bagGetBy bitIx (Bag static steps) =
+  case stepsLookup bitIx steps of
+    Just slot -> Just (stepVal slot)
+    Nothing -> static ! bitIx
 
-bagDel :: forall a c. Component c a => Bag c -> Bag c
-bagDel = filter (isNothing . prj @c @a)
+bagGetByTyped :: forall a c. Int -> Bag c -> Maybe a
+bagGetByTyped bitIx bag = unsafeCoerce <$> bagGetBy bitIx bag
 
-get :: forall a c. Component c a => Entity -> World c -> Maybe a
+bagGetByUnsafe :: forall a c. Int -> Bag c -> a
+bagGetByUnsafe bitIx bag =
+  case bagGetBy bitIx bag of
+    Just v -> unsafeCoerce v
+    Nothing -> error "bagGetByUnsafe: missing component (signature mismatch?)"
+
+bagGet :: forall c a. (Component c a, ComponentBit c a) => Bag c -> Maybe a
+bagGet bag = bagGetByTyped (componentBitOf @c @a) bag
+
+bagSet :: forall a c. (Component c a, ComponentBit c a) => a -> Bag c -> Bag c
+bagSet a (Bag static steps) =
+  let bitIx = componentBitOf @c @a
+      vAny = unsafeCoerce a
+  in case stepsLookup bitIx steps of
+      Just (StepSlot _ sAny) ->
+        let steps' = stepsInsert bitIx (StepSlot vAny sAny) steps
+            static' = static // [(bitIx, Nothing)]
+        in Bag static' steps'
+      Nothing ->
+        Bag (static // [(bitIx, Just vAny)]) steps
+
+bagSetStep :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> Bag c -> Bag c
+bagSetStep s0 (Bag static steps) =
+  let stepAny = unsafeCoerce s0 :: F.Step () Any
+      (vAny, s1) = F.stepS stepAny 0 ()
+      bitIx = componentBitOf @c @a
+      slot = StepSlot vAny (unsafeCoerce s1)
+      steps' = stepsInsert bitIx slot steps
+      static' = static // [(bitIx, Nothing)]
+  in Bag static' steps'
+
+bagDel :: forall a c. (Component c a, ComponentBit c a) => Bag c -> Bag c
+bagDel (Bag static steps) =
+  let bitIx = componentBitOf @c @a
+      static' = static // [(bitIx, Nothing)]
+      steps' = stepsDelete bitIx steps
+  in Bag static' steps'
+
+get :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Maybe a
 get e w =
   case lookupRow (eid e) (entitiesW w) of
     Nothing -> Nothing
     Just bag -> bagGet bag
 
-set :: forall a c. (Component c a, ComponentId c) => Entity -> a -> World c -> World c
+set :: forall a c. (Component c a, ComponentBit c a) => Entity -> a -> World c -> World c
 set e a w =
-  w { entitiesW = adjustRow (eid e) (bagSet a) (entitiesW w) }
+  let eid' = eid e
+      bitC = bit (componentBitOf @c @a)
+      step (eid'', sig, bag)
+        | eid'' == eid' =
+            let bag' = bagSet a bag
+                sig' = sig .|. bitC
+            in (eid'', sig', bag')
+        | otherwise = (eid'', sig, bag)
+  in w { entitiesW = map step (entitiesW w) }
 
-del :: forall a c. (Component c a, ComponentId c) => Entity -> World c -> World c
+del :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> World c
 del e w =
-  w { entitiesW = adjustRow (eid e) (bagDel @a) (entitiesW w) }
+  let eid' = eid e
+      bitC = bit (componentBitOf @c @a)
+      step (eid'', sig, bag)
+        | eid'' == eid' =
+            let bag' = bagDel @a bag
+                sig' = sig .&. complement bitC
+            in (eid'', sig', bag')
+        | otherwise = (eid'', sig, bag)
+  in w { entitiesW = map step (entitiesW w) }
 
-has :: forall a c. Component c a => Entity -> World c -> Bool
+has :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Bool
 has e w = isJust (get @a e w)
 
 data QueryInfo = QueryInfo
@@ -343,6 +584,12 @@ instance Monoid QueryInfo where
 data Query c a = Query
   { runQuery :: Entity -> Bag c -> Maybe a
   , queryInfoQ :: QueryInfo
+  }
+
+data Plan c a = Plan
+  { planReq :: !Sig
+  , planForbid :: !Sig
+  , planRun :: !(Bag c -> a)
   }
 
 queryInfo :: Query c a -> QueryInfo
@@ -363,21 +610,29 @@ instance Alternative (Query c) where
   Query a _ <|> Query b _ = Query (\e bag -> a e bag <|> b e bag) mempty
 
 comp :: forall a c. (Component c a, ComponentBit c a) => Query c a
-comp = Query (\_ bag -> bagGet bag) (QueryInfo (bit (componentBitOf @c @a)) 0)
+comp =
+  let bitIx = componentBitOf @c @a
+  in Query (\_ bag -> bagGetByTyped bitIx bag) (QueryInfo (bit bitIx) 0)
 
-opt :: forall a c. Component c a => Query c (Maybe a)
-opt = Query (\_ bag -> Just (bagGet bag)) mempty
+opt :: forall a c. (Component c a, ComponentBit c a) => Query c (Maybe a)
+opt =
+  let bitIx = componentBitOf @c @a
+  in Query (\_ bag -> Just (bagGetByTyped bitIx bag)) mempty
 
 data Has a = Has deriving (Eq, Show)
 data Not a = Not deriving (Eq, Show)
 
 hasQ :: forall a c. (Component c a, ComponentBit c a) => Query c (Has a)
-hasQ = Query (\_ bag -> if isJust (bagGet bag :: Maybe a) then Just Has else Nothing)
-  (QueryInfo (bit (componentBitOf @c @a)) 0)
+hasQ =
+  let bitIx = componentBitOf @c @a
+  in Query (\_ bag -> if isJust (bagGetByTyped @a bitIx bag) then Just Has else Nothing)
+      (QueryInfo (bit bitIx) 0)
 
 notQ :: forall a c. (Component c a, ComponentBit c a) => Query c (Not a)
-notQ = Query (\_ bag -> if isJust (bagGet bag :: Maybe a) then Nothing else Just Not)
-  (QueryInfo 0 (bit (componentBitOf @c @a)))
+notQ =
+  let bitIx = componentBitOf @c @a
+  in Query (\_ bag -> if isJust (bagGetByTyped @a bitIx bag) then Nothing else Just Not)
+      (QueryInfo 0 (bit bitIx))
 
 runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
@@ -414,7 +669,7 @@ class QueryField c a where
 instance {-# OVERLAPPABLE #-} (Component c a, ComponentBit c a) => QueryField c a where
   fieldQuery = comp
 
-instance {-# OVERLAPPING #-} Component c a => QueryField c (Maybe a) where
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Maybe a) where
   fieldQuery = opt
 
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Has a) where
@@ -422,6 +677,29 @@ instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (
 
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Not a) where
   fieldQuery = notQ
+
+class PlanField c a where
+  fieldPlan :: (Sig, Sig, Bag c -> a)
+
+instance {-# OVERLAPPABLE #-} (Component c a, ComponentBit c a) => PlanField c a where
+  fieldPlan =
+    let bitIx = componentBitOf @c @a
+    in (bit bitIx, 0, bagGetByUnsafe bitIx)
+
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => PlanField c (Maybe a) where
+  fieldPlan =
+    let bitIx = componentBitOf @c @a
+    in (0, 0, bagGetByTyped bitIx)
+
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => PlanField c (Has a) where
+  fieldPlan =
+    let bitIx = componentBitOf @c @a
+    in (bit bitIx, 0, \_ -> Has)
+
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => PlanField c (Not a) where
+  fieldPlan =
+    let bitIx = componentBitOf @c @a
+    in (0, bit bitIx, \_ -> Not)
 
 class Queryable c a where
   queryC :: Query c a
@@ -433,11 +711,27 @@ class QueryableSum c a where
   default querySumC :: (Generic a, GQueryableSum c (Rep a)) => Query c a
   querySumC = to <$> gquerySum
 
+class Plannable c a where
+  planC :: Plan c a
+
+instance PlanField c a => Plannable c a where
+  planC =
+    let (req, forb, runF) = fieldPlan @c @a
+    in Plan req forb runF
+
 query :: forall a c. Queryable c a => Query c a
 query = queryC @c @a
 
 querySum :: forall a c. QueryableSum c a => Query c a
 querySum = querySumC @c @a
+
+plan :: forall a c. Plannable c a => Plan c a
+plan = planC @c @a
+
+planRec :: forall a c. (Generic a, GPlan c (Rep a)) => Plan c a
+planRec =
+  let (req, forb, runF) = gplan @c @(Rep a)
+  in Plan req forb (to . runF)
 
 class GQueryable c f where
   gquery :: Query c (f p)
@@ -468,6 +762,29 @@ instance GQueryableSum c f => GQueryableSum c (M1 S m f) where
 
 instance GQueryable c f => GQueryableSum c (M1 C m f) where
   gquerySum = M1 <$> gquery
+
+class GPlan c f where
+  gplan :: (Sig, Sig, Bag c -> f p)
+
+instance GPlan c U1 where
+  gplan = (0, 0, \_ -> U1)
+
+instance GPlan c f => GPlan c (M1 i m f) where
+  gplan =
+    let (req, forb, runF) = gplan @c @f
+    in (req, forb, \bag -> M1 (runF bag))
+
+instance (GPlan c a, GPlan c b) => GPlan c (a :*: b) where
+  gplan =
+    let (reqA, forbA, runA) = gplan @c @a
+        (reqB, forbB, runB) = gplan @c @b
+        run bag = runA bag :*: runB bag
+    in (reqA .|. reqB, forbA .|. forbB, run)
+
+instance PlanField c a => GPlan c (K1 i a) where
+  gplan =
+    let (req, forb, runF) = fieldPlan @c @a
+    in (req, forb, K1 . runF)
 
 put :: forall a c. Typeable a => a -> World c -> World c
 put a w =
@@ -531,3 +848,17 @@ deleteRel rid src dst table =
           then IntMap.delete rid table
           else IntMap.insert rid rels' table
   in table'
+stepWorld :: F.DTime -> World c -> World c
+stepWorld d w =
+  let rows = entitiesW w
+      hasSteps = any (\(_, _, bag) -> not (stepsNull (bagSteps bag))) rows
+  in if not hasSteps
+      then w
+      else w { entitiesW = map stepRow rows }
+  where
+    stepRow (eid', sig, bag)
+      | stepsNull (bagSteps bag) = (eid', sig, bag)
+      | otherwise = (eid', sig, stepBag d bag)
+
+stepBag :: F.DTime -> Bag c -> Bag c
+stepBag d bag = bag { bagSteps = stepsStepAll d (bagSteps bag) }

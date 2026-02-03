@@ -1,19 +1,19 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeApplications #-}
 
-module SystemProps
-  ( system_resume_once
-  , system_await_value
-  , system_eachm_entity_state
-  , prop_system_resume
-  , prop_system_await_value
+module ProgramProps
+  ( program_resume_once
+  , program_await_value
+  , program_eachm_entity_state
+  , prop_program_resume
+  , prop_program_await_value
   ) where
 
 import Data.List (foldl')
 import GHC.Generics (Generic)
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
-import qualified Engine.Data.System as S
+import qualified Engine.Data.Program as S
 
 data WaitGo
 data Speed
@@ -31,31 +31,22 @@ data C
 
 instance E.ComponentId C
 
-instance E.Component C Int where
-  inj = CInt
-  prj c = case c of
-    CInt v -> Just v
-    _ -> Nothing
-
-instance E.Component C Count where
-  inj = CCount
-  prj c = case c of
-    CCount v -> Just v
-    _ -> Nothing
-
 type World = E.World C
-type System msg = S.System C msg
-type SystemV msg a = S.SystemV C msg a
+type Program msg a = S.Program C msg a
 type Graph msg = S.Graph C msg
 
-system_resume_once :: Bool
-system_resume_once =
+program_resume_once :: Bool
+program_resume_once =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
-      sys :: SystemV String ()
-      sys = S.system (S.handle 0) $ do
-        S.each (E.comp @Int) (+1)
+      sys :: Program String ()
+      sys = S.program (S.handle 0) $ do
+        _ <- S.await $ S.batch $ do
+          S.each (E.comp @Int) $ \n ->
+            S.set (n + 1)
         _ <- S.awaitEvent (== "go")
-        S.each (E.comp @Int) (+10)
+        _ <- S.await $ S.batch $ do
+          S.each (E.comp @Int) $ \n ->
+            S.set (n + 10)
         pure ()
       g0 :: Graph String
       g0 = S.graph @String sys
@@ -68,35 +59,40 @@ system_resume_once =
       && E.get @Int e w3 == Just 11
       && E.get @Int e w4 == Just 12
 
-system_await_value :: Bool
-system_await_value =
+program_await_value :: Bool
+program_await_value =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
-      speedSys :: SystemV String Int
-      speedSys = S.system (S.handle 0) (pure 3)
-      useSys :: System String
-      useSys = S.system (S.handle 1) $ do
-        v <- S.await (S.handle 0)
-        S.each (E.comp @Int) (const v)
+      speedProg :: Program String Int
+      speedProg = S.program (S.handle 0) (pure 3)
+      useProg :: Program String ()
+      useProg = S.program (S.handle 1) $ do
+        v <- S.awaitProgram (S.handle 0)
+        _ <- S.await $ S.batch $ do
+          S.each (E.comp @Int) $ \_ ->
+            S.set (v :: Int)
+        pure ()
       g0 :: Graph String
-      g0 = S.graph @String useSys speedSys
+      g0 = S.graph @String useProg speedProg
       (w1, _, _) = S.run 0.1 w0 [] g0
   in E.get @Int e w1 == Just 3
 
 countStep :: F.Step (F.Events (Int -> Int)) Int
 countStep = F.acc 0
 
-countSys :: System ()
-countSys = S.system (S.handle 0) $ do
-  S.eachM @CountLoop (E.comp @Count) $ \_ -> do
-    n <- S.step @CountStep countStep [(+1)]
-    S.edit (S.set (Count n))
+countProg :: Program () ()
+countProg = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $ do
+    S.eachM @CountLoop (E.comp @Count) $ \_ -> do
+      n <- S.step @CountStep countStep [(+1)]
+      S.edit (S.set (Count n))
+  pure ()
 
-system_eachm_entity_state :: Bool
-system_eachm_entity_state =
+program_eachm_entity_state :: Bool
+program_eachm_entity_state =
   let (e1, w1) = E.spawn (Count 0) (E.emptyWorld :: World)
       (e2, w2) = E.spawn (Count 0) w1
       g0 :: Graph ()
-      g0 = S.graph @() countSys
+      g0 = S.graph @() countProg
       (w3, _, g1) = S.run 0.1 w2 [] g0
       (w4, _, _) = S.run 0.1 w3 [] g1
   in E.get @Count e1 w3 == Just (Count 1)
@@ -110,7 +106,7 @@ data Phase = Start | Wait
 stepPhase :: Phase -> Bool -> (Phase, Int)
 stepPhase Start ev =
   if ev
-    then (Start, 10)
+    then (Start, 11)
     else (Wait, 1)
 stepPhase Wait ev =
   if ev
@@ -128,11 +124,15 @@ expectedValue evs =
 runFrames :: [Bool] -> Int
 runFrames evs =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
-      sys :: SystemV String ()
-      sys = S.system (S.handle 0) $ do
-        S.each (E.comp @Int) (+1)
+      sys :: Program String ()
+      sys = S.program (S.handle 0) $ do
+        _ <- S.await $ S.batch $ do
+          S.each (E.comp @Int) $ \n ->
+            S.set (n + 1)
         _ <- S.awaitEvent (== "go")
-        S.each (E.comp @Int) (+10)
+        _ <- S.await $ S.batch $ do
+          S.each (E.comp @Int) $ \n ->
+            S.set (n + 10)
         pure ()
       g0 :: Graph String
       g0 = S.graph @String sys
@@ -145,20 +145,23 @@ runFrames evs =
       Nothing -> 0
       Just v -> v
 
-prop_system_resume :: [Bool] -> Bool
-prop_system_resume evs =
+prop_program_resume :: [Bool] -> Bool
+prop_program_resume evs =
   runFrames evs == expectedValue evs
 
-prop_system_await_value :: Int -> Bool
-prop_system_await_value v =
+prop_program_await_value :: Int -> Bool
+prop_program_await_value v =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
-      speedSys :: SystemV String Int
-      speedSys = S.system (S.handle 0) (pure v)
-      useSys :: System String
-      useSys = S.system (S.handle 1) $ do
-        v' <- S.await (S.handle 0)
-        S.each (E.comp @Int) (const v')
+      speedProg :: Program String Int
+      speedProg = S.program (S.handle 0) (pure v)
+      useProg :: Program String ()
+      useProg = S.program (S.handle 1) $ do
+        v' <- S.awaitProgram (S.handle 0)
+        _ <- S.await $ S.batch $ do
+          S.each (E.comp @Int) $ \_ ->
+            S.set (v' :: Int)
+        pure ()
       g0 :: Graph String
-      g0 = S.graph @String useSys speedSys
+      g0 = S.graph @String useProg speedProg
       (w1, _, _) = S.run 0.1 w0 [] g0
   in E.get @Int e w1 == Just v

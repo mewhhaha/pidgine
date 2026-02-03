@@ -30,30 +30,6 @@ data C
 
 instance E.ComponentId C
 
-instance E.Component C Int where
-  inj = CInt
-  prj c = case c of
-    CInt v -> Just v
-    _ -> Nothing
-
-instance E.Component C Bool where
-  inj = CBool
-  prj c = case c of
-    CBool v -> Just v
-    _ -> Nothing
-
-instance E.Component C T.Local where
-  inj = CLocal
-  prj c = case c of
-    CLocal v -> Just v
-    _ -> Nothing
-
-instance E.Component C T.Global where
-  inj = CGlobal
-  prj c = case c of
-    CGlobal v -> Just v
-    _ -> Nothing
-
 type World = E.World C
 
 prop_spawn_get :: Int -> Bool

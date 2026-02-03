@@ -1,23 +1,33 @@
 # redatared
 
 Small, pure data layer for game engines with a minimal FRP core and a tiny ECS.
-The API is intentionally simple and favors short, single‑word names.
+Pattern name: **ECP** (Entity‑Component‑Program). The API is intentionally simple and favors short, single‑word names.
+
+See `docs/first-principles.md` for the core model and runtime semantics.
 
 Suggested imports (to avoid name clashes with Prelude):
 
 ```haskell
 import qualified Engine.Data.FRP as F
 import qualified Engine.Data.ECS as E
-import qualified Engine.Data.System as S
+import qualified Engine.Data.Program as S
 import qualified Engine.Data.Input as I
 import qualified Engine.Data.Transform as T
 ```
 
 Note: Some examples use `do` with Applicative only; enable `ApplicativeDo`.
 
+## Philosophy (the short version)
+
+- Continuous, async-first: programs are coroutines that run across frames; `await` is explicit and everything else stays pure.
+- Time is first-class: `Step`/`Signal`/`Tween` model time directly and can be used inside programs via `S.step`.
+- Per-entity programs live in program locals: `eachM @Key` creates per-entity programs stored in program locals (not on entities), so entities only store components.
+- One sync point: `await (batch ...)` gathers `each`/`collect` and runs them in one pass.
+- Composition everywhere: queries are Applicative, patches are Semigroup/Monoid, steps compose, programs can `await` other programs/events.
+
 ## FRP: Practical examples
 
-These `Step`s can run standalone via `F.run` or inside systems via `S.step`.
+These `Step`s can run standalone via `F.run` or inside programs via `S.step`.
 
 ### 1) A constant signal
 
@@ -125,18 +135,20 @@ invuln :: F.Step I.Input Bool
 invuln = F.forFrom (I.press (I.Button "hit")) 1.0
 ```
 
-### 2d) Step inside System (composition)
+### 2d) Step inside Program (composition)
 
 ```haskell
--- Run a Step inside a System (state is kept per-system).
+-- Run a Step inside a Program (state is kept per-program).
 data Pos = Pos Double
 data WiggleTween
 
-wiggleSys :: System msg
-wiggleSys = S.system (S.handle 0) $ do
+wiggleProg :: Program msg
+wiggleProg = S.program (S.handle 0) $ do
   let tweenX = F.tween (F.Span 0 1) easeInOut (lerp (-2) 2)
   x <- S.step @WiggleTween (F.sample tweenX) ()
-  S.each (E.comp @Pos) (\_ -> Pos x)
+  _ <- S.await $ S.batch $ do
+    S.each (E.comp @Pos) $ \_ ->
+      S.set (Pos x)
 ```
 
 Note: `S.step @Key` stores Step state under a type key. Use a unique key per independent Step.
@@ -248,13 +260,13 @@ left = I.held (I.Button "left")
 moveX :: F.Step I.Input Double
 moveX = I.axis "x"
 
-waitJump :: System I.Input
-waitJump = S.system (S.handle 0) $ do
+waitJump :: Program I.Input
+waitJump = S.program (S.handle 0) $ do
   _ <- S.await (I.justPressed (I.Button "jump"))
   pure ()
 
-waitDash :: System I.Input
-waitDash = S.system (S.handle 0) $ do
+waitDash :: Program I.Input
+waitDash = S.program (S.handle 0) $ do
   _ <- S.await (I.axisAbove "x" 0.8)
   pure ()
 
@@ -271,7 +283,7 @@ sample = I.Input
 
 ## Composability patterns
 
-### 1) Applicative steps (parallel systems)
+### 1) Applicative steps (parallel programs)
 
 ```haskell
 sysA :: F.Step I.Input Int
@@ -308,7 +320,7 @@ q = do
   pure (p, v)
 ```
 
-### 3) Patches as Monoid (merge systems)
+### 3) Patches as Monoid (merge programs)
 
 ```haskell
 data Game
@@ -321,8 +333,8 @@ physics = pure (S.patch id)
 ai :: F.Step () Patch
 ai = pure (S.patch id)
 
-gameSys :: System msg
-gameSys = S.system (S.handle 0) $ do
+gameProg :: Program msg
+gameProg = S.program (S.handle 0) $ do
   p <- S.step @Physics physics ()
   a <- S.step @AI ai ()
   S.world (p <> a)
@@ -343,16 +355,16 @@ World
   relations : out/in (edge type -> adjacency)
 
 Graph
-  systems   : [System]
+  programs   : [Program]
 
-System (coroutine)
+Program (coroutine)
   - handle id
   - step state
-  - local state (per-system)
-  - per-entity programs (eachM) stored in system locals (keyed by EntityId)
+  - local state (per-program)
+  - per-entity programs (each @Key) stored in program locals (keyed by EntityId)
 ```
 
-Entities own only components; system-local programs/state are not stored on entities.
+Entities own only components; program-local programs/state are not stored on entities.
 
 ### 1) Spawn and access components
 
@@ -377,36 +389,12 @@ instance E.ComponentId C
 
 -- Note: component wrappers should be a sum of unary constructors so the
 -- bitset index can be derived automatically.
-
-instance E.Component C Pos where
-  inj = CPos
-  prj c = case c of
-    CPos v -> Just v
-    _ -> Nothing
-
-instance E.Component C Vel where
-  inj = CVel
-  prj c = case c of
-    CVel v -> Just v
-    _ -> Nothing
-
-instance E.Component C Player where
-  inj = CPlayer
-  prj c = case c of
-    CPlayer v -> Just v
-    _ -> Nothing
-
-instance E.Component C Enemy where
-  inj = CEnemy
-  prj c = case c of
-    CEnemy v -> Just v
-    _ -> Nothing
+-- No `Component` instances are required; they are inferred from the wrapper.
 
 type World = E.World C
 type Query a = E.Query C a
 type Graph msg = S.Graph C msg
-type System msg = S.System C msg
-type SystemV msg a = S.SystemV C msg a
+type Program msg a = S.Program C msg a
 type Patch = S.Patch C
 
 (e, w1) = E.spawn (Pos 0 0, Vel 1 0) (E.emptyWorld :: World)
@@ -610,43 +598,43 @@ world = T.ident T.<.> local
 
 ---
 
-## Systems: FRP + ECS together (async list)
+## Programs: FRP + ECS together (async list)
 
-Note: systems use explicit typed handles. You can create them manually with
+Note: programs use explicit typed handles. You can create them manually with
 `S.handle n` (unique per graph), or use the graph builder `S.graphM` to auto‑allocate
 handles for you.
-`System` is an alias for `SystemV msg ()` (with `C` baked in); if you want
-to `await` a value, use `SystemV msg a`.
+`Program msg a` is the program type (with `C` baked in); use `Program msg ()` for
+side‑effect programs, and any `a` if you want to `await` a value.
 
-Systems accumulate changes via `S.edit` (entity‑local) and `S.world` (global). Use
+Programs accumulate changes via `S.edit` (entity‑local) and `S.world` (global). Use
 `S.set`/`S.update`/`S.del` to build entity patches, and `S.setAt`/`S.updateAt`/`S.delAt`,
 `S.put`, `S.relate`, etc for global patches.
 The runtime
-re-runs only systems that return `wait` (directly or via `await` gating) until no
+re-runs only programs that return `wait` (directly or via `await` gating) until no
 new messages appear, so `await` can be satisfied within the same frame. The returned outbox is the
 aggregate of all messages emitted this frame.
-When an `await` is not ready, the rest of that system does not run for the tick.
-Systems are coroutines: they resume at the suspended `await` on later frames,
+When an `await` is not ready, the rest of that program does not run for the tick.
+Programs are coroutines: they resume at the suspended `await` on later frames,
 and restart from the top once they return.
 
-For “gathered” systems, use `system`: it batches `each`/`edit`/`send` operations and
-applies them once per tick, while `await` provides gating without manual `wait`.
-Use `sysP`/`sysE` only for low‑level patch or stateful `Step` systems (they also take a handle).
+Entity iteration lives inside `await (S.batch $ do ...)`. `S.each` (pure patch) and
+`S.collect` are only usable in a `batch`, so you can’t accidentally run them outside.
+A `batch` reads one snapshot, fuses the work into one pass, and applies patches once.
+If you want `do`‑notation inside `batch`, enable `ApplicativeDo`.
 
 For per‑entity continuations, use `eachM @Key` with a monadic body. This gives each
 entity its own time/state machine without storing Steps in components.
 `eachM @Key` resumes the per‑entity program; it is intentionally entity‑local (edit/await/send/step).
-If you need fresh data or cross‑entity effects, split into another system and communicate
+Note: some longer examples below still show `gather` or `each` with `edit`; translate
+them to `await (batch ...)` and `eachM` when you need monadic actions.
+If you need fresh data or cross‑entity effects, split into another program and communicate
 via events, then `await` the sync point you need.
 
 Graph construction is variadic: `S.graph sys1 sys2 sys3` (no list needed).
 
-Within a single `system`, all `each`/`collect` calls read the same world snapshot;
+Within a single `batch`, all `each`/`collect` calls read the same snapshot;
 their patches are merged and applied once. If you need “see the result of a
-previous update,” split it into another system and `await x`.
-
-On multicore runtimes (`+RTS -N`), `each`/`eachM`/`eachStep` automatically
-use data‑parallel chunks for large worlds; no extra config required.
+previous update,” split it into another program and `await x`, then `batch` again.
 
 ### Graph builder (auto handles)
 
@@ -656,11 +644,13 @@ If you don’t want to manage handle integers manually, use `graphM`:
 build :: (S.Handle Double, Graph ())
 build =
   S.graphM $ do
-    speedH <- S.systemM (pure 2.5)
-    _moveH <- S.systemM $ do
-      speed <- S.await speedH
+    speedH <- S.programM (pure 2.5)
+    _moveH <- S.programM $ do
+      speed <- S.awaitProgram speedH
       dt <- S.dt
-      S.each (E.comp :: Query Pos) (\(Pos x y) -> Pos (x + speed * dt) y)
+      _ <- S.await $ S.batch $ do
+        S.each (E.comp :: Query Pos) $ \(Pos x y) ->
+          S.set (Pos (x + speed * dt) y)
       pure ()
     pure speedH
 
@@ -676,20 +666,19 @@ data MoveQ = MoveQ
   } deriving (Generic)
 
 instance E.Queryable C MoveQ
-instance S.Eachable C MoveQ
 
-moveSys :: System ()
-moveSys = S.system (S.handle 0) $ do
+moveProg :: Program ()
+moveProg = S.program (S.handle 0) $ do
   dt <- S.dt
-  S.each (E.query @MoveQ) (\q ->
-    q { pos = let Pos x y = pos q
-                      Vel vx vy = vel q
-              in Pos (x + vx * dt) (y + vy * dt)
-      })
+  _ <- S.await $ S.batch $ do
+    S.each (E.query @MoveQ) $ \q ->
+      let Pos x y = pos q
+          Vel vx vy = vel q
+      in S.set (Pos (x + vx * dt) (y + vy * dt))
   pure ()
 
 g0 :: Graph ()
-g0 = S.graph moveSys
+g0 = S.graph moveProg
 
 runFrame :: F.DTime -> World -> Graph () -> (World, Graph ())
 runFrame dt w g =
@@ -697,7 +686,7 @@ runFrame dt w g =
   in (w', g')
 ```
 
-Note: Each round can be parallelized by evaluating all runnable systems
+Note: Each round can be parallelized by evaluating all runnable programs
 against the same snapshot/inbox and then merging patches in list order.
 The current `run` executes sequentially for simplicity.
 
@@ -715,26 +704,26 @@ resetScore e = S.updateAt e (const (Score 0)) -- or S.setAt e (Score 0)
 
 ---
 
-## System patterns
+## Program patterns
 
-### 1) Independent systems in one frame
+### 1) Independent programs in one frame
 
 ```haskell
 data Move
 data AI
 data Anim
 
-moveSys :: System ()
-moveSys = S.system (S.handle 0) (pure ())
+moveProg :: Program ()
+moveProg = S.program (S.handle 0) (pure ())
 
-aiSys :: System ()
-aiSys = S.system (S.handle 1) (pure ())   -- placeholder
+aiProg :: Program ()
+aiProg = S.program (S.handle 1) (pure ())   -- placeholder
 
-animSys :: System ()
-animSys = S.system (S.handle 2) (pure ()) -- placeholder
+animProg :: Program ()
+animProg = S.program (S.handle 2) (pure ()) -- placeholder
 
 g0 :: Graph ()
-g0 = S.graph moveSys aiSys animSys
+g0 = S.graph moveProg aiProg animProg
 ```
 
 ### 2) Deterministic patch order
@@ -744,52 +733,54 @@ data Physics
 data Collision
 data Damage
 
-physicsSys :: System ()
-physicsSys = S.system (S.handle 0) (pure ())
+physicsProg :: Program ()
+physicsProg = S.program (S.handle 0) (pure ())
 
-collisionSys :: System ()
-collisionSys = S.system (S.handle 1) (pure ())  -- resolve contacts
+collisionProg :: Program ()
+collisionProg = S.program (S.handle 1) (pure ())  -- resolve contacts
 
-damageSys :: System ()
-damageSys = S.system (S.handle 2) (pure ())
+damageProg :: Program ()
+damageProg = S.program (S.handle 2) (pure ())
 
 g0 :: Graph ()
-g0 = S.graph physicsSys aiSys collisionSys damageSys animSys
+g0 = S.graph physicsProg aiProg collisionProg damageProg animProg
 ```
 
 ### 3) Snapshot semantics
 
 ```haskell
--- All systems read the same snapshot; list order only affects patch application.
+-- All programs read the same snapshot; list order only affects patch application.
 data WritePos
 data ReadPos
 
-writePos :: System ()
-writePos = S.system (S.handle 0) $ do
-  S.each (E.comp :: Query Pos) (\(Pos x y) -> Pos (x + 1) y)
+writePos :: Program ()
+writePos = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $ do
+    S.each (E.comp :: Query Pos) $ \(Pos x y) ->
+      S.set (Pos (x + 1) y)
   pure ()
 
-readPos :: System ()
-readPos = S.system (S.handle 1) (pure ()) -- build a spatial index
+readPos :: Program ()
+readPos = S.program (S.handle 1) (pure ()) -- build a spatial index
 
 g0 :: Graph ()
 g0 = S.graph writePos readPos
 ```
 
-### 4) Messaging between systems
+### 4) Messaging between programs
 
 ```haskell
 data Msg = Fire | SpawnBullet deriving (Eq, Show)
-data FireSys
-data SpawnSys
+data FireProg
+data SpawnProg
 
-fireSys :: System Msg
-fireSys = S.system (S.handle 0) $ do
+fireProg :: Program Msg
+fireProg = S.program (S.handle 0) $ do
   _fires <- S.awaitEvent (== Fire)
   S.send [SpawnBullet]
 
-spawnSys :: System Msg
-spawnSys = S.system (S.handle 1) $ do
+spawnProg :: Program Msg
+spawnProg = S.program (S.handle 1) $ do
   spawns <- S.awaitEvent (== SpawnBullet)
   let p = foldMap (const (S.setAt e Bullet)) spawns  -- assume e exists
   S.world p
@@ -801,8 +792,8 @@ spawnSys = S.system (S.handle 1) $ do
 
 ### 4b) Movement waits for velocity update
 
-This pattern lets you write systems without rigid ordering: a system can
-use `await` to gate until another system has run in‑frame, and `run` will re‑run it in‑frame.
+This pattern lets you write programs without rigid ordering: a program can
+use `await` to gate until another program has run in‑frame, and `run` will re‑run it in‑frame.
 
 ```haskell
 data Vel = Vel Double Double
@@ -817,7 +808,6 @@ data MoveQ = MoveQ
   } deriving (Generic)
 
 instance E.Queryable C MoveQ
-instance S.Eachable C MoveQ
 
 speedH :: S.Handle ()
 speedH = S.handle 0
@@ -825,33 +815,33 @@ speedH = S.handle 0
 moveH :: S.Handle ()
 moveH = S.handle 1
 
-speedSys :: System ()
-speedSys = S.system speedH $ do
-  S.each (E.query @MoveQ) (\q ->
-    q { vel = let Vel vx vy = vel q in Vel (vx * 1.1) (vy * 1.1) }
-    )
+speedProg :: Program ()
+speedProg = S.program speedH $ do
+  _ <- S.await $ S.batch $ do
+    S.each (E.query @MoveQ) $ \q ->
+      let Vel vx vy = vel q
+      in S.set (Vel (vx * 1.1) (vy * 1.1))
   pure ()
 
-moveSys :: System ()
-moveSys = S.system moveH $ do
-  _ready <- S.await speedH
+moveProg :: Program ()
+moveProg = S.program moveH $ do
+  _ready <- S.awaitProgram speedH
   dt <- S.dt
-  S.each (E.query @MoveQ) (\q ->
-    q { pos = let Pos x y = pos q
-                      Vel vx vy = vel q
-                  in Pos (x + vx * dt) (y + vy * dt)
-      }
-    )
+  _ <- S.await $ S.batch $ do
+    S.each (E.query @MoveQ) $ \q ->
+      let Pos x y = pos q
+          Vel vx vy = vel q
+      in S.set (Pos (x + vx * dt) (y + vy * dt))
   pure ()
 
 g0 :: Graph ()
-g0 = S.graph moveSys speedSys  -- order doesn’t matter: moveSys waits
+g0 = S.graph moveProg speedProg  -- order doesn’t matter: moveProg waits
 ```
 
-### 4c) Await a system value
+### 4c) Await a program value
 
-`await` returns the value produced by the system (for its last in‑frame run).
-Use `SystemV` for non‑`()` values; `graph` accepts any mix of return types.
+`await` returns the value produced by the program (for its last in‑frame run).
+Use `Program msg a` for non‑`()` values; `graph` accepts any mix of return types.
 
 ```haskell
 data Speed
@@ -863,18 +853,32 @@ speedH = S.handle 0
 moveH :: S.Handle ()
 moveH = S.handle 1
 
-speedSys :: SystemV () Double
-speedSys = S.system speedH $ pure 2.5
+speedProg :: Program () Double
+speedProg = S.program speedH $ pure 2.5
 
-moveSys :: System ()
-moveSys = S.system moveH $ do
-  speed <- S.await speedH
+moveProg :: Program ()
+moveProg = S.program moveH $ do
+  speed <- S.awaitProgram speedH
   dt <- S.dt
-  S.each (E.comp :: Query Pos) (\(Pos x y) -> Pos (x + speed * dt) y)
+  _ <- S.await $ S.batch $ do
+    S.each (E.comp :: Query Pos) $ \(Pos x y) ->
+      S.set (Pos (x + speed * dt) y)
   pure ()
 
 g0 :: Graph ()
-g0 = S.graph speedSys moveSys
+g0 = S.graph speedProg moveProg
+```
+
+### 4c.1) Awaiting batches
+
+Use `await (batch ...)` to run entity work. The batch reads one snapshot and applies
+patches once.
+
+```haskell
+hits <- S.await $ S.batch $ do
+  S.each (E.comp @Pos) $ \(Pos x y) ->
+    S.set (Pos (x + 1) y)
+  S.collect (E.comp @Pos)
 ```
 
 Another common pattern is “compute collisions once, then consume them”:
@@ -891,25 +895,25 @@ collideH = S.handle 0
 damageH :: S.Handle ()
 damageH = S.handle 1
 
-collideSys :: SystemV () [Collision]
-collideSys = S.system collideH $ do
-  pairs <- S.collect (E.query @PairQ)  -- PairQ omitted for brevity
+collideProg :: Program () [Collision]
+collideProg = S.program collideH $ do
+  pairs <- S.await $ S.batch $ S.collect (E.query @PairQ)  -- PairQ omitted for brevity
   pure (detect pairs)                 -- detect :: [(Entity, PairQ)] -> [Collision]
 
-damageSys :: System ()
-damageSys = S.system damageH $ do
-  collisions <- S.await collideH
+damageProg :: Program ()
+damageProg = S.program damageH $ do
+  collisions <- S.awaitProgram collideH
   let p = foldMap applyDamage collisions
   S.world p
   pure ()
 
 g1 :: Graph ()
-g1 = S.graph collideSys damageSys
+g1 = S.graph collideProg damageProg
 ```
 
 ### 4d) Collect after sync point
 
-`await Update` waits until all systems have run once in the frame, then `collect` returns a snapshot.
+`await Update` waits until all programs have run once in the frame, then `collect` returns a snapshot.
 
 ```haskell
 data EnemyQ = EnemyQ
@@ -921,38 +925,10 @@ instance E.Queryable C EnemyQ
 
 data CountEnemies
 
-countEnemies :: System ()
-countEnemies = S.system (S.handle 0) $ do
-  _ <- S.await S.Update
-  enemies <- S.collect (E.query @EnemyQ)
+countEnemies :: Program ()
+countEnemies = S.program (S.handle 0) $ do
+  enemies <- S.await $ S.batch $ S.collect (E.query @EnemyQ)
   let n = length enemies
-  pure ()
-```
-
-### 4e) Await a group of systems
-
-Group multiple systems with `S.group` and wait for the whole group:
-
-```haskell
-data Physics
-data Move
-data Collide
-data Sync
-
-moveSys :: System ()
-moveSys = S.group @Physics $ S.system (S.handle 0) $ do
-  -- physics integration
-  pure ()
-
-collideSys :: System ()
-collideSys = S.group @Physics $ S.system (S.handle 1) $ do
-  -- collision resolution
-  pure ()
-
-syncSys :: System ()
-syncSys = S.system (S.handle 2) $ do
-  _ <- S.await (S.Group @Physics)
-  -- all physics systems have run this frame
   pure ()
 ```
 
@@ -961,8 +937,8 @@ syncSys = S.system (S.handle 2) $ do
 ```haskell
 data Job = LoadTex String | PlaySound String
 
-jobsSys :: System I.Input
-jobsSys = S.system (S.handle 0) $ do
+jobsProg :: Program I.Input
+jobsProg = S.program (S.handle 0) $ do
   _ <- S.await (I.justPressed (I.Button "jump"))
   S.send [PlaySound "jump.wav"]
 
@@ -992,11 +968,13 @@ tween2 duration from to = do
   u <- F.progress (0, duration)
   pure (from + u * (to - from))
 
--- System form (sample a tween with system time)
+-- Program form (sample a tween with program time)
 -- assume Pos component
--- tweenSys = S.system (S.handle 0) $ do
+-- tweenProg = S.program (S.handle 0) $ do
 --   x <- S.sample (F.tween (F.Span 0 duration) id (lerp 0 target))
---   S.each (E.comp @Pos) (\_ -> Pos x)
+--   _ <- S.await $ S.batch $ do
+--     S.each (E.comp @Pos) $ \_ -> S.set (Pos x)
+--   pure ()
 ```
 
 ### 2) Animated sprites (frame selection)
@@ -1016,8 +994,8 @@ sprite fps frames = do
 -- Example: 4 frames at 12 fps
 -- F.run (sprite 12 [0,1,2,3]) [(0.1,()), (0.1,()), (0.1,())]
 
--- System form:
--- spriteSys = S.system (S.handle 0) $ do
+-- Program form:
+-- spriteProg = S.program (S.handle 0) $ do
 --   t <- S.time
 --   let i = floor (t * fps) `mod` n
 --   S.send [Frame (frames !! i)]
@@ -1048,17 +1026,17 @@ collisions w =
     pairs = [(a,b) | (i,a) <- zip [0..] xs, (j,b) <- zip [0..] xs, i < j]
 ```
 
-### 4) Parallelism (compose independent systems)
+### 4) Parallelism (compose independent programs)
 
 ```haskell
-physicsSys :: System msg
-physicsSys = S.system (S.handle 0) (pure ())
+physicsProg :: Program msg
+physicsProg = S.program (S.handle 0) (pure ())
 
-aiSys :: System msg
-aiSys = S.system (S.handle 1) (pure ())
+aiProg :: Program msg
+aiProg = S.program (S.handle 1) (pure ())
 
 gameGraph :: Graph msg
-gameGraph = S.graph physicsSys aiSys
+gameGraph = S.graph physicsProg aiProg
 ```
 
 ### 5) Fixed timestep accumulator
@@ -1068,8 +1046,8 @@ gameGraph = S.graph physicsSys aiSys
 fixed60 :: F.Step a (F.Events ())
 fixed60 = F.every (1 / 60)
 
--- System form:
--- fixedSys = S.system (S.handle 0) $ do
+-- Program form:
+-- fixedProg = S.program (S.handle 0) $ do
 --   ticks <- S.step @Fixed fixed60 ()
 --   S.send (map (const Tick) ticks)
 ```
@@ -1163,7 +1141,7 @@ This pattern is explicit: each state returns `(state, events)` where events
 carry the next state. Time‑based transitions use `F.after`. The state machine
 runs continuously during gameplay; it is not a one‑time “startup” action.
 
-System form:
+Program form:
 
 ```haskell
 data EnemyAIKey
@@ -1174,21 +1152,23 @@ data EnemyQ = EnemyQ { sense :: Sense }
 
 instance E.Queryable C EnemyQ
 
-enemySys :: System msg
-enemySys = S.system (S.handle 0) $ do
-  S.eachM @EnemyLoop (E.query @EnemyQ) $ \q -> do
-    st <- S.step @EnemyAIKey enemy (sense q)
-    S.edit (S.set st)
+enemyProg :: Program msg
+enemyProg = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $ do
+    S.eachM @EnemyLoop (E.query @EnemyQ) $ \q -> do
+      st <- S.step @EnemyAIKey enemy (sense q)
+      S.edit (S.set st)
+  pure ()
 ```
 
-Tip: for per‑entity time, use `S.step @Key F.time ()` inside `eachM @Key`.
+Tip: for per‑entity time, use `S.step @Key F.time ()` inside `each @Key`.
 
 ---
 
 ## Mini‑games (practical sketches)
 
 The examples below are intentionally small and practical. They show how you can
-structure a game loop using `System` (Step‑style time), `World`, and `Query`.
+structure a game loop using `Program` (Step‑style time), `World`, and `Query`.
 
 ### 1) Pong (ECS + FRP)
 
@@ -1197,7 +1177,7 @@ structure a game loop using `System` (Step‑style time), `World`, and `Query`.
 
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
-import qualified Engine.Data.System as S
+import qualified Engine.Data.Program as S
 
 data Pos = Pos Double Double deriving (Show, Eq)
 data Vel = Vel Double Double deriving (Show, Eq)
@@ -1220,36 +1200,34 @@ data MoveQ = MoveQ
   } deriving (Generic)
 
 instance E.Queryable C MoveQ
-instance S.Eachable C MoveQ
-
 moveH :: S.Handle ()
 moveH = S.handle 0
 
 bounceH :: S.Handle ()
 bounceH = S.handle 1
 
-moveSys :: System ()
-moveSys = S.system moveH $ do
+moveProg :: Program ()
+moveProg = S.program moveH $ do
   dt <- S.dt
-  S.each (E.query @MoveQ) (\q ->
-    q { pos = let Pos x y = pos q
-                      Vel vx vy = vel q
-              in Pos (x + vx * dt) (y + vy * dt)
-      })
+  _ <- S.await $ S.batch $ do
+    S.each (E.query @MoveQ) $ \q ->
+      let Pos x y = pos q
+          Vel vx vy = vel q
+      in S.set (Pos (x + vx * dt) (y + vy * dt))
   pure ()
 
-bounceSys :: System ()
-bounceSys = S.system bounceH $ do
-  _ <- S.await moveH
-  S.each (E.query @MoveQ) (\q ->
-    q { vel = let Pos _ y = pos q
-                      Vel vx vy = vel q
-                  in Vel vx (if y > 9 || y < (-9) then -vy else vy)
-      })
+bounceProg :: Program ()
+bounceProg = S.program bounceH $ do
+  _ <- S.awaitProgram moveH
+  _ <- S.await $ S.batch $ do
+    S.each (E.query @MoveQ) $ \q ->
+      let Pos _ y = pos q
+          Vel vx vy = vel q
+      in S.set (Vel vx (if y > 9 || y < (-9) then -vy else vy))
   pure ()
 
 pongGraph0 :: Graph ()
-pongGraph0 = S.graph moveSys bounceSys
+pongGraph0 = S.graph moveProg bounceProg
 
 frame :: F.DTime -> World -> Graph () -> (World, Graph ())
 frame dt w g =
@@ -1393,11 +1371,11 @@ stepBullet b0 = do
       t = u * 2
   pure (if u >= 1 then Nothing else Just (Bullet (advance t p v) v))
 
--- System form:
--- shipSys = S.system (S.handle 0) $ do
+-- Program form:
+-- shipProg = S.program (S.handle 0) $ do
 --   ship <- S.step @Ship (stepShip s0) ()
 --   ...
--- bulletSys = S.system (S.handle 1) $ do
+-- bulletProg = S.program (S.handle 1) $ do
 --   b <- S.step @Bullet (stepBullet b0) ()
 --   ...
 ```
@@ -1459,7 +1437,7 @@ push d s =
 {-# LANGUAGE TypeApplications #-}
 
 import qualified Engine.Data.ECS as E
-import qualified Engine.Data.System as S
+import qualified Engine.Data.Program as S
 import qualified Engine.Data.Input as I
 
 data Pos = Pos Double Double deriving (Eq, Show)
@@ -1481,26 +1459,32 @@ data Gravity
 data Move
 data Jump
 
-gravitySys :: System I.Input
-gravitySys = S.system (S.handle 0) $ do
+gravityProg :: Program I.Input
+gravityProg = S.program (S.handle 0) $ do
   dt <- S.dt
-  S.each (E.comp @Vel) $ \(Vel vx vy) ->
-    Vel vx (vy - 9.8 * dt)
+  _ <- S.await $ S.batch $ do
+    S.each (E.comp @Vel) $ \(Vel vx vy) ->
+      S.set (Vel vx (vy - 9.8 * dt))
+  pure ()
 
-moveSys :: System I.Input
-moveSys = S.system (S.handle 1) $ do
+moveProg :: Program I.Input
+moveProg = S.program (S.handle 1) $ do
   dt <- S.dt
-  S.eachP (E.query @MoveQ) $ \(MoveQ (Pos x y) (Vel vx vy)) ->
-    S.set (Pos (x + vx * dt) (y + vy * dt))
+  _ <- S.await $ S.batch $ do
+    S.each (E.query @MoveQ) $ \(MoveQ (Pos x y) (Vel vx vy)) ->
+      S.set (Pos (x + vx * dt) (y + vy * dt))
+  pure ()
 
-jumpSys :: System I.Input
-jumpSys = S.system (S.handle 2) $ do
+jumpProg :: Program I.Input
+jumpProg = S.program (S.handle 2) $ do
   _ <- S.await (I.justPressed (I.Button "jump"))
-  S.eachP (E.query @JumpQ) $ \(JumpQ (Vel vx _) _) ->
-    S.set (Vel vx 12) <> S.del @OnGround
+  _ <- S.await $ S.batch $ do
+    S.each (E.query @JumpQ) $ \(JumpQ (Vel vx _) _) ->
+      S.set (Vel vx 12) <> S.del @OnGround
+  pure ()
 
 platGraph :: Graph I.Input
-platGraph = S.graph gravitySys moveSys jumpSys
+platGraph = S.graph gravityProg moveProg jumpProg
 ```
 
 ### 11) Vampire Survivors (waves + enemy pool)
@@ -1511,7 +1495,7 @@ platGraph = S.graph gravitySys moveSys jumpSys
 
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
-import qualified Engine.Data.System as S
+import qualified Engine.Data.Program as S
 
 data Msg = SpawnEnemy | Reward deriving (Eq, Show)
 data Enemy = Enemy deriving (Eq, Show)
@@ -1519,8 +1503,8 @@ data HP = HP Int deriving (Eq, Show)
 data Pos = Pos Double Double deriving (Eq, Show)
 data SpawnTick
 
-spawnTickSys :: System Msg
-spawnTickSys = S.system (S.handle 0) $ do
+spawnTickProg :: Program Msg
+spawnTickProg = S.program (S.handle 0) $ do
   evs <- S.step @SpawnTick (F.every 0.5) ()
   S.send (map (const SpawnEnemy) evs)
 
@@ -1529,10 +1513,11 @@ data PoolQ = PoolQ { free :: E.Not Enemy }
 
 instance E.Queryable C PoolQ
 
-spawnSys :: System Msg
-spawnSys = S.system (S.handle 1) $ do
+spawnProg :: Program Msg
+spawnProg = S.program (S.handle 1) $ do
   spawns <- S.awaitEvent (== SpawnEnemy)
-  pool <- S.collect (E.query @PoolQ)
+  pool <- S.await $ S.batch $ do
+    S.collect (E.query @PoolQ)
   let targets = take (length spawns) pool
       p = foldMap (\(e, _) ->
             S.setAt e Enemy <> S.setAt e (HP 5) <> S.setAt e (Pos 0 0)
@@ -1546,7 +1531,7 @@ spawnSys = S.system (S.handle 1) $ do
 {-# LANGUAGE TypeApplications #-}
 
 import qualified Engine.Data.ECS as E
-import qualified Engine.Data.System as S
+import qualified Engine.Data.Program as S
 
 data Msg = TalkNPC | BossDown | GiveReward deriving (Eq, Show)
 data Quest = NotStarted | InProgress | Complete deriving (Eq, Show)
@@ -1554,21 +1539,23 @@ data Quest = NotStarted | InProgress | Complete deriving (Eq, Show)
 data QuestStart
 data QuestFinish
 
-questStartSys :: System Msg
-questStartSys = S.system (S.handle 0) $ do
+questStartProg :: Program Msg
+questStartProg = S.program (S.handle 0) $ do
   _ <- S.awaitEvent (== TalkNPC)
-  S.each (E.comp @Quest) $ \q ->
-    case q of
-      NotStarted -> InProgress
-      _ -> q
+  _ <- S.await $ S.batch $ do
+    S.each (E.comp @Quest) $ \q ->
+      case q of
+        NotStarted -> S.set InProgress
+        _ -> mempty
 
-questFinishSys :: System Msg
-questFinishSys = S.system (S.handle 1) $ do
+questFinishProg :: Program Msg
+questFinishProg = S.program (S.handle 1) $ do
   _ <- S.awaitEvent (== BossDown)
-  S.each (E.comp @Quest) $ \q ->
-    case q of
-      InProgress -> Complete
-      _ -> q
+  _ <- S.await $ S.batch $ do
+    S.each (E.comp @Quest) $ \q ->
+      case q of
+        InProgress -> S.set Complete
+        _ -> mempty
   S.send [GiveReward]
 ```
 
@@ -1585,15 +1572,15 @@ questFinishSys = S.system (S.handle 1) $ do
 ## Pain points (current)
 
 - No built-in IO/async runtime: `Job`/`Events` are data only; you need an external executor.
-- System graph runs sequentially; parallelism is data‑parallel inside `each`/`eachM`/`eachStep` only.
+- Program graph runs sequentially; parallelism is not automatic.
 - Patch conflicts are resolved by list order; no merge policy beyond `Semigroup` order.
-- Waiting systems are re-run within a frame; misbehaving systems can loop forever.
+- Waiting programs are re-run within a frame; misbehaving programs can loop forever.
 - `QueryableSum` skips signature pruning; sum queries scan all entities.
 - Queries are applicative; no dependent queries without giving up pruning.
 - No spatial index; collision queries are naive unless you build your own structure.
-- `Events` are plain lists: no timestamps, priorities, or guaranteed ordering across systems.
+- `Events` are plain lists: no timestamps, priorities, or guaranteed ordering across programs.
 - Long-running `Step`s require manual state hygiene; no built-in garbage collection for events.
-- Coroutine systems aren’t serializable as data; mid-flight saves require input logging/replay.
-- Relative timers are event-driven; there’s no first-class clock scaling/pausing per system.
+- Coroutine programs aren’t serializable as data; mid-flight saves require input logging/replay.
+- Relative timers are event-driven; there’s no first-class clock scaling/pausing per program.
 - No prefab/archetype registry; bundles are just ad‑hoc values without tooling.
 - `progress` clamps; `range` is windowed—users need to learn the distinction.

@@ -3,6 +3,7 @@ dist/
 .ghc.environment.*
 /.cabal/
 .cabal-logs/
+.cabal-store-prof/
 *.hi
 *.o
 *.dyn_hi

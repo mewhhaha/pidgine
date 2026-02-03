@@ -21,7 +21,8 @@ library
     import:           warnings
     exposed-modules:  Engine.Data.FRP
                       Engine.Data.ECS
-                      Engine.Data.System
+                      Engine.Data.Program
+                      Engine.Data.Program.Core
                       Engine.Data.Input
                       Engine.Data.Transform
     -- other-modules:
@@ -39,7 +40,7 @@ test-suite redatared-tests
     main-is:          Main.hs
     other-modules:    FRPProps
                       ECSProps
-                      SystemProps
+                      ProgramProps
     build-depends:    base ^>=4.21.0.0
                       , array
                       , containers

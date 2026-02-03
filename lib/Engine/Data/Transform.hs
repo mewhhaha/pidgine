@@ -194,23 +194,23 @@ parent e w =
 children :: Entity -> World c -> [Entity]
 children = E.out @ParentOf
 
-propagate :: (E.Component c Local, E.Component c Global, E.ComponentId c) => World c -> World c
+propagate :: (E.Component c Local, E.ComponentBit c Local, E.Component c Global, E.ComponentBit c Global) => World c -> World c
 propagate w0 =
   let roots = Prelude.filter (\e -> parent e w0 == Nothing) (E.entities w0)
   in foldl' (propRoot w0) w0 roots
 
-propRoot :: (E.Component c Local, E.Component c Global, E.ComponentId c) => World c -> World c -> Entity -> World c
+propRoot :: (E.Component c Local, E.ComponentBit c Local, E.Component c Global, E.ComponentBit c Global) => World c -> World c -> Entity -> World c
 propRoot w0 w e =
   let l = localOrIdentity w0 e
       g = toGlobal l
       w1 = E.set e g w
   in propChildren w0 w1 (IntSet.singleton (E.eid e)) e g
 
-propChildren :: (E.Component c Local, E.Component c Global, E.ComponentId c) => World c -> World c -> IntSet -> Entity -> Global -> World c
+propChildren :: (E.Component c Local, E.ComponentBit c Local, E.Component c Global, E.ComponentBit c Global) => World c -> World c -> IntSet -> Entity -> Global -> World c
 propChildren w0 w visited p gp =
   foldl' (propChild w0 visited gp) w (children p w0)
 
-propChild :: (E.Component c Local, E.Component c Global, E.ComponentId c) => World c -> IntSet -> Global -> World c -> Entity -> World c
+propChild :: (E.Component c Local, E.ComponentBit c Local, E.Component c Global, E.ComponentBit c Global) => World c -> IntSet -> Global -> World c -> Entity -> World c
 propChild w0 visited gp w e =
   if IntSet.member (E.eid e) visited
     then w
@@ -221,7 +221,7 @@ propChild w0 visited gp w e =
           visited' = IntSet.insert (E.eid e) visited
       in propChildren w0 w1 visited' e g
 
-localOrIdentity :: E.Component c Local => World c -> Entity -> Local
+localOrIdentity :: (E.Component c Local, E.ComponentBit c Local) => World c -> Entity -> Local
 localOrIdentity w e =
   case E.get @Local e w of
     Just l -> l

@@ -1,3 +1,4 @@
+{-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -8,7 +9,7 @@ import Data.List (foldl')
 import GHC.Generics (Generic)
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
-import qualified Engine.Data.System as S
+import qualified Engine.Data.Program as S
 
 data Pos = Pos Double Double
   deriving (Eq, Show)
@@ -31,37 +32,14 @@ data C
 
 instance E.ComponentId C
 
-instance E.Component C Pos where
-  inj = CPos
-  prj c = case c of
-    CPos v -> Just v
-    _ -> Nothing
-
-instance E.Component C Vel where
-  inj = CVel
-  prj c = case c of
-    CVel v -> Just v
-    _ -> Nothing
-
-instance E.Component C Acc where
-  inj = CAcc
-  prj c = case c of
-    CAcc v -> Just v
-    _ -> Nothing
-
-instance E.Component C Hp where
-  inj = CHp
-  prj c = case c of
-    CHp v -> Just v
-    _ -> Nothing
-
-instance S.Eachable C (Pos, Vel)
 
 type World = E.World C
-type System msg = S.System C msg
+type Program msg a = S.Program C msg a
 type Graph msg = S.Graph C msg
 
 data MoveLoop
+data MoveLoop1
+data MoveLoop2
 
 data Move3 = Move3
   { pos3 :: Pos
@@ -70,7 +48,6 @@ data Move3 = Move3
   } deriving (Generic)
 
 instance E.Queryable C Move3
-instance S.Eachable C Move3
 
 buildWorld :: Int -> World
 buildWorld n = snd (foldl' add (0 :: Int, E.emptyWorld) [1 .. n])
@@ -86,45 +63,64 @@ buildWorld n = snd (foldl' add (0 :: Int, E.emptyWorld) [1 .. n])
               w
       in (i + 1, w1)
 
-qPV :: E.Query C (Pos, Vel)
-qPV = (,) <$> (E.comp :: E.Query C Pos) <*> (E.comp :: E.Query C Vel)
+pPV :: E.Plan C (Pos, Vel)
+pPV = E.planRec @(Pos, Vel)
 
-qP :: E.Query C Pos
-qP = E.comp
+pP :: E.Plan C Pos
+pP = E.plan @Pos
 
-qVA :: E.Query C (Vel, Acc)
-qVA = (,) <$> (E.comp :: E.Query C Vel) <*> (E.comp :: E.Query C Acc)
+pVA :: E.Plan C (Vel, Acc)
+pVA = E.planRec @(Vel, Acc)
 
-qMove3 :: E.Query C Move3
-qMove3 = E.query @Move3
+pMove3 :: E.Plan C Move3
+pMove3 = E.planRec @Move3
 
-moveSys :: System String
-moveSys = S.system (S.handle 0) $ do
-  S.each qPV (\(Pos x y, Vel vx vy) -> (Pos (x + vx) (y + vy), Vel vx vy))
+qPVQ :: E.Query C (Pos, Vel)
+qPVQ = (,) <$> (E.comp :: E.Query C Pos) <*> (E.comp :: E.Query C Vel)
+
+qPQ :: E.Query C Pos
+qPQ = E.comp
+
+moveProg :: Program String ()
+moveProg = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    S.eachP pPV $ \(Pos x y, Vel vx vy) ->
+      let p = Pos (x + vx) (y + vy)
+          v = Vel vx vy
+      in S.set p <> S.set v
   pure ()
 
-moveSysSmall :: System String
-moveSysSmall = S.system (S.handle 0) $ do
-  S.each qP (\(Pos x y) -> Pos (x + 1) y)
+moveProgSmall :: Program String ()
+moveProgSmall = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    S.eachP pP $ \(Pos x y) ->
+      let p = Pos (x + 1) y
+      in S.set p
   pure ()
 
-moveSysJoin3 :: System String
-moveSysJoin3 = S.system (S.handle 0) $ do
-  S.each qMove3 (\q ->
-    let Pos x y = pos3 q
-        Vel vx vy = vel3 q
-        Acc ax ay = acc3 q
-        vx' = vx + ax
-        vy' = vy + ay
-        p' = Pos (x + vx') (y + vy')
-    in q { pos3 = p', vel3 = Vel vx' vy' }
-    )
+moveProgJoin3 :: Program String ()
+moveProgJoin3 = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    S.eachP pMove3 $ \q ->
+      let Pos x y = pos3 q
+          Vel vx vy = vel3 q
+          Acc ax ay = acc3 q
+          vx' = vx + ax
+          vy' = vy + ay
+          p' = Pos (x + vx') (y + vy')
+      in S.set p' <> S.set (Vel vx' vy')
   pure ()
 
-moveSysTwoEach :: System String
-moveSysTwoEach = S.system (S.handle 0) $ do
-  S.each qPV (\(Pos x y, Vel vx vy) -> (Pos (x + vx) (y + vy), Vel vx vy))
-  S.eachP qVA (\(Vel vx vy, Acc ax ay) -> S.set (Vel (vx + ax) (vy + ay)))
+moveProgTwoEach :: Program String ()
+moveProgTwoEach = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    (S.eachP pPV $ \(Pos x y, Vel vx vy) ->
+      let p = Pos (x + vx) (y + vy)
+      in S.set p)
+    *>
+    (S.eachP pVA $ \(Vel vx vy, Acc ax ay) ->
+      let v = Vel (vx + ax) (vy + ay)
+      in S.set v)
   pure ()
 
 advance :: Double -> Pos -> Vel -> (Pos, Vel)
@@ -137,13 +133,13 @@ advance dt (Pos x y) (Vel vx vy) =
       y' = y + vy' * dt + cos vy'
   in (Pos x' y', Vel vx' vy')
 
-moveSysLogic :: System String
-moveSysLogic = S.system (S.handle 0) $ do
+moveProgLogic :: Program String ()
+moveProgLogic = S.program (S.handle 0) $ do
   dt <- S.dt
-  S.each qPV (\(p, v) ->
-    let (p', v') = advance dt p v
-    in (p', v')
-    )
+  _ <- S.await $ S.batch $
+    S.eachP pPV $ \(p, v) ->
+      let (p', v') = advance dt p v
+      in S.set p' <> S.set v'
   pure ()
 
 moveStep :: F.Step (Pos, Vel) (Pos, Vel)
@@ -152,100 +148,108 @@ moveStep = F.Step $ \dt (Pos x y, Vel vx vy) ->
       v = Vel vx vy
   in ((p, v), moveStep)
 
-moveSysStep :: System String
-moveSysStep = S.system (S.handle 1) $ do
-  S.eachStep @MoveLoop qPV moveStep $ \_ (p, v) ->
-    S.set p <> S.set v
+moveProgStep :: Program String ()
+moveProgStep = S.program (S.handle 1) $ do
+  _ <- S.await $ S.batch $
+    S.eachMP @MoveLoop pPV $ \(p, v) -> do
+      (p', v') <- S.step @MoveLoop moveStep (p, v)
+      S.edit (S.set p' <> S.set v')
   pure ()
 
-moveSysM :: System String
-moveSysM = S.system (S.handle 0) $ do
-  S.eachM @MoveLoop qPV $ \(Pos x y, Vel vx vy) -> do
-    let p = Pos (x + vx) (y + vy)
-        v = Vel vx vy
-    S.edit (S.set p <> S.set v)
+moveProgM :: Program String ()
+moveProgM = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    S.eachMP @MoveLoop pPV $ \(Pos x y, Vel vx vy) -> do
+      let p = Pos (x + vx) (y + vy)
+          v = Vel vx vy
+      S.edit (S.set p <> S.set v)
   pure ()
 
-moveSysMSmall :: System String
-moveSysMSmall = S.system (S.handle 0) $ do
-  S.eachM @MoveLoop qP $ \(Pos x y) -> do
-    let p = Pos (x + 1) y
-    S.edit (S.set p)
+moveProgMSmall :: Program String ()
+moveProgMSmall = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    S.eachMP @MoveLoop pP $ \(Pos x y) -> do
+      let p = Pos (x + 1) y
+      S.edit (S.set p)
   pure ()
 
-moveSysMJoin3 :: System String
-moveSysMJoin3 = S.system (S.handle 0) $ do
-  S.eachM @MoveLoop qMove3 $ \q -> do
-    let Pos x y = pos3 q
-        Vel vx vy = vel3 q
-        Acc ax ay = acc3 q
-        vx' = vx + ax
-        vy' = vy + ay
-        p' = Pos (x + vx') (y + vy')
-    S.edit (S.set p' <> S.set (Vel vx' vy'))
+moveProgMJoin3 :: Program String ()
+moveProgMJoin3 = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    S.eachMP @MoveLoop pMove3 $ \q -> do
+      let Pos x y = pos3 q
+          Vel vx vy = vel3 q
+          Acc ax ay = acc3 q
+          vx' = vx + ax
+          vy' = vy + ay
+          p' = Pos (x + vx') (y + vy')
+      S.edit (S.set p' <> S.set (Vel vx' vy'))
   pure ()
 
-moveSysMTwoEach :: System String
-moveSysMTwoEach = S.system (S.handle 0) $ do
-  S.eachM @MoveLoop qPV $ \(Pos x y, Vel vx vy) -> do
-    let p = Pos (x + vx) (y + vy)
-    S.edit (S.set p)
-  S.eachM @MoveLoop qVA $ \(Vel vx vy, Acc ax ay) -> do
-    let v = Vel (vx + ax) (vy + ay)
-    S.edit (S.set v)
+moveProgMTwoEach :: Program String ()
+moveProgMTwoEach = S.program (S.handle 0) $ do
+  _ <- S.await $ S.batch $
+    (S.eachMP @MoveLoop1 pPV $ \(Pos x y, Vel vx vy) -> do
+      let p = Pos (x + vx) (y + vy)
+      S.edit (S.set p))
+    *>
+    (S.eachMP @MoveLoop2 pVA $ \(Vel vx vy, Acc ax ay) -> do
+      let v = Vel (vx + ax) (vy + ay)
+      S.edit (S.set v))
   pure ()
 
-moveSysMLogic :: System String
-moveSysMLogic = S.system (S.handle 0) $ do
+moveProgMLogic :: Program String ()
+moveProgMLogic = S.program (S.handle 0) $ do
   dt <- S.dt
-  S.eachM @MoveLoop qPV $ \(p, v) -> do
-    let (p', v') = advance dt p v
-    S.edit (S.set p' <> S.set v')
+  _ <- S.await $ S.batch $
+    S.eachMP @MoveLoop pPV $ \(p, v) -> do
+      let (p', v') = advance dt p v
+      S.edit (S.set p' <> S.set v')
   pure ()
 
 graphEach :: Graph String
-graphEach = S.graph @String moveSys
+graphEach = S.graph @String moveProg
 
 graphEachS :: Graph String
-graphEachS = S.graph @String moveSysStep
+graphEachS = S.graph @String moveProgStep
 
 graphEachM :: Graph String
-graphEachM = S.graph @String moveSysM
+graphEachM = S.graph @String moveProgM
 
 graphEachSmall :: Graph String
-graphEachSmall = S.graph @String moveSysSmall
+graphEachSmall = S.graph @String moveProgSmall
 
 graphEachJoin3 :: Graph String
-graphEachJoin3 = S.graph @String moveSysJoin3
+graphEachJoin3 = S.graph @String moveProgJoin3
 
 graphEachTwoEach :: Graph String
-graphEachTwoEach = S.graph @String moveSysTwoEach
+graphEachTwoEach = S.graph @String moveProgTwoEach
 
 graphEachLogic :: Graph String
-graphEachLogic = S.graph @String moveSysLogic
+graphEachLogic = S.graph @String moveProgLogic
 
 graphEachMSmall :: Graph String
-graphEachMSmall = S.graph @String moveSysMSmall
+graphEachMSmall = S.graph @String moveProgMSmall
 
 graphEachMJoin3 :: Graph String
-graphEachMJoin3 = S.graph @String moveSysMJoin3
+graphEachMJoin3 = S.graph @String moveProgMJoin3
 
 graphEachMTwoEach :: Graph String
-graphEachMTwoEach = S.graph @String moveSysMTwoEach
+graphEachMTwoEach = S.graph @String moveProgMTwoEach
 
 graphEachMLogic :: Graph String
-graphEachMLogic = S.graph @String moveSysMLogic
+graphEachMLogic = S.graph @String moveProgMLogic
 
 main :: IO ()
 main = defaultMain
   [ bgroup "ecs"
       [ let w = buildWorld 10000
-        in bench "query-10k" $ nf (length . E.runq qPV) w
+        in bench "query-10k" $ nf (length . E.runq qPVQ) w
       , let w = buildWorld 10000
-        in bench "query-small-10k" $ nf (length . E.runq qP) w
+        in bench "query-small-10k" $ nf (length . E.runq qPQ) w
       , bench "spawn-10k" $ nf (length . E.entities . buildWorld) 10000
       ]
-  , bgroup "system"
+  , bgroup "program"
       [ bgroup "10k"
           [ let w = buildWorld 10000
             in bench "each" $ nf (\w0 ->
