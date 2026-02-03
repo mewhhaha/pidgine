@@ -79,5 +79,5 @@ Steps can be sampled in programs or used directly in pure logic.
 
 ## Open Questions (not yet decided)
 - How to serialize mid-flight programs safely.
-- Whether to add a compact "batch" DSL for fusing entity iteration.
+- Whether to add a compact "compute" DSL for fusing entity iteration.
 - Whether to provide optional spatial indexes or leave them to user code.

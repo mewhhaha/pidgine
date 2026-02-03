@@ -85,6 +85,7 @@ main = do
   assert "program resume" program_resume_once
   assert "program await value" program_await_value
   assert "each per-entity" program_eachm_entity_state
+  assert "compute fused order" program_compute_fused_order
 
   results <-
     sequence

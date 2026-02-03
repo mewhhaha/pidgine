@@ -27,10 +27,7 @@ module Engine.Data.ECS
   , foldEntities
   , foldEntitiesFrom
   , mapEntities
-  , setEntities
   , setEntityRows
-  , updateEntityRows
-  , updateEntityRow
   , nextId
   , spawn
   , kill
@@ -235,33 +232,8 @@ mapEntities f w =
           (entitiesW w)
   in w { entitiesW = ents' }
 
-setEntities :: [(Entity, Bag c)] -> World c -> World c
-setEntities rows w =
-  let ents' = [(eid', sigFromBag bag, bag) | (Entity eid', bag) <- rows]
-  in w { entitiesW = ents' }
-
 setEntityRows :: [EntityRow c] -> World c -> World c
 setEntityRows rows w = w { entitiesW = rows }
-
-updateEntityRows :: [EntityRow c] -> World c -> World c
-updateEntityRows rows w = foldl' (\acc (eid', sig, bag) -> updateEntityRow eid' sig bag acc) w rows
-
-updateEntityRow :: Int -> Sig -> Bag c -> World c -> World c
-updateEntityRow eid' sig' bag w =
-  let (ents', inserted) = insertRow eid' sig' bag (entitiesW w)
-      nextId' = if inserted && eid' >= nextIdW w then eid' + 1 else nextIdW w
-  in w { entitiesW = ents', nextIdW = nextId' }
-
-insertRow :: Int -> Sig -> Bag c -> [EntityRow c] -> ([EntityRow c], Bool)
-insertRow eid' sig' bag = go
-  where
-    go [] = ([(eid', sig', bag)], True)
-    go (row@(eid0, _, _) : rest)
-      | eid' == eid0 = ((eid', sig', bag) : rest, False)
-      | eid' < eid0 =
-          let (rest', inserted) = go rest
-          in (row : rest', inserted)
-      | otherwise = ((eid', sig', bag) : row : rest, True)
 
 class Typeable a => Component c a where
   inj :: a -> c

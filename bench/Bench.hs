@@ -37,6 +37,9 @@ type World = E.World C
 type Program msg a = S.Program C msg a
 type Graph msg = S.Graph C msg
 
+computeS :: S.Batch C String a -> S.Batch C String a
+computeS = S.compute
+
 data MoveLoop
 data MoveLoop1
 data MoveLoop2
@@ -83,7 +86,7 @@ qPQ = E.comp
 
 moveProg :: Program String ()
 moveProg = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachP pPV $ \(Pos x y, Vel vx vy) ->
       let p = Pos (x + vx) (y + vy)
           v = Vel vx vy
@@ -92,7 +95,7 @@ moveProg = S.program (S.handle 0) $ do
 
 moveProgSmall :: Program String ()
 moveProgSmall = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachP pP $ \(Pos x y) ->
       let p = Pos (x + 1) y
       in S.set p
@@ -100,7 +103,7 @@ moveProgSmall = S.program (S.handle 0) $ do
 
 moveProgJoin3 :: Program String ()
 moveProgJoin3 = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachP pMove3 $ \q ->
       let Pos x y = pos3 q
           Vel vx vy = vel3 q
@@ -113,7 +116,7 @@ moveProgJoin3 = S.program (S.handle 0) $ do
 
 moveProgTwoEach :: Program String ()
 moveProgTwoEach = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     (S.eachP pPV $ \(Pos x y, Vel vx vy) ->
       let p = Pos (x + vx) (y + vy)
       in S.set p)
@@ -121,6 +124,36 @@ moveProgTwoEach = S.program (S.handle 0) $ do
     (S.eachP pVA $ \(Vel vx vy, Acc ax ay) ->
       let v = Vel (vx + ax) (vy + ay)
       in S.set v)
+  pure ()
+
+moveProgTwoCompute :: Program String ()
+moveProgTwoCompute = S.program (S.handle 0) $ do
+  _ <- S.await $ computeS $
+    S.eachP pPV $ \(Pos x y, Vel vx vy) ->
+      let p = Pos (x + vx) (y + vy)
+      in S.set p
+  _ <- S.await $ computeS $
+    S.eachP pVA $ \(Vel vx vy, Acc ax ay) ->
+      let v = Vel (vx + ax) (vy + ay)
+      in S.set v
+  pure ()
+
+mkMoveProg :: Int -> Program String ()
+mkMoveProg n = S.program (S.handle n) $ do
+  _ <- S.await $ computeS $
+    S.eachP pPV $ \(Pos x y, Vel vx vy) ->
+      let p = Pos (x + vx) (y + vy)
+      in S.set p
+  pure ()
+
+moveProgTenEaches :: Program String ()
+moveProgTenEaches = S.program (S.handle 0) $ do
+  let one =
+        S.eachP pPV $ \(Pos x y, Vel vx vy) ->
+          let p = Pos (x + vx) (y + vy)
+          in S.set p
+  _ <- S.await $ computeS $
+    foldl' (*>) (pure ()) (replicate 10 one)
   pure ()
 
 advance :: Double -> Pos -> Vel -> (Pos, Vel)
@@ -136,7 +169,7 @@ advance dt (Pos x y) (Vel vx vy) =
 moveProgLogic :: Program String ()
 moveProgLogic = S.program (S.handle 0) $ do
   dt <- S.dt
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachP pPV $ \(p, v) ->
       let (p', v') = advance dt p v
       in S.set p' <> S.set v'
@@ -150,7 +183,7 @@ moveStep = F.Step $ \dt (Pos x y, Vel vx vy) ->
 
 moveProgStep :: Program String ()
 moveProgStep = S.program (S.handle 1) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachMP @MoveLoop pPV $ \(p, v) -> do
       (p', v') <- S.step @MoveLoop moveStep (p, v)
       S.edit (S.set p' <> S.set v')
@@ -158,7 +191,7 @@ moveProgStep = S.program (S.handle 1) $ do
 
 moveProgM :: Program String ()
 moveProgM = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachMP @MoveLoop pPV $ \(Pos x y, Vel vx vy) -> do
       let p = Pos (x + vx) (y + vy)
           v = Vel vx vy
@@ -167,7 +200,7 @@ moveProgM = S.program (S.handle 0) $ do
 
 moveProgMSmall :: Program String ()
 moveProgMSmall = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachMP @MoveLoop pP $ \(Pos x y) -> do
       let p = Pos (x + 1) y
       S.edit (S.set p)
@@ -175,7 +208,7 @@ moveProgMSmall = S.program (S.handle 0) $ do
 
 moveProgMJoin3 :: Program String ()
 moveProgMJoin3 = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachMP @MoveLoop pMove3 $ \q -> do
       let Pos x y = pos3 q
           Vel vx vy = vel3 q
@@ -188,7 +221,7 @@ moveProgMJoin3 = S.program (S.handle 0) $ do
 
 moveProgMTwoEach :: Program String ()
 moveProgMTwoEach = S.program (S.handle 0) $ do
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     (S.eachMP @MoveLoop1 pPV $ \(Pos x y, Vel vx vy) -> do
       let p = Pos (x + vx) (y + vy)
       S.edit (S.set p))
@@ -201,7 +234,7 @@ moveProgMTwoEach = S.program (S.handle 0) $ do
 moveProgMLogic :: Program String ()
 moveProgMLogic = S.program (S.handle 0) $ do
   dt <- S.dt
-  _ <- S.batch $
+  _ <- S.await $ computeS $
     S.eachMP @MoveLoop pPV $ \(p, v) -> do
       let (p', v') = advance dt p v
       S.edit (S.set p' <> S.set v')
@@ -224,6 +257,15 @@ graphEachJoin3 = S.graph @String moveProgJoin3
 
 graphEachTwoEach :: Graph String
 graphEachTwoEach = S.graph @String moveProgTwoEach
+
+graphEachTwoCompute :: Graph String
+graphEachTwoCompute = S.graph @String moveProgTwoCompute
+
+graphEach10Programs :: Graph String
+graphEach10Programs = S.graphList (map mkMoveProg [0 .. 9])
+
+graphEach10InOne :: Graph String
+graphEach10InOne = S.graph @String moveProgTenEaches
 
 graphEachLogic :: Graph String
 graphEachLogic = S.graph @String moveProgLogic
@@ -269,6 +311,21 @@ main = defaultMain
           , let w = buildWorld 10000
             in bench "each-two" $ nf (\w0 ->
                 let (w1, _, _) = S.run 0.016 w0 [] graphEachTwoEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-two-compute" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachTwoCompute
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-10-progs" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEach10Programs
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-10-in-one" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEach10InOne
                 in length (E.entities w1)
               ) w
           , let w = buildWorld 10000

@@ -5,6 +5,7 @@ module ProgramProps
   ( program_resume_once
   , program_await_value
   , program_eachm_entity_state
+  , program_compute_fused_order
   , prop_program_resume
   , prop_program_await_value
   ) where
@@ -20,6 +21,8 @@ data Speed
 data Use
 data CountLoop
 data CountStep
+data Marker = Marker
+  deriving (Eq, Show)
 
 newtype Count = Count Int
   deriving (Eq, Show)
@@ -27,6 +30,7 @@ newtype Count = Count Int
 data C
   = CInt Int
   | CCount Count
+  | CMarker Marker
   deriving (Generic)
 
 instance E.ComponentId C
@@ -35,17 +39,32 @@ type World = E.World C
 type Program msg a = S.Program C msg a
 type Graph msg = S.Graph C msg
 
+qInt :: E.Query C Int
+qInt = E.comp
+
+qMarker :: E.Query C Marker
+qMarker = E.comp
+
+qCount :: E.Query C Count
+qCount = E.comp
+
+computeS :: S.Batch C String a -> S.Batch C String a
+computeS = S.compute
+
+computeU :: S.Batch C () a -> S.Batch C () a
+computeU = S.compute
+
 program_resume_once :: Bool
 program_resume_once =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
       sys :: Program String ()
       sys = S.program (S.handle 0) $ do
-        _ <- S.batch $ do
-          S.each (E.comp @Int) $ \n ->
+        _ <- S.await $ computeS $ do
+          S.each qInt $ \n ->
             S.set (n + 1)
-        _ <- S.awaitEvent (== "go")
-        _ <- S.batch $ do
-          S.each (E.comp @Int) $ \n ->
+        _ <- S.await (== "go")
+        _ <- S.await $ computeS $ do
+          S.each qInt $ \n ->
             S.set (n + 10)
         pure ()
       g0 :: Graph String
@@ -66,9 +85,9 @@ program_await_value =
       speedProg = S.program (S.handle 0) (pure 3)
       useProg :: Program String ()
       useProg = S.program (S.handle 1) $ do
-        v <- S.awaitProgram (S.handle 0)
-        _ <- S.batch $ do
-          S.each (E.comp @Int) $ \_ ->
+        v <- S.await (S.handle 0)
+        _ <- S.await $ computeS $ do
+          S.each qInt $ \_ ->
             S.set (v :: Int)
         pure ()
       g0 :: Graph String
@@ -81,8 +100,8 @@ countStep = F.acc 0
 
 countProg :: Program () ()
 countProg = S.program (S.handle 0) $ do
-  _ <- S.batch $ do
-    S.eachM @CountLoop (E.comp @Count) $ \_ -> do
+  _ <- S.await $ computeU $ do
+    S.eachM @CountLoop qCount $ \_ -> do
       n <- S.step @CountStep countStep [(+1)]
       S.edit (S.set (Count n))
   pure ()
@@ -99,6 +118,20 @@ program_eachm_entity_state =
       && E.get @Count e2 w3 == Just (Count 1)
       && E.get @Count e1 w4 == Just (Count 2)
       && E.get @Count e2 w4 == Just (Count 2)
+
+program_compute_fused_order :: Bool
+program_compute_fused_order =
+  let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
+      markProg :: Program () ()
+      markProg = S.program (S.handle 0) $ do
+        marks <- S.await $ computeU $
+          S.each qInt (\_ -> S.set Marker) *> S.collect qMarker
+        S.world (S.at e (S.set (length marks)))
+        pure ()
+      g0 :: Graph ()
+      g0 = S.graph @() markProg
+      (w1, _, _) = S.run 0.1 w0 [] g0
+  in E.get @Int e w1 == Just 1
 
 data Phase = Start | Wait
   deriving (Eq, Show)
@@ -126,12 +159,12 @@ runFrames evs =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
       sys :: Program String ()
       sys = S.program (S.handle 0) $ do
-        _ <- S.batch $ do
-          S.each (E.comp @Int) $ \n ->
+        _ <- S.await $ computeS $ do
+          S.each qInt $ \n ->
             S.set (n + 1)
-        _ <- S.awaitEvent (== "go")
-        _ <- S.batch $ do
-          S.each (E.comp @Int) $ \n ->
+        _ <- S.await (== "go")
+        _ <- S.await $ computeS $ do
+          S.each qInt $ \n ->
             S.set (n + 10)
         pure ()
       g0 :: Graph String
@@ -156,9 +189,9 @@ prop_program_await_value v =
       speedProg = S.program (S.handle 0) (pure v)
       useProg :: Program String ()
       useProg = S.program (S.handle 1) $ do
-        v' <- S.awaitProgram (S.handle 0)
-        _ <- S.batch $ do
-          S.each (E.comp @Int) $ \_ ->
+        v' <- S.await (S.handle 0)
+        _ <- S.await $ computeS $ do
+          S.each qInt $ \_ ->
             S.set (v' :: Int)
         pure ()
       g0 :: Graph String

@@ -22,7 +22,6 @@ library
     exposed-modules:  Engine.Data.FRP
                       Engine.Data.ECS
                       Engine.Data.Program
-                      Engine.Data.Program.Core
                       Engine.Data.Input
                       Engine.Data.Transform
     -- other-modules:

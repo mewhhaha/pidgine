@@ -23,7 +23,7 @@ Note: Some examples use `do` with Applicative only; enable `ApplicativeDo`.
 - `await` is overloaded: you can `await` a handle, an event predicate, or an explicit `Await` value.
 - Time is first-class: `Step`/`Signal`/`Tween` model time directly and can be used inside programs via `S.step`.
 - Per-entity programs live in program locals: `eachM @Key` creates per-entity programs stored in program locals (not on entities), so entities only store components.
-- One sync point: `batch ...` gathers `each`/`collect` and runs them in one pass.
+- One sync point: `await (compute ...)` gathers `each`/`collect` and runs them in one pass.
 - Composition everywhere: queries are Applicative, patches are Semigroup/Monoid, steps compose, programs can `await` other programs/events.
 
 ## FRP: Practical examples
@@ -147,7 +147,7 @@ wiggleProg :: Program msg
 wiggleProg = S.program (S.handle 0) $ do
   let tweenX = F.tween (F.Span 0 1) easeInOut (lerp (-2) 2)
   x <- S.step @WiggleTween (F.sample tweenX) ()
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.comp @Pos) $ \_ ->
       S.set (Pos x)
 ```
@@ -608,7 +608,7 @@ handles for you. `await` accepts handles directly (no `awaitProgram` needed).
 side‑effect programs, and any `a` if you want to `await` a value.
 
 Programs accumulate changes via `S.edit` (entity‑local) and `S.world` (global). Use
-`S.set`/`S.update`/`S.del` to build entity patches, and `S.setAt`/`S.updateAt`/`S.delAt`,
+`S.set`/`S.update`/`S.del` to build entity patches, and `S.at`,
 `S.put`, `S.relate`, etc for global patches.
 The runtime
 re-runs only programs that return `wait` (directly or via `await` gating) until no
@@ -618,25 +618,26 @@ When an `await` is not ready, the rest of that program does not run for the tick
 Programs are coroutines: they resume at the suspended `await` on later frames,
 and restart from the top once they return.
 
-Entity iteration lives inside `S.batch $ do ...` (it already waits for the sync point).
-`S.each` (pure patch) and `S.collect` are only usable in a `batch`, so you can’t
+Entity iteration lives inside `S.await $ S.compute $ do ...` (explicit sync point).
+`S.each` (pure patch) and `S.collect` are only usable in a `compute`, so you can’t
 accidentally run them outside.
-A `batch` reads one snapshot, fuses the work into one pass, and applies patches once.
-If you want `do`‑notation inside `batch`, enable `ApplicativeDo`.
+`compute` fuses the work into one pass; operations are executed left‑to‑right per
+entity and updates apply immediately, so later actions can see earlier edits.
+If you want `do`‑notation inside `compute`, enable `ApplicativeDo`.
 
 For per‑entity continuations, use `eachM @Key` with a monadic body. This gives each
 entity its own time/state machine without storing Steps in components.
 `eachM @Key` resumes the per‑entity program; it is intentionally entity‑local (edit/await/send/step).
 Note: some longer examples below still show `gather` or `each` with `edit`; translate
-them to `batch ...` and `eachM` when you need monadic actions.
+them to `await (compute ...)` and `eachM` when you need monadic actions.
 If you need fresh data or cross‑entity effects, split into another program and communicate
 via events, then `await` the sync point you need.
 
 Graph construction is variadic: `S.graph sys1 sys2 sys3` (no list needed).
 
-Within a single `batch`, all `each`/`collect` calls read the same snapshot;
-their patches are merged and applied once. If you need “see the result of a
-previous update,” split it into another program and `await x`, then `batch` again.
+Within a single `compute`, `each`/`collect` calls are sequenced left‑to‑right;
+later calls can see earlier edits for the same entity. If you need a full “tick
+boundary,” split it into another program and `await x`, then `await (compute ...)` again.
 
 ### Graph builder (auto handles)
 
@@ -650,7 +651,7 @@ build =
     _moveH <- S.programM $ do
       speed <- S.await speedH
       dt <- S.dt
-      _ <- S.batch $ do
+      _ <- S.await $ S.compute $ do
         S.each (E.comp :: Query Pos) $ \(Pos x y) ->
           S.set (Pos (x + speed * dt) y)
       pure ()
@@ -672,7 +673,7 @@ instance E.Queryable C MoveQ
 moveProg :: Program ()
 moveProg = S.program (S.handle 0) $ do
   dt <- S.dt
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.query @MoveQ) $ \q ->
       let Pos x y = pos q
           Vel vx vy = vel q
@@ -688,9 +689,8 @@ runFrame dt w g =
   in (w', g')
 ```
 
-Note: Each round can be parallelized by evaluating all runnable programs
-against the same snapshot/inbox and then merging patches in list order.
-The current `run` executes sequentially for simplicity.
+Note: Programs run sequentially in list order; patches apply immediately.
+Parallelization would require snapshot semantics or additional ordering rules.
 
 Patch helpers also support update-in-place:
 
@@ -698,10 +698,10 @@ Patch helpers also support update-in-place:
 data Score = Score Int
 
 bumpScore :: E.Entity -> Patch
-bumpScore e = S.updateAt e (\(Score n) -> Score (n + 1))
+bumpScore e = S.at e (S.update (\(Score n) -> Score (n + 1)))
 
 resetScore :: E.Entity -> Patch
-resetScore e = S.updateAt e (const (Score 0)) -- or S.setAt e (Score 0)
+resetScore e = S.at e (S.update (const (Score 0))) -- or S.at e (S.set (Score 0))
 ```
 
 ---
@@ -748,16 +748,16 @@ g0 :: Graph ()
 g0 = S.graph physicsProg aiProg collisionProg damageProg animProg
 ```
 
-### 3) Snapshot semantics
+### 3) Program order semantics
 
 ```haskell
--- All programs read the same snapshot; list order only affects patch application.
+-- Programs run in list order; later programs see earlier patches in the same round.
 data WritePos
 data ReadPos
 
 writePos :: Program ()
 writePos = S.program (S.handle 0) $ do
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.comp :: Query Pos) $ \(Pos x y) ->
       S.set (Pos (x + 1) y)
   pure ()
@@ -778,13 +778,13 @@ data SpawnProg
 
 fireProg :: Program Msg
 fireProg = S.program (S.handle 0) $ do
-  _fires <- S.awaitEvent (== Fire)
+  _fires <- S.await (== Fire)
   S.send [SpawnBullet]
 
 spawnProg :: Program Msg
 spawnProg = S.program (S.handle 1) $ do
-  spawns <- S.awaitEvent (== SpawnBullet)
-  let p = foldMap (const (S.setAt e Bullet)) spawns  -- assume e exists
+  spawns <- S.await (== SpawnBullet)
+  let p = foldMap (const (S.at e (S.set Bullet))) spawns -- assume e exists
   S.world p
   pure ()
 
@@ -819,7 +819,7 @@ moveH = S.handle 1
 
 speedProg :: Program ()
 speedProg = S.program speedH $ do
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.query @MoveQ) $ \q ->
       let Vel vx vy = vel q
       in S.set (Vel (vx * 1.1) (vy * 1.1))
@@ -829,7 +829,7 @@ moveProg :: Program ()
 moveProg = S.program moveH $ do
   _ready <- S.await speedH
   dt <- S.dt
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.query @MoveQ) $ \q ->
       let Pos x y = pos q
           Vel vx vy = vel q
@@ -862,7 +862,7 @@ moveProg :: Program ()
 moveProg = S.program moveH $ do
   speed <- S.await speedH
   dt <- S.dt
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.comp :: Query Pos) $ \(Pos x y) ->
       S.set (Pos (x + speed * dt) y)
   pure ()
@@ -873,11 +873,11 @@ g0 = S.graph speedProg moveProg
 
 ### 4c.1) Batching entity work
 
-Use `batch ...` to run entity work (it waits for the sync point). The batch
-reads one snapshot and applies patches once.
+Use `await (compute ...)` to run entity work. The compute
+fuses work into one pass; updates apply as the actions run.
 
 ```haskell
-hits <- S.batch $ do
+hits <- S.await $ S.compute $ do
   S.each (E.comp @Pos) $ \(Pos x y) ->
     S.set (Pos (x + 1) y)
   S.collect (E.comp @Pos)
@@ -899,7 +899,7 @@ damageH = S.handle 1
 
 collideProg :: Program () [Collision]
 collideProg = S.program collideH $ do
-  pairs <- S.batch $ S.collect (E.query @PairQ)  -- PairQ omitted for brevity
+  pairs <- S.await $ S.compute $ S.collect (E.query @PairQ)  -- PairQ omitted for brevity
   pure (detect pairs)                 -- detect :: [(Entity, PairQ)] -> [Collision]
 
 damageProg :: Program ()
@@ -915,7 +915,7 @@ g1 = S.graph collideProg damageProg
 
 ### 4d) Collect after sync point
 
-`await Update` waits until all programs have run once in the frame, then `collect` returns a snapshot.
+`await Update` waits until all programs have run once in the frame, then `collect` returns current state.
 
 ```haskell
 data EnemyQ = EnemyQ
@@ -929,7 +929,7 @@ data CountEnemies
 
 countEnemies :: Program ()
 countEnemies = S.program (S.handle 0) $ do
-  enemies <- S.batch $ S.collect (E.query @EnemyQ)
+  enemies <- S.await $ S.compute $ S.collect (E.query @EnemyQ)
   let n = length enemies
   pure ()
 ```
@@ -974,7 +974,7 @@ tween2 duration from to = do
 -- assume Pos component
 -- tweenProg = S.program (S.handle 0) $ do
 --   x <- S.sample (F.tween (F.Span 0 duration) id (lerp 0 target))
---   _ <- S.batch $ do
+--   _ <- S.await $ S.compute $ do
 --     S.each (E.comp @Pos) $ \_ -> S.set (Pos x)
 --   pure ()
 ```
@@ -1156,7 +1156,7 @@ instance E.Queryable C EnemyQ
 
 enemyProg :: Program msg
 enemyProg = S.program (S.handle 0) $ do
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.eachM @EnemyLoop (E.query @EnemyQ) $ \q -> do
       st <- S.step @EnemyAIKey enemy (sense q)
       S.edit (S.set st)
@@ -1211,7 +1211,7 @@ bounceH = S.handle 1
 moveProg :: Program ()
 moveProg = S.program moveH $ do
   dt <- S.dt
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.query @MoveQ) $ \q ->
       let Pos x y = pos q
           Vel vx vy = vel q
@@ -1221,7 +1221,7 @@ moveProg = S.program moveH $ do
 bounceProg :: Program ()
 bounceProg = S.program bounceH $ do
   _ <- S.await moveH
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.query @MoveQ) $ \q ->
       let Pos _ y = pos q
           Vel vx vy = vel q
@@ -1464,7 +1464,7 @@ data Jump
 gravityProg :: Program I.Input
 gravityProg = S.program (S.handle 0) $ do
   dt <- S.dt
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.comp @Vel) $ \(Vel vx vy) ->
       S.set (Vel vx (vy - 9.8 * dt))
   pure ()
@@ -1472,7 +1472,7 @@ gravityProg = S.program (S.handle 0) $ do
 moveProg :: Program I.Input
 moveProg = S.program (S.handle 1) $ do
   dt <- S.dt
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.query @MoveQ) $ \(MoveQ (Pos x y) (Vel vx vy)) ->
       S.set (Pos (x + vx * dt) (y + vy * dt))
   pure ()
@@ -1480,7 +1480,7 @@ moveProg = S.program (S.handle 1) $ do
 jumpProg :: Program I.Input
 jumpProg = S.program (S.handle 2) $ do
   _ <- S.await (I.justPressed (I.Button "jump"))
-  _ <- S.batch $ do
+  _ <- S.await $ S.compute $ do
     S.each (E.query @JumpQ) $ \(JumpQ (Vel vx _) _) ->
       S.set (Vel vx 12) <> S.del @OnGround
   pure ()
@@ -1517,12 +1517,14 @@ instance E.Queryable C PoolQ
 
 spawnProg :: Program Msg
 spawnProg = S.program (S.handle 1) $ do
-  spawns <- S.awaitEvent (== SpawnEnemy)
-  pool <- S.batch $ do
+  spawns <- S.await (== SpawnEnemy)
+  pool <- S.await $ S.compute $ do
     S.collect (E.query @PoolQ)
   let targets = take (length spawns) pool
       p = foldMap (\(e, _) ->
-            S.setAt e Enemy <> S.setAt e (HP 5) <> S.setAt e (Pos 0 0)
+            S.at e (S.set Enemy)
+              <> S.at e (S.set (HP 5))
+              <> S.at e (S.set (Pos 0 0))
           ) targets
   S.world p
 ```
@@ -1543,8 +1545,8 @@ data QuestFinish
 
 questStartProg :: Program Msg
 questStartProg = S.program (S.handle 0) $ do
-  _ <- S.awaitEvent (== TalkNPC)
-  _ <- S.batch $ do
+  _ <- S.await (== TalkNPC)
+  _ <- S.await $ S.compute $ do
     S.each (E.comp @Quest) $ \q ->
       case q of
         NotStarted -> S.set InProgress
@@ -1552,8 +1554,8 @@ questStartProg = S.program (S.handle 0) $ do
 
 questFinishProg :: Program Msg
 questFinishProg = S.program (S.handle 1) $ do
-  _ <- S.awaitEvent (== BossDown)
-  _ <- S.batch $ do
+  _ <- S.await (== BossDown)
+  _ <- S.await $ S.compute $ do
     S.each (E.comp @Quest) $ \q ->
       case q of
         InProgress -> S.set Complete
