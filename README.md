@@ -689,8 +689,9 @@ runFrame dt w g =
   in (w', g')
 ```
 
-Note: Programs run sequentially in list order; patches apply immediately.
-Parallelization would require snapshot semantics or additional ordering rules.
+Note: Programs are evaluated in parallel per round against the same snapshot/inbox.
+Patches are merged in list order after the round, so program order only affects
+patch merge, not in‑round visibility.
 
 Patch helpers also support update-in-place:
 
@@ -751,7 +752,7 @@ g0 = S.graph physicsProg aiProg collisionProg damageProg animProg
 ### 3) Program order semantics
 
 ```haskell
--- Programs run in list order; later programs see earlier patches in the same round.
+-- Programs run in parallel per round; list order only affects patch merge order.
 data WritePos
 data ReadPos
 
@@ -1576,7 +1577,7 @@ questFinishProg = S.program (S.handle 1) $ do
 ## Pain points (current)
 
 - No built-in IO/async runtime: `Job`/`Events` are data only; you need an external executor.
-- Program graph runs sequentially; parallelism is not automatic.
+- Program graph runs in parallel per round; ordering only affects patch merge, not in‑round visibility.
 - Patch conflicts are resolved by list order; no merge policy beyond `Semigroup` order.
 - Waiting programs are re-run within a frame; misbehaving programs can loop forever.
 - `QueryableSum` skips signature pruning; sum queries scan all entities.

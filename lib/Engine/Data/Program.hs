@@ -87,6 +87,7 @@ import Data.List (foldl')
 import qualified Data.IntMap as IntMap
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
+import qualified Data.Vector as V
 import GHC.Exts (Any)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.Typeable (Typeable)
@@ -306,22 +307,50 @@ data PendingBatch c msg where
     (a -> ProgramM c msg b) ->
     PendingBatch c msg
 
+data BatchGroup c msg = BatchGroup
+  { bgPid :: !ProgramId
+  , bgLocals :: !(Locals c msg)
+  , bgK :: !(V.Vector Any -> Any)
+  , bgCont :: !(Any -> Any)
+  , bgOpCount :: !Int
+  }
+
 data PendingStep c msg where
   PendingStep ::
-    ProgramId ->
-    Locals c msg ->
+    Int ->
     s ->
     (Entity -> E.Sig -> E.Bag c -> s -> (E.Sig, E.Bag c, s)) ->
-    (s -> (a, BatchOut c msg)) ->
+    (s -> (Any, BatchOut c msg)) ->
     (s -> s -> s) ->
     ([E.EntityRow c] -> s -> (s, s)) ->
-    (a -> ProgramM c msg b) ->
     PendingStep c msg
+
+data StepStatic c msg = StepStatic
+  { ssGroup :: !Int
+  , ssStep :: !(Entity -> Sig -> E.Bag c -> Any -> (Sig, E.Bag c, Any))
+  , ssDone :: !(Any -> (Any, BatchOut c msg))
+  , ssMerge :: !(Any -> Any -> Any)
+  , ssSplit :: !([E.EntityRow c] -> Any -> (Any, Any))
+  }
+
+data PendingState c msg = PendingState
+  { psStatics :: !(V.Vector (StepStatic c msg))
+  , psStates :: !(V.Vector Any)
+  }
 
 data ProgramUpdate c msg = ProgramUpdate
   { puLocals :: Locals c msg
   , puProg :: Any
   }
+
+data Acc c msg = Acc
+  { accRes :: !(Build Any)
+  , accOut :: !(BatchOut c msg)
+  }
+
+data RunRes c msg where
+  Ran :: Program c msg a -> Inbox msg -> Tick c msg -> Locals c msg -> ProgStep c msg a -> RunRes c msg
+  Skipped :: Program c msg a -> RunRes c msg
 
 newtype Graph c a = Graph [AnyProgram c a]
 
@@ -406,8 +435,18 @@ instance Semigroup (BatchOut c msg) where
 instance Monoid (BatchOut c msg) where
   mempty = BatchOut id mempty
 
+data BatchOp c msg = BatchOp
+  { opGather :: Gather c msg (Any, BatchOut c msg)
+  }
+
+data BatchRun c msg a = BatchRun
+  { brOps :: !(Build (BatchOp c msg))
+  , brCount :: !Int
+  , brK :: !(V.Vector Any -> Int -> (a, Int))
+  }
+
 data Batch c msg a = Batch
-  { unBatch :: DTime -> Inbox msg -> Locals c msg -> Gather c msg (a, BatchOut c msg)
+  { unBatch :: DTime -> Inbox msg -> Locals c msg -> BatchRun c msg a
   , batchReq :: E.Sig
   , batchPar :: Bool
   }
@@ -416,19 +455,24 @@ instance Functor (Batch c msg) where
   fmap f (Batch g req parOk) =
     Batch
       (\d inbox locals ->
-        fmap (\(a, bout) -> (f a, bout)) (g d inbox locals)
+        let BatchRun ops n k = g d inbox locals
+        in BatchRun ops n (\xs i -> let (a, i') = k xs i in (f a, i'))
       )
       req
       parOk
 
 instance Applicative (Batch c msg) where
-  pure a = Batch (\_ _ _ -> pure (a, mempty)) 0 True
+  pure a = Batch (\_ _ _ -> BatchRun mempty 0 (\_ i -> (a, i))) 0 True
   Batch gf reqF parF <*> Batch ga reqA parA =
     Batch
       (\d inbox locals ->
-        let gF = gf d inbox locals
-            gA = ga d inbox locals
-        in (\(f, outF) (a, outA) -> (f a, outF <> outA)) <$> gF <*> gA
+        let BatchRun opsF nF kF = gf d inbox locals
+            BatchRun opsA nA kA = ga d inbox locals
+            k xs i0 =
+              let (f, i1) = kF xs i0
+                  (a, i2) = kA xs i1
+              in (f a, i2)
+        in BatchRun (opsF <> opsA) (nF + nA) k
       )
       (reqF .|. reqA)
       (parF && parA)
@@ -467,10 +511,19 @@ planQuery :: E.Plan c a -> E.Query c a
 planQuery (E.Plan req forb runP) =
   E.Query (\_ bag -> Just (runP bag)) (E.QueryInfo req forb)
 
+batchRun1 :: Gather c msg (a, BatchOut c msg) -> BatchRun c msg a
+batchRun1 g =
+  let g' = fmap (\(a, bout) -> (unsafeCoerce a, bout)) g
+      k xs i =
+        if i < V.length xs
+          then (unsafeCoerce (V.unsafeIndex xs i), i + 1)
+          else error "compute: missing batch result"
+  in BatchRun (buildOne (BatchOp g')) 1 k
+
 each :: E.Query c a -> (a -> EntityPatch c) -> Batch c msg ()
 each q f =
   let req = E.requireQ (E.queryInfo q)
-  in Batch (\_ _ _ -> Gather () step done (\_ _ -> ()) (\_ s -> (s, s))) req True
+  in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
   where
     step e sig bag () =
       case E.runQuerySig q sig e bag of
@@ -514,7 +567,7 @@ eachM q f =
               Just v -> unsafeCoerce v
               Nothing -> []
           step = stepEntity d inbox
-      in Gather (emptyEachAcc progList0) step done merge split
+      in batchRun1 (Gather (emptyEachAcc progList0) step done merge split)
     ) req True
   where
     progKey = E.typeIdOf @(ProgramKey key)
@@ -582,12 +635,13 @@ eachMP p f = eachM @key (planQuery p) f
 collect :: E.Query c a -> Batch c msg [(Entity, a)]
 collect q =
   let req = E.requireQ (E.queryInfo q)
-  in Batch (\_ _ _ -> fmap (\a -> (a, mempty)) (Gather mempty step buildToList (<>) (\_ s -> (s, s)))) req True
+  in Batch (\_ _ _ -> batchRun1 (Gather mempty step done (<>) (\_ s -> (s, s)))) req True
   where
     step e sig bag acc =
       case E.runQuerySig q sig e bag of
         Nothing -> (sig, bag, acc)
         Just a -> (sig, bag, acc <> buildOne (e, a))
+    done acc = (buildToList acc, mempty)
 
 
 data ProgCtx c msg = ProgCtx
@@ -863,24 +917,35 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
         in (w2, out1 ++ out2, programs2, run2, done1, seen1, values1, progressed1 || progressed2, stepped1)
   where
     runProgramsPhase inb doneSet seenSet valuesSet w pairs =
-      go inb doneSet seenSet valuesSet [] [] [] w False [] pairs
+      let results =
+            withStrategy (parListChunk 1 rseq) $
+              map (runOne inb doneSet seenSet valuesSet w) pairs
+          (w', out', progs', runs', dSet', sSet', vSet', progressed', pending') =
+            foldl' applyOne (w, [], [], [], doneSet, seenSet, valuesSet, False, []) results
+      in (w', out', reverse progs', reverse runs', dSet', sSet', vSet', progressed', reverse pending')
       where
-        go _ dSet sSet vSet accOut accProg accRun w progressed pending [] =
-          (w, accOut, reverse accProg, reverse accRun, dSet, sSet, vSet, progressed, reverse pending)
-        go inbox dSet sSet vSet accOut accProg accRun w progressed pending
-          ((AnyProgram (prog0 :: Program c msg a), runNow) : rest) =
+        runOne inbox0 dSet sSet vSet w0 (AnyProgram (prog0 :: Program c msg a), runNow) =
           if runNow
             then
               let sid = handleId (programHandle prog0)
-                  inbox0 = Inbox inbox dSet sSet allSet vSet sid
-                  (t, locals', res) = runProgramM d w inbox0 (programLocals prog0) (programProg prog0)
+                  inbox1 = Inbox inbox0 dSet sSet allSet vSet sid
+                  (t, locals', res) = runProgramM d w0 inbox1 (programLocals prog0) (programProg prog0)
+              in Ran prog0 inbox1 t locals' res
+            else
+              Skipped prog0
+
+        applyOne (wAcc, accOut, accProg, accRun, dSet, sSet, vSet, progressed, pending) res =
+          case res of
+            Skipped prog0 ->
+              (wAcc, accOut, AnyProgram prog0 : accProg, False : accRun, dSet, sSet, vSet, progressed, pending)
+            Ran (prog0 :: Program c msg a) inbox0 t locals' resStep ->
+              let sid = handleId (programHandle prog0)
                   out = outT t
-                  inbox' = inbox ++ out
                   accOut' = accOut ++ out
-                  w' = apply (patchT t) w
+                  w' = apply (patchT t) wAcc
                   sSet' = IntSet.insert sid sSet
                   progressedSeen = not (IntSet.member sid sSet)
-              in case res of
+              in case resStep of
                   ProgDone _ ->
                     let prog1 = prog0 { programLocals = locals', programProg = programBase prog0 }
                         accProg' = AnyProgram prog1 : accProg
@@ -891,7 +956,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                           Nothing -> vSet
                           Just v -> IntMap.insert sid v vSet
                         progressed' = progressed || progressedDone || progressedSeen || not (null out)
-                    in go inbox' dSet' sSet' vSet' accOut' accProg' accRun' w' progressed' pending rest
+                    in (w', accOut', accProg', accRun', dSet', sSet', vSet', progressed', pending)
                   ProgAwait waitOn cont ->
                     let progWait = await waitOn >>= cont
                         prog1 = prog0 { programLocals = locals', programProg = progWait }
@@ -902,113 +967,187 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                             _ -> (pending, True)
                         accRun' = runFlag : accRun
                         progressed' = progressed || progressedSeen || not (null out)
-                    in go inbox' dSet sSet' vSet accOut' accProg' accRun' w' progressed' pending' rest
-            else
-              let accProg' = AnyProgram prog0 : accProg
-              in go inbox dSet sSet vSet accOut accProg' (False : accRun) w progressed pending rest
+                    in (w', accOut', accProg', accRun', dSet, sSet', vSet, progressed', pending')
 
     runBatchesPhase d w pending programs runFlags stepped0 =
       let pendingSorted = pending
           wStep = if stepped0 then w else E.stepWorld d w
           stepped1 = True
-          steps = map (mkPendingStep d wStep) pendingSorted
+          compiled = zipWith (compilePending d) [0..] pendingSorted
+          steps = concatMap fst compiled
+          groups = V.fromList (map snd compiled)
           parOk = all pendingPar pendingSorted
           rows = E.entityRows wStep
-          (w', steps') =
+          state0 = stepsFromPending steps
+          (w', state') =
             if parOk
-              then runPendingStepsPar rows steps wStep
-              else runPendingSteps rows steps wStep
-          (updates, out) = finalizePending steps'
+              then runPendingStepsPar rows state0 wStep
+              else runPendingSteps rows state0 wStep
+          (updates, out) = finalizePendingState state' groups
           programs' = applyProgramUpdates programs updates
           runFlags' = updateRunFlags programs' runFlags (IntMap.keysSet updates)
           progressed = not (IntMap.null updates) || not (null out)
       in (w', out, programs', runFlags', progressed, stepped1)
 
-    pendingId (PendingBatch pid _ _ _ _) = pid
-    pendingReq (PendingBatch _ _ _ b _) = batchReq b
     pendingPar (PendingBatch _ _ _ b _) = batchPar b
 
-    mkPendingStep d wStep (PendingBatch pid locals inbox b cont) =
-      case unBatch b d inbox locals of
-        Gather s step done merge split -> PendingStep pid locals s step done merge split cont
+    compilePending d gid (PendingBatch pid locals inbox b cont) =
+      let BatchRun ops n k = unBatch b d inbox locals
+          kAny xs = unsafeCoerce (fst (k xs 0))
+          contAny v = unsafeCoerce (cont (unsafeCoerce v))
+          group =
+            BatchGroup
+              { bgPid = pid
+              , bgLocals = locals
+              , bgK = kAny
+              , bgCont = contAny
+              , bgOpCount = n
+              }
+          steps = map (opToStep gid) (buildToList ops)
+      in (steps, group)
 
-    runPendingSteps rows steps wStep =
-      let stepRow (build, st) (eid', sig, bag) =
-            let (sig', bag', st') = runPendingStepsOne (E.Entity eid') sig bag st
-            in (build . ((eid', sig', bag') :), st')
-          (build, st') = foldl' stepRow (id, steps) rows
-          rows' = build []
+    opToStep gid (BatchOp g) =
+      case g of
+        Gather s step done merge split -> PendingStep gid s step done merge split
+
+    runPendingSteps rows state0 wStep =
+      let (rows', state1) = processRows rows state0
           w' = E.setEntityRows rows' wStep
-      in (w', st')
+      in (w', state1)
 
-    runPendingStepsPar rows steps wStep =
+    runPendingStepsPar rows state0 wStep =
       let chunkSize = 1024
           rowChunks = chunkRows chunkSize rows
-          stepChunks = splitSteps rowChunks steps
+          stateChunks = splitStateChunks rowChunks state0
           chunkResults =
             withStrategy (parListChunk 1 rseq) $
-              zipWith (\st rs -> forceChunk (processChunk st wStep rs)) stepChunks rowChunks
+              zipWith (\st rs -> forceChunk (processRows rs st)) stateChunks rowChunks
           rows' = concatMap fst chunkResults
-          steps' = mergeSteps steps (map snd chunkResults)
+          state' = mergeStateChunks state0 (map snd chunkResults)
           w' = E.setEntityRows rows' wStep
-      in (w', steps')
+      in (w', state')
 
-    processChunk steps _ chunk =
-      let stepRow (build, st, n) (eid', sig, bag) =
-            let (sig', bag', st') = runPendingStepsOne (E.Entity eid') sig bag st
-            in (build . ((eid', sig', bag') :), st', n + 1)
-          (build, st', n) = foldl' stepRow (id, steps, 0 :: Int) chunk
-          rows = build []
-      in (rows, st', n)
-
-    forceChunk (rows, st, n) = n `seq` (rows, st)
-
-    mergeSteps base [] = base
-    mergeSteps base (s:ss) = foldl' mergeStepLists s ss
-
-    mergeStepLists xs ys = zipWith mergeStep xs ys
-
-    mergeStep (PendingStep pid locals st step done merge split cont)
-              (PendingStep _ _ stB _ _ _ _ _) =
-      let stB' = unsafeCoerce stB
-      in PendingStep pid locals (merge st stB') step done merge split cont
-
-    splitSteps [] _ = []
-    splitSteps (rows : rest) steps =
-      let (chunkSteps, restSteps) = splitStepList rows steps
-      in chunkSteps : splitSteps rest restSteps
-
-    splitStepList rows = unzip . map (splitStep rows)
-
-    splitStep rows (PendingStep pid locals st step done merge split cont) =
-      let (stChunk, stRest) = split rows st
-      in ( PendingStep pid locals stChunk step done merge split cont
-         , PendingStep pid locals stRest step done merge split cont
-         )
+    forceChunk (rows', st) = length rows' `seq` (rows', st)
 
     chunkRows _ [] = []
     chunkRows n xs =
       let (h, t) = splitAt n xs
       in h : chunkRows n t
 
+    stepsFromPending steps =
+      let statics = V.fromList (map mkStatic steps)
+          states = V.fromList (map mkState steps)
+      in PendingState statics states
+      where
+        mkStatic (PendingStep gid st step done merge split) =
+          StepStatic
+            { ssGroup = gid
+            , ssStep = \e sig bag stAny ->
+                let (sig', bag', st') = step e sig bag (unsafeCoerce stAny)
+                in (sig', bag', unsafeCoerce st')
+            , ssDone = \stAny ->
+                let (a, bout) = done (unsafeCoerce stAny)
+                in (unsafeCoerce a, bout)
+            , ssMerge = \a b -> unsafeCoerce (merge (unsafeCoerce a) (unsafeCoerce b))
+            , ssSplit = \rows stAny ->
+                let (s1, s2) = split rows (unsafeCoerce stAny)
+                in (unsafeCoerce s1, unsafeCoerce s2)
+            }
+        mkState (PendingStep _ st _ _ _ _) = unsafeCoerce st
 
-    runPendingStepsOne e sig bag steps =
-      let go accSig accBag accSteps [] = (accSig, accBag, reverse accSteps)
-          go accSig accBag accSteps (PendingStep pid locals st step done merge split cont : rest) =
-            let (sig', bag', st') = step e accSig accBag st
-            in go sig' bag' (PendingStep pid locals st' step done merge split cont : accSteps) rest
-      in go sig bag [] steps
+    processRows rows (PendingState statics states0) =
+      let stepRow (build, states) row =
+            let (row', states') = processRow statics states row
+            in (build . (row' :), states')
+          (build, states') = foldl' stepRow (id, states0) rows
+      in (build [], PendingState statics states')
 
-    finalizePending steps =
-      let go accUpdates accOut [] = (accUpdates, outToList accOut)
-          go accUpdates accOut (PendingStep pid locals st _ done _ _ cont : rest) =
-            let (a, bout) = done st
-                locals' = boLocals bout locals
-                out' = accOut <> boOut bout
-                prog' = cont a
-                update = ProgramUpdate locals' (unsafeCoerce prog')
-            in go (IntMap.insert pid update accUpdates) out' rest
-      in go IntMap.empty mempty steps
+    processRow :: V.Vector (StepStatic c msg) -> V.Vector Any -> E.EntityRow c
+               -> (E.EntityRow c, V.Vector Any)
+    processRow statics states (eid', sig0, bag0) =
+      let e = E.Entity eid'
+          len = V.length statics
+          go i sig bag acc =
+            if i >= len
+              then (sig, bag, V.fromListN len (reverse acc))
+              else
+                let stc = V.unsafeIndex statics i
+                    st = V.unsafeIndex states i
+                    (sig', bag', st') = ssStep stc e sig bag st
+                in sig' `seq` bag' `seq` go (i + 1) sig' bag' (st' : acc)
+          (sig', bag', states') = go 0 sig0 bag0 []
+      in ((eid', sig', bag'), states')
+
+    splitStateChunks [] _ = []
+    splitStateChunks (rows : rest) (PendingState statics states0) =
+      let (chunkStates, restStates) = splitStates statics rows states0
+      in PendingState statics chunkStates : splitStateChunks rest (PendingState statics restStates)
+
+    splitStates statics rows states0 =
+      let len = V.length statics
+          go i accChunk accRest =
+            if i >= len
+              then (V.fromListN len (reverse accChunk), V.fromListN len (reverse accRest))
+              else
+                let stc = V.unsafeIndex statics i
+                    s = V.unsafeIndex states0 i
+                    (sChunk, sRest) = ssSplit stc rows s
+                in go (i + 1) (sChunk : accChunk) (sRest : accRest)
+      in go 0 [] []
+
+    mergeStateChunks base [] = base
+    mergeStateChunks base (s:ss) =
+      let statics = psStatics base
+          states = foldl' (mergeStates statics) (psStates s) (map psStates ss)
+      in PendingState statics states
+
+    mergeStates statics xs ys =
+      let len = V.length statics
+          go i acc =
+            if i >= len
+              then V.fromListN len (reverse acc)
+              else
+                let stc = V.unsafeIndex statics i
+                    a = V.unsafeIndex xs i
+                    b = V.unsafeIndex ys i
+                    ab = ssMerge stc a b
+                in go (i + 1) (ab : acc)
+      in go 0 []
+
+    finalizePendingState (PendingState statics states0) groups =
+      let len = V.length statics
+          go i accMap accOut =
+            if i >= len
+              then (accMap, outToList accOut)
+              else
+                let stc = V.unsafeIndex statics i
+                    st = V.unsafeIndex states0 i
+                    StepStatic gid _ done _ _ = stc
+                    (aAny, bout) = done st
+                    accOut' = accOut <> boOut bout
+                    accMap' = updateAcc gid aAny bout accMap
+                in go (i + 1) accMap' accOut'
+          updateAcc gid aAny bout accMap =
+            let acc = IntMap.findWithDefault emptyAcc gid accMap
+                acc' =
+                  Acc
+                    { accRes = accRes acc <> buildOne aAny
+                    , accOut = accOut acc <> bout
+                    }
+            in IntMap.insert gid acc' accMap
+          emptyAcc = Acc mempty mempty
+          applyUpdate acc gid accVal =
+            case groups V.!? gid of
+              Nothing -> acc
+              Just grp ->
+                let results = V.fromList (buildToList (accRes accVal))
+                    aAny = bgK grp results
+                    progAny = bgCont grp aAny
+                    locals' = boLocals (accOut accVal) (bgLocals grp)
+                in IntMap.insert (bgPid grp) (ProgramUpdate locals' progAny) acc
+          (accMap0, outList) = go 0 IntMap.empty mempty
+          updates = IntMap.foldlWithKey' applyUpdate IntMap.empty accMap0
+      in (updates, outList)
 
     applyProgramUpdates progs updates =
       map

@@ -30,6 +30,7 @@ library
                       , array
                       , containers
                       , parallel
+                      , vector ^>=0.13
     hs-source-dirs:   lib
     default-language: GHC2024
 
@@ -44,6 +45,7 @@ test-suite redatared-tests
                       , array
                       , containers
                       , parallel
+                      , vector ^>=0.13
                       , QuickCheck
                       , redatared
     default-language: GHC2024
@@ -57,6 +59,7 @@ benchmark redatared-bench
                       , array
                       , containers
                       , parallel
+                      , vector ^>=0.13
                       , criterion
                       , redatared
     default-language: GHC2024
