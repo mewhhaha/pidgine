@@ -67,16 +67,16 @@ buildWorld n = snd (foldl' add (0 :: Int, E.emptyWorld) [1 .. n])
       in (i + 1, w1)
 
 pPV :: E.Plan C (Pos, Vel)
-pPV = E.planRec @(Pos, Vel)
+pPV = E.plan @(Pos, Vel)
 
 pP :: E.Plan C Pos
 pP = E.plan @Pos
 
 pVA :: E.Plan C (Vel, Acc)
-pVA = E.planRec @(Vel, Acc)
+pVA = E.plan @(Vel, Acc)
 
 pMove3 :: E.Plan C Move3
-pMove3 = E.planRec @Move3
+pMove3 = E.planMap (\(p, v, a) -> Move3 p v a) (E.plan @(Pos, Vel, Acc))
 
 qPVQ :: E.Query C (Pos, Vel)
 qPVQ = (,) <$> (E.comp :: E.Query C Pos) <*> (E.comp :: E.Query C Vel)
@@ -189,13 +189,16 @@ moveProgStep = S.program (S.handle 1) $ do
       S.edit (S.set2 p' v')
   pure ()
 
+movePatch :: (Pos, Vel) -> S.EntityPatch C
+movePatch (Pos x y, Vel vx vy) =
+  let p = Pos (x + vx) (y + vy)
+      v = Vel vx vy
+  in S.set2 p v
+
 moveProgM :: Program String ()
 moveProgM = S.program (S.handle 0) $ do
   _ <- S.await $ computeS $
-    S.eachMP @MoveLoop pPV $ \(Pos x y, Vel vx vy) -> do
-      let p = Pos (x + vx) (y + vy)
-          v = Vel vx vy
-      S.edit (S.set2 p v)
+    S.eachMPure pPV movePatch
   pure ()
 
 moveProgMSmall :: Program String ()

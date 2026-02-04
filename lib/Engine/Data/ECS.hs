@@ -49,6 +49,7 @@ module Engine.Data.ECS
   , Plan(..)
   , plan
   , planRec
+  , planMap
   , sigFromBag
   , runQuerySig
   , keyOf
@@ -1016,7 +1017,23 @@ class QueryableSum c a where
 class Plannable c a where
   planC :: Plan c a
 
-instance PlanField c a => Plannable c a where
+instance {-# OVERLAPPING #-} (PlanField c a, PlanField c b) => Plannable c (a, b) where
+  planC =
+    let (reqA, forbA, runA) = fieldPlan @c @a
+        (reqB, forbB, runB) = fieldPlan @c @b
+    in Plan (reqA .|. reqB) (forbA .|. forbB) (\bag -> (runA bag, runB bag))
+
+instance {-# OVERLAPPING #-} (PlanField c a, PlanField c b, PlanField c d) => Plannable c (a, b, d) where
+  planC =
+    let (reqA, forbA, runA) = fieldPlan @c @a
+        (reqB, forbB, runB) = fieldPlan @c @b
+        (reqD, forbD, runD) = fieldPlan @c @d
+    in Plan
+      (reqA .|. reqB .|. reqD)
+      (forbA .|. forbB .|. forbD)
+      (\bag -> (runA bag, runB bag, runD bag))
+
+instance {-# OVERLAPPABLE #-} PlanField c a => Plannable c a where
   planC =
     let (req, forb, runF) = fieldPlan @c @a
     in Plan req forb runF
@@ -1028,12 +1045,18 @@ querySum :: forall a c. QueryableSum c a => Query c a
 querySum = querySumC @c @a
 
 plan :: forall a c. Plannable c a => Plan c a
+{-# NOINLINE plan #-}
 plan = planC @c @a
 
 planRec :: forall a c. (Generic a, GPlan c (Rep a)) => Plan c a
+{-# NOINLINE planRec #-}
 planRec =
   let (req, forb, runF) = gplan @c @(Rep a)
   in Plan req forb (to . runF)
+
+planMap :: (a -> b) -> Plan c a -> Plan c b
+{-# INLINE planMap #-}
+planMap f (Plan req forb runP) = Plan req forb (f . runP)
 
 class GQueryable c f where
   gquery :: Query c (f p)

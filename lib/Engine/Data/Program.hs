@@ -33,6 +33,7 @@ module Engine.Data.Program
   , eachP
   , eachM
   , eachMP
+  , eachMPure
   , collect
   , GraphM
   , graphM
@@ -91,6 +92,7 @@ import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import qualified Data.Vector as V
 import Data.Word (Word64)
+import GHC.Conc (numCapabilities)
 import GHC.Exts (Any)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.Typeable (Typeable)
@@ -134,10 +136,12 @@ componentBitOfType :: forall c a. (E.Component c a, E.ComponentBit c a) => Int
 componentBitOfType = E.componentBitOf @c @a
 
 runEntityPatch :: EntityPatch c -> Sig -> E.Bag c -> (Sig, E.Bag c)
+{-# INLINE runEntityPatch #-}
 runEntityPatch (EntityPatch f) sig bag = f sig bag
 
 -- Unsafe: only use when the Bag is uniquely owned by the caller.
 runEntityPatchUnsafe :: EntityPatch c -> Sig -> E.Bag c -> (Sig, E.Bag c)
+{-# INLINE runEntityPatchUnsafe #-}
 runEntityPatchUnsafe (EntityPatch f) sig bag = f sig bag
 
 set :: forall a c. (E.Component c a, E.ComponentBit c a) => a -> EntityPatch c
@@ -774,6 +778,10 @@ eachMP (E.Plan req forb runP) f =
           else Nothing
   in eachMWith @key req runMatch f
 
+eachMPure :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
+{-# INLINE eachMPure #-}
+eachMPure = eachP
+
 collect :: E.Query c a -> Batch c msg [(Entity, a)]
 collect q =
   let req = E.requireQ (E.queryInfo q)
@@ -1168,8 +1176,12 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       in (w', state1)
 
     runPendingStepsPar rows state0 wStep =
-      let chunkSize = 1024
-          rowsV = V.fromList rows
+      let rowsV = V.fromList rows
+          rowsLen = V.length rowsV
+          chunkSize =
+            if rowsLen <= 0
+              then 0
+              else max 1024 (rowsLen `div` (8 * numCapabilities))
           rowChunks = chunkRows chunkSize rowsV
           stateChunks = splitStateChunks rowChunks state0
           chunkResults =
