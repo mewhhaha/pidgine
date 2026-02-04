@@ -4,7 +4,9 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MagicHash #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -51,6 +53,19 @@ module Engine.Data.ECS
   , runQuerySig
   , keyOf
   , keyOfType
+  , BagEdit
+  , bagEditSet
+  , bagEditSetStep
+  , bagEditUpdate
+  , bagEditDel
+  , bagApplyEdit
+  , bagApplyEditUnsafe
+  , bagSetDirect
+  , bagSet2Direct
+  , bagSet3Direct
+  , bagSetStepDirect
+  , bagUpdateDirect
+  , bagDelDirect
   , bagGet
   , bagSet
   , bagSetStep
@@ -77,19 +92,19 @@ module Engine.Data.ECS
   ) where
 
 import Control.Applicative (Alternative(..))
-import Data.Array (Array, (!), (//), bounds, listArray)
-import Data.Bits (bit, complement, (.&.), (.|.), xor)
+import Data.Bits (bit, complement, finiteBitSize, (.&.), (.|.), xor)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
-import Data.List (foldl')
-import Data.Maybe (isJust)
 import Data.Kind (Constraint, Type)
+import Data.Maybe (isJust)
 import Data.Proxy (Proxy(..))
 import Data.Typeable (Typeable, cast, typeRep, typeRepFingerprint)
+import qualified Data.Vector as V
+import Data.Word (Word64)
 import GHC.TypeLits (TypeError, ErrorMessage(..))
-import GHC.Exts (Any)
+import GHC.Exts (Any, isTrue#, reallyUnsafePtrEquality#)
 import GHC.Fingerprint (Fingerprint(..))
 import GHC.Generics
 import Unsafe.Coerce (unsafeCoerce)
@@ -122,13 +137,31 @@ newtype Steps = Steps
   }
 
 data Bag c = Bag
-  { bagStatic :: !(Array Int (Maybe Any))
+  { bagStatic :: !(V.Vector (Maybe Any))
   , bagSteps :: !Steps
   }
 
-type Sig = Integer
+type Sig = Word64
 
 type EntityRow c = (Int, Sig, Bag c)
+
+data BagOp
+  = BagOpSet !Int !Any
+  | BagOpSetStep !Int !StepSlot
+  | BagOpUpdate !Int (Any -> Any)
+  | BagOpDel !Int
+
+type StaticEdits = [(Int, Maybe Any)]
+
+newtype BagEdit c = BagEdit
+  { runBagEdit :: forall r. (BagOp -> r -> r) -> r -> r
+  }
+
+instance Semigroup (BagEdit c) where
+  BagEdit f <> BagEdit g = BagEdit (\k z -> f k (g k z))
+
+instance Monoid (BagEdit c) where
+  mempty = BagEdit (\_ z -> z)
 
 stepsEmpty :: Steps
 stepsEmpty = Steps IntMap.empty
@@ -156,25 +189,30 @@ stepsNull (Steps m) = IntMap.null m
 emptyBag :: forall c. ComponentId c => Bag c
 emptyBag =
   let size = componentCount @c
-      arr =
+      limit = finiteBitSize (0 :: Word64)
+      _ =
+        if size > limit
+          then error ("ComponentId: componentCount exceeds Sig bit width (" <> show limit <> ")")
+          else ()
+      vec =
         if size <= 0
-          then listArray (0, -1) []
-          else listArray (0, size - 1) (replicate size Nothing)
-  in Bag arr stepsEmpty
+          then V.empty
+          else V.replicate size Nothing
+  in Bag vec stepsEmpty
 
 stepsMerge :: Steps -> Steps -> Steps
 stepsMerge (Steps base) (Steps extra) =
   Steps (IntMap.union extra base)
 
-mergeStatic :: Array Int (Maybe Any) -> Array Int (Maybe Any) -> Array Int (Maybe Any)
+mergeStatic :: V.Vector (Maybe Any) -> V.Vector (Maybe Any) -> V.Vector (Maybe Any)
 mergeStatic s1 s2 =
-  let (lo, hi) = bounds s1
-  in if lo > hi
+  let len = V.length s1
+  in if len == 0
       then s1
-      else listArray (lo, hi) [case s2 ! i of
-                                Just v -> Just v
-                                Nothing -> s1 ! i
-                              | i <- [lo .. hi]]
+      else V.generate len $ \i ->
+            case V.unsafeIndex s2 i of
+              Just v -> Just v
+              Nothing -> V.unsafeIndex s1 i
 
 instance ComponentId c => Semigroup (Bag c) where
   Bag s1 st1 <> Bag s2 st2 =
@@ -464,14 +502,11 @@ sigFromBag :: Bag c -> Sig
 sigFromBag bag =
   let static = bagStatic bag
       steps = bagSteps bag
-      (lo, hi) = bounds static
       sigStatic =
-        if lo > hi
-          then 0
-          else foldl' (\acc i -> case static ! i of
-                                  Just _ -> acc .|. bit i
-                                  Nothing -> acc
-                        ) 0 [lo .. hi]
+        V.ifoldl' (\acc i v -> case v of
+                                Just _ -> acc .|. bit i
+                                Nothing -> acc
+                  ) 0 static
       sigSteps = IntMap.foldlWithKey' (\acc bitIx _ -> acc .|. bit bitIx) 0 (stepsMap steps)
   in sigStatic .|. sigSteps
 
@@ -491,9 +526,12 @@ keyOfType = Key (componentBitOf @c @a)
 
 bagGetBy :: Int -> Bag c -> Maybe Any
 bagGetBy bitIx (Bag static steps) =
-  case stepsLookup bitIx steps of
-    Just slot -> Just (stepVal slot)
-    Nothing -> static ! bitIx
+  if stepsNull steps
+    then V.unsafeIndex static bitIx
+    else
+      case stepsLookup bitIx steps of
+        Just slot -> Just (stepVal slot)
+        Nothing -> V.unsafeIndex static bitIx
 
 bagGetByTyped :: forall a c. Int -> Bag c -> Maybe a
 bagGetByTyped bitIx bag = unsafeCoerce <$> bagGetBy bitIx bag
@@ -507,37 +545,284 @@ bagGetByUnsafe bitIx bag =
 bagGet :: forall c a. (Component c a, ComponentBit c a) => Bag c -> Maybe a
 bagGet bag = bagGetByTyped (componentBitOf @c @a) bag
 
-bagSet :: forall a c. (Component c a, ComponentBit c a) => a -> Bag c -> Bag c
-bagSet a (Bag static steps) =
+ptrEq :: Any -> Any -> Bool
+ptrEq a b = isTrue# (reallyUnsafePtrEquality# a b)
+
+eqMaybe :: Maybe Any -> Maybe Any -> Bool
+eqMaybe (Just a) (Just b) = ptrEq a b
+eqMaybe Nothing Nothing = True
+eqMaybe _ _ = False
+
+updateStatic :: V.Vector (Maybe Any) -> Int -> Maybe Any -> V.Vector (Maybe Any)
+updateStatic static bitIx newVal =
+  let cur = V.unsafeIndex static bitIx
+  in if eqMaybe cur newVal
+      then static
+      else static V.// [(bitIx, newVal)]
+
+lookupStatic :: V.Vector (Maybe Any) -> StaticEdits -> Int -> Maybe Any
+lookupStatic static edits bitIx =
+  case lookupEdit bitIx edits of
+    Just v -> v
+    Nothing -> V.unsafeIndex static bitIx
+
+lookupEdit :: Int -> StaticEdits -> Maybe (Maybe Any)
+lookupEdit _ [] = Nothing
+lookupEdit bitIx ((i, v) : rest)
+  | i == bitIx = Just v
+  | otherwise = lookupEdit bitIx rest
+
+upsertEdit :: Int -> Maybe Any -> StaticEdits -> StaticEdits
+upsertEdit bitIx newVal [] = [(bitIx, newVal)]
+upsertEdit bitIx newVal ((i, v) : rest)
+  | i == bitIx = (bitIx, newVal) : rest
+  | otherwise = (i, v) : upsertEdit bitIx newVal rest
+
+setStaticIfChanged :: V.Vector (Maybe Any) -> Int -> Maybe Any -> StaticEdits -> StaticEdits
+setStaticIfChanged static bitIx newVal edits =
+  let cur =
+        case lookupEdit bitIx edits of
+          Just v -> v
+          Nothing -> V.unsafeIndex static bitIx
+  in if eqMaybe cur newVal
+      then edits
+      else upsertEdit bitIx newVal edits
+
+bagEditSet :: forall c a. (Component c a, ComponentBit c a) => a -> BagEdit c
+bagEditSet a =
+  let bitIx = componentBitOf @c @a
+      vAny = unsafeCoerce a
+  in BagEdit (\k z -> k (BagOpSet bitIx vAny) z)
+
+bagEditSetStep :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> BagEdit c
+bagEditSetStep s0 =
+  let stepAny = unsafeCoerce s0 :: F.Step () Any
+      (vAny, s1) = F.stepS stepAny 0 ()
+      bitIx = componentBitOf @c @a
+      slot = StepSlot vAny (unsafeCoerce s1)
+  in BagEdit (\k z -> k (BagOpSetStep bitIx slot) z)
+
+bagEditUpdate :: forall c a. (Component c a, ComponentBit c a) => (a -> a) -> BagEdit c
+bagEditUpdate f =
+  let bitIx = componentBitOf @c @a
+      fAny v = unsafeCoerce (f (unsafeCoerce v))
+  in BagEdit (\k z -> k (BagOpUpdate bitIx fAny) z)
+
+bagEditDel :: forall c a. (Component c a, ComponentBit c a) => BagEdit c
+bagEditDel =
+  let bitIx = componentBitOf @c @a
+  in BagEdit (\k z -> k (BagOpDel bitIx) z)
+
+bagApplyEdit :: BagEdit c -> Bag c -> Bag c
+bagApplyEdit edit (Bag static steps) =
+  let step op (stepsAcc, edits) =
+        case op of
+          BagOpSet bitIx vAny ->
+            case stepsLookup bitIx stepsAcc of
+              Just (StepSlot vOld sAny) ->
+                if ptrEq vOld vAny
+                  then (stepsAcc, edits)
+                  else
+                    let steps' = stepsInsert bitIx (StepSlot vAny sAny) stepsAcc
+                        edits' = setStaticIfChanged static bitIx Nothing edits
+                    in (steps', edits')
+              Nothing ->
+                let edits' = setStaticIfChanged static bitIx (Just vAny) edits
+                in (stepsAcc, edits')
+          BagOpSetStep bitIx slot ->
+            let steps' = stepsInsert bitIx slot stepsAcc
+                edits' = setStaticIfChanged static bitIx Nothing edits
+            in (steps', edits')
+          BagOpUpdate bitIx fAny ->
+            case stepsLookup bitIx stepsAcc of
+              Just (StepSlot vAny sAny) ->
+                let vAny' = fAny vAny
+                in if ptrEq vAny vAny'
+                    then (stepsAcc, edits)
+                    else (stepsInsert bitIx (StepSlot vAny' sAny) stepsAcc, edits)
+              Nothing ->
+                case lookupStatic static edits bitIx of
+                  Nothing -> (stepsAcc, edits)
+                  Just vAny ->
+                    let vAny' = fAny vAny
+                    in if ptrEq vAny vAny'
+                        then (stepsAcc, edits)
+                        else (stepsAcc, setStaticIfChanged static bitIx (Just vAny') edits)
+          BagOpDel bitIx ->
+            let steps' = stepsDelete bitIx stepsAcc
+                edits' = setStaticIfChanged static bitIx Nothing edits
+            in (steps', edits')
+      (steps', staticEdits) = runBagEdit edit step (steps, [])
+      static' =
+        if null staticEdits
+          then static
+          else static V.// staticEdits
+  in Bag static' steps'
+
+bagApplyEditUnsafe :: BagEdit c -> Bag c -> Bag c
+bagApplyEditUnsafe = bagApplyEdit
+
+bagSetDirect :: forall c a. (Component c a, ComponentBit c a) => a -> Bag c -> Bag c
+{-# INLINE bagSetDirect #-}
+bagSetDirect a (Bag static steps) =
   let bitIx = componentBitOf @c @a
       vAny = unsafeCoerce a
   in case stepsLookup bitIx steps of
-      Just (StepSlot _ sAny) ->
-        let steps' = stepsInsert bitIx (StepSlot vAny sAny) steps
-            static' =
-              case static ! bitIx of
-                Nothing -> static
-                Just _ -> static // [(bitIx, Nothing)]
+      Just (StepSlot vOld sAny) ->
+        let steps' =
+              if ptrEq vOld vAny
+                then steps
+                else stepsInsert bitIx (StepSlot vAny sAny) steps
+            static' = updateStatic static bitIx Nothing
         in Bag static' steps'
       Nothing ->
-        Bag (static // [(bitIx, Just vAny)]) steps
+        let static' = updateStatic static bitIx (Just vAny)
+        in Bag static' steps
 
-bagSetStep :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> Bag c -> Bag c
-bagSetStep s0 (Bag static steps) =
+applySetStep :: Steps -> Int -> Any -> (Steps, Maybe Any)
+{-# INLINE applySetStep #-}
+applySetStep steps bitIx vAny =
+  case stepsLookup bitIx steps of
+    Just (StepSlot vOld sAny) ->
+      let steps' =
+            if ptrEq vOld vAny
+              then steps
+              else stepsInsert bitIx (StepSlot vAny sAny) steps
+      in (steps', Nothing)
+    Nothing ->
+      (steps, Just vAny)
+
+updateStatic2 :: V.Vector (Maybe Any) -> Int -> Maybe Any -> Int -> Maybe Any -> V.Vector (Maybe Any)
+{-# INLINE updateStatic2 #-}
+updateStatic2 static i vI j vJ =
+  let curI = V.unsafeIndex static i
+      curJ = V.unsafeIndex static j
+      edits =
+        case eqMaybe curI vI of
+          True ->
+            if eqMaybe curJ vJ
+              then []
+              else [(j, vJ)]
+          False ->
+            if eqMaybe curJ vJ
+              then [(i, vI)]
+              else [(i, vI), (j, vJ)]
+  in if null edits
+      then static
+      else static V.// edits
+
+addEdit3 :: (Int, Maybe Any) -> [(Int, Maybe Any)] -> [(Int, Maybe Any)]
+addEdit3 edit edits =
+  case edits of
+    [] -> [edit]
+    [a] -> [a, edit]
+    [a, b] -> [a, b, edit]
+    _ -> edits ++ [edit]
+
+updateStatic3 :: V.Vector (Maybe Any) -> Int -> Maybe Any -> Int -> Maybe Any -> Int -> Maybe Any
+              -> V.Vector (Maybe Any)
+{-# INLINE updateStatic3 #-}
+updateStatic3 static i vI j vJ k vK =
+  let curI = V.unsafeIndex static i
+      curJ = V.unsafeIndex static j
+      curK = V.unsafeIndex static k
+      edits2 =
+        case eqMaybe curI vI of
+          True ->
+            if eqMaybe curJ vJ
+              then []
+              else [(j, vJ)]
+          False ->
+            if eqMaybe curJ vJ
+              then [(i, vI)]
+              else [(i, vI), (j, vJ)]
+      edits =
+        if eqMaybe curK vK
+          then edits2
+          else addEdit3 (k, vK) edits2
+  in if null edits
+      then static
+      else static V.// edits
+
+bagSet2Direct :: forall c a b.
+  (Component c a, ComponentBit c a, Component c b, ComponentBit c b)
+  => a -> b -> Bag c -> Bag c
+{-# INLINE bagSet2Direct #-}
+bagSet2Direct a b (Bag static steps0) =
+  let bitA = componentBitOf @c @a
+      bitB = componentBitOf @c @b
+      vA = unsafeCoerce a
+      vB = unsafeCoerce b
+      (steps1, staticA) = applySetStep steps0 bitA vA
+      (steps2, staticB) = applySetStep steps1 bitB vB
+      static' = updateStatic2 static bitA staticA bitB staticB
+  in Bag static' steps2
+
+bagSet3Direct :: forall c a b d.
+  (Component c a, ComponentBit c a
+  , Component c b, ComponentBit c b
+  , Component c d, ComponentBit c d
+  ) => a -> b -> d -> Bag c -> Bag c
+{-# INLINE bagSet3Direct #-}
+bagSet3Direct a b d (Bag static steps0) =
+  let bitA = componentBitOf @c @a
+      bitB = componentBitOf @c @b
+      bitD = componentBitOf @c @d
+      vA = unsafeCoerce a
+      vB = unsafeCoerce b
+      vD = unsafeCoerce d
+      (steps1, staticA) = applySetStep steps0 bitA vA
+      (steps2, staticB) = applySetStep steps1 bitB vB
+      (steps3, staticD) = applySetStep steps2 bitD vD
+      static' = updateStatic3 static bitA staticA bitB staticB bitD staticD
+  in Bag static' steps3
+
+bagSetStepDirect :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> Bag c -> Bag c
+bagSetStepDirect s0 (Bag static steps) =
   let stepAny = unsafeCoerce s0 :: F.Step () Any
       (vAny, s1) = F.stepS stepAny 0 ()
       bitIx = componentBitOf @c @a
       slot = StepSlot vAny (unsafeCoerce s1)
       steps' = stepsInsert bitIx slot steps
-      static' = static // [(bitIx, Nothing)]
+      static' = updateStatic static bitIx Nothing
   in Bag static' steps'
 
-bagDel :: forall a c. (Component c a, ComponentBit c a) => Bag c -> Bag c
-bagDel (Bag static steps) =
+bagUpdateDirect :: forall c a. (Component c a, ComponentBit c a) => (a -> a) -> Bag c -> Bag c
+{-# INLINE bagUpdateDirect #-}
+bagUpdateDirect f (Bag static steps) =
   let bitIx = componentBitOf @c @a
-      static' = static // [(bitIx, Nothing)]
+      fAny v = unsafeCoerce (f (unsafeCoerce v))
+  in case stepsLookup bitIx steps of
+      Just (StepSlot vAny sAny) ->
+        let vAny' = fAny vAny
+        in if ptrEq vAny vAny'
+            then Bag static steps
+            else Bag static (stepsInsert bitIx (StepSlot vAny' sAny) steps)
+      Nothing ->
+        case V.unsafeIndex static bitIx of
+          Nothing -> Bag static steps
+          Just vAny ->
+            let vAny' = fAny vAny
+            in if ptrEq vAny vAny'
+                then Bag static steps
+                else Bag (updateStatic static bitIx (Just vAny')) steps
+
+bagDelDirect :: forall c a. (Component c a, ComponentBit c a) => Bag c -> Bag c
+{-# INLINE bagDelDirect #-}
+bagDelDirect (Bag static steps) =
+  let bitIx = componentBitOf @c @a
       steps' = stepsDelete bitIx steps
+      static' = updateStatic static bitIx Nothing
   in Bag static' steps'
+
+bagSet :: forall a c. (Component c a, ComponentBit c a) => a -> Bag c -> Bag c
+bagSet = bagSetDirect
+
+bagSetStep :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> Bag c -> Bag c
+bagSetStep = bagSetStepDirect
+
+bagDel :: forall a c. (Component c a, ComponentBit c a) => Bag c -> Bag c
+bagDel bag = bagDelDirect @c @a bag
 
 get :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Maybe a
 get e w =

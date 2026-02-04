@@ -172,7 +172,7 @@ moveProgLogic = S.program (S.handle 0) $ do
   _ <- S.await $ computeS $
     S.eachP pPV $ \(p, v) ->
       let (p', v') = advance dt p v
-      in S.set p' <> S.set v'
+      in S.set2 p' v'
   pure ()
 
 moveStep :: F.Step (Pos, Vel) (Pos, Vel)
@@ -186,7 +186,7 @@ moveProgStep = S.program (S.handle 1) $ do
   _ <- S.await $ computeS $
     S.eachMP @MoveLoop pPV $ \(p, v) -> do
       (p', v') <- S.step @MoveLoop moveStep (p, v)
-      S.edit (S.set p' <> S.set v')
+      S.edit (S.set2 p' v')
   pure ()
 
 moveProgM :: Program String ()
@@ -195,7 +195,7 @@ moveProgM = S.program (S.handle 0) $ do
     S.eachMP @MoveLoop pPV $ \(Pos x y, Vel vx vy) -> do
       let p = Pos (x + vx) (y + vy)
           v = Vel vx vy
-      S.edit (S.set p <> S.set v)
+      S.edit (S.set2 p v)
   pure ()
 
 moveProgMSmall :: Program String ()
@@ -216,7 +216,7 @@ moveProgMJoin3 = S.program (S.handle 0) $ do
           vx' = vx + ax
           vy' = vy + ay
           p' = Pos (x + vx') (y + vy')
-      S.edit (S.set p' <> S.set (Vel vx' vy'))
+      S.edit (S.set2 p' (Vel vx' vy'))
   pure ()
 
 moveProgMTwoEach :: Program String ()
@@ -237,7 +237,7 @@ moveProgMLogic = S.program (S.handle 0) $ do
   _ <- S.await $ computeS $
     S.eachMP @MoveLoop pPV $ \(p, v) -> do
       let (p', v') = advance dt p v
-      S.edit (S.set p' <> S.set v')
+      S.edit (S.set2 p' v')
   pure ()
 
 graphEach :: Graph String
@@ -281,6 +281,14 @@ graphEachMTwoEach = S.graph @String moveProgMTwoEach
 
 graphEachMLogic :: Graph String
 graphEachMLogic = S.graph @String moveProgMLogic
+
+runWarmTick :: Double -> World -> Graph String -> World
+runWarmTick dt w0 g0 =
+  let (w1, _, g1) = S.run dt w0 [] g0
+      _ = length (E.entities w1)
+      (w2, _, _) = S.run dt w1 [] g1
+      _ = length (E.entities w2)
+  in w2
 
 main :: IO ()
 main = defaultMain
@@ -364,77 +372,75 @@ main = defaultMain
                 in length (E.entities w1)
               ) w
           ]
-      , bgroup "50k"
-          [ let w = buildWorld 50000
+      , bgroup "10k-warm"
+          [ let w = buildWorld 10000
             in bench "each" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEach
+                let w1 = runWarmTick 0.016 w0 graphEach
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
             in bench "each-small" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachSmall
+                let w1 = runWarmTick 0.016 w0 graphEachSmall
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
             in bench "each-join3" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachJoin3
+                let w1 = runWarmTick 0.016 w0 graphEachJoin3
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
+            in bench "each-two" $ nf (\w0 ->
+                let w1 = runWarmTick 0.016 w0 graphEachTwoEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-two-compute" $ nf (\w0 ->
+                let w1 = runWarmTick 0.016 w0 graphEachTwoCompute
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-10-progs" $ nf (\w0 ->
+                let w1 = runWarmTick 0.016 w0 graphEach10Programs
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-10-in-one" $ nf (\w0 ->
+                let w1 = runWarmTick 0.016 w0 graphEach10InOne
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
             in bench "each-logic" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachLogic
+                let w1 = runWarmTick 0.016 w0 graphEachLogic
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
             in bench "each-step" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachS
+                let w1 = runWarmTick 0.016 w0 graphEachS
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
             in bench "eachm" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                let w1 = runWarmTick 0.016 w0 graphEachM
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
             in bench "eachm-small" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachMSmall
+                let w1 = runWarmTick 0.016 w0 graphEachMSmall
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
             in bench "eachm-join3" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachMJoin3
+                let w1 = runWarmTick 0.016 w0 graphEachMJoin3
                 in length (E.entities w1)
               ) w
-          , let w = buildWorld 50000
+          , let w = buildWorld 10000
+            in bench "eachm-two" $ nf (\w0 ->
+                let w1 = runWarmTick 0.016 w0 graphEachMTwoEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
             in bench "eachm-logic" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachMLogic
-                in length (E.entities w1)
-              ) w
-          ]
-      , bgroup "100k"
-          [ let w = buildWorld 100000
-            in bench "each" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEach
-                in length (E.entities w1)
-              ) w
-          , let w = buildWorld 100000
-            in bench "each-small" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachSmall
-                in length (E.entities w1)
-              ) w
-          , let w = buildWorld 100000
-            in bench "each-step" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachS
-                in length (E.entities w1)
-              ) w
-          , let w = buildWorld 100000
-            in bench "eachm" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachM
-                in length (E.entities w1)
-              ) w
-          , let w = buildWorld 100000
-            in bench "eachm-small" $ nf (\w0 ->
-                let (w1, _, _) = S.run 0.016 w0 [] graphEachMSmall
+                let w1 = runWarmTick 0.016 w0 graphEachMLogic
                 in length (E.entities w1)
               ) w
           ]
