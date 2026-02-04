@@ -21,7 +21,7 @@ module Engine.Data.ECS
   , Steps
   , StepSlot(..)
   , Sig
-  , EntityRow
+  , EntityRow(..)
   , emptyWorld
   , entities
   , entityRows
@@ -146,7 +146,10 @@ data Bag c = Bag
 
 type Sig = Word64
 
-type EntityRow c = (Int, Sig, Bag c)
+data EntityRow c = EntityRow
+  {-# UNPACK #-} !Int
+  {-# UNPACK #-} !Sig
+  !(Bag c)
 
 data BagOp
   = BagOpSet !Int !Any
@@ -243,7 +246,7 @@ emptyWorld =
     }
 
 entities :: World c -> [Entity]
-entities = V.toList . V.map (\(eid', _, _) -> Entity eid') . entitiesW
+entities = V.toList . V.map (\(EntityRow eid' _ _) -> Entity eid') . entitiesW
 
 entityRows :: World c -> [EntityRow c]
 entityRows = V.toList . entitiesW
@@ -257,14 +260,14 @@ nextId = nextIdW
 foldEntitiesFrom :: [EntityRow c] -> (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
 foldEntitiesFrom rows f s0 _ =
   foldl'
-    (\acc (eid', sig, bag) -> f (Entity eid') sig bag acc)
+    (\acc (EntityRow eid' sig bag) -> f (Entity eid') sig bag acc)
     s0
     rows
 
 foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
 foldEntities f s0 w =
   V.foldl'
-    (\acc (eid', sig, bag) -> f (Entity eid') sig bag acc)
+    (\acc (EntityRow eid' sig bag) -> f (Entity eid') sig bag acc)
     s0
     (entitiesW w)
 
@@ -272,10 +275,10 @@ mapEntities :: (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
 mapEntities f w =
   let ents' =
         V.map
-          (\(eid', sig, bag) ->
+          (\(EntityRow eid' sig bag) ->
             let bag' = f (Entity eid') sig bag
                 sig' = sigFromBag bag'
-            in (eid', sig', bag')
+            in EntityRow eid' sig' bag'
           )
           (entitiesW w)
   in w { entitiesW = ents' }
@@ -484,7 +487,7 @@ spawn a w =
       bag = bundle a
       sig = sigFromBag bag
       eid' = eid e
-      ents' = V.cons (eid', sig, bag) (entitiesW w)
+      ents' = V.cons (EntityRow eid' sig bag) (entitiesW w)
       w' =
         w
           { nextIdW = nextIdW w + 1
@@ -495,7 +498,7 @@ spawn a w =
 kill :: Entity -> World c -> World c
 kill e w =
   let eid' = eid e
-      ents' = V.filter (\(eid0, _, _) -> eid0 /= eid') (entitiesW w)
+      ents' = V.filter (\(EntityRow eid0 _ _) -> eid0 /= eid') (entitiesW w)
       out' = dropRelEntity eid' (relOutW w)
       in' = dropRelEntity eid' (relInW w)
   in w
@@ -872,12 +875,13 @@ has e w = isJust (get @a e w)
 
 lookupRow :: Int -> V.Vector (EntityRow c) -> Maybe (Sig, Bag c)
 lookupRow eid' rows =
-  (\(_, sig, bag) -> (sig, bag))
-    <$> V.find (\(eid0, _, _) -> eid0 == eid') rows
+  (\(EntityRow _ sig bag) -> (sig, bag))
+    <$> V.find (\(EntityRow eid0 _ _) -> eid0 == eid') rows
 
 replaceRow :: Int -> Sig -> Bag c -> V.Vector (EntityRow c) -> V.Vector (EntityRow c)
 replaceRow eid' sig' bag' =
-  V.map (\row@(eid0, _, _) -> if eid0 == eid' then (eid0, sig', bag') else row)
+  V.map (\row@(EntityRow eid0 _ _) ->
+    if eid0 == eid' then EntityRow eid0 sig' bag' else row)
 
 data QueryInfo = QueryInfo
   { requireQ :: Sig
@@ -945,7 +949,7 @@ notQ =
 
 runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
-  let step (eid', sig, bag) acc =
+  let step (EntityRow eid' sig bag) acc =
         if matchSig (queryInfoQ q) sig
           then case runQuery q (Entity eid') bag of
             Nothing -> acc
@@ -956,7 +960,7 @@ runq q w =
 foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
   V.foldl'
-    (\acc (eid', sig, bag) ->
+    (\acc (EntityRow eid' sig bag) ->
       if matchSig (queryInfoQ q) sig
         then case runQuery q (Entity eid') bag of
           Nothing -> acc
@@ -1182,10 +1186,10 @@ deleteRel rid src dst table =
   in table'
 stepWorld :: F.DTime -> World c -> World c
 stepWorld d w =
-  let stepRow (eid', sig, bag) =
+  let stepRow (EntityRow eid' sig bag) =
         if stepsNull (bagSteps bag)
-          then (False, (eid', sig, bag))
-          else (True, (eid', sig, stepBag d bag))
+          then (False, EntityRow eid' sig bag)
+          else (True, EntityRow eid' sig (stepBag d bag))
       (flags, ents') = V.unzip (V.map stepRow (entitiesW w))
       hasSteps = V.any id flags
   in if not hasSteps

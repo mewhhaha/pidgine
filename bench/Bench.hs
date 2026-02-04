@@ -201,11 +201,16 @@ moveDirect (Pos x y, Vel vx vy) =
       v = Vel vx vy
   in S.set2Direct p v
 
+moveSet2 :: (Pos, Vel) -> (Pos, Vel)
+moveSet2 (Pos x y, Vel vx vy) =
+  let p = Pos (x + vx) (y + vy)
+      v = Vel vx vy
+  in (p, v)
+
 moveProgM :: Program String ()
 moveProgM = S.program (S.handle 0) $ do
   _ <- S.await $ computeS $
-    S.eachMP @MoveLoop pPV $ \x -> do
-      S.editDirect (moveDirect x)
+    S.eachPSet2 pPV moveSet2
   pure ()
 
 moveProgMPure :: Program String ()

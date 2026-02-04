@@ -33,9 +33,11 @@ module Engine.Data.Program
   , each
   , eachP
   , eachPDirect
+  , eachPSet2
   , eachM
   , eachMP
   , eachMPEdit
+  , eachMPDirect
   , eachMPure
   , collect
   , GraphM
@@ -352,10 +354,11 @@ handle = Handle
 
 data Locals c msg = Locals
   { localsGlobal :: IntMap.IntMap Any
+  , localsCache :: IntMap.IntMap Any
   }
 
 emptyLocals :: Locals c msg
-emptyLocals = Locals IntMap.empty
+emptyLocals = Locals IntMap.empty IntMap.empty
 
 data Program c (msg :: Type) (a :: Type) = ProgramDef
   { programHandle :: Handle a
@@ -504,6 +507,7 @@ data CompiledStepsKey
 
 data CompiledSteps c msg = CompiledSteps
   { csStatics :: !(V.Vector (StepStatic c msg))
+  , csStates0 :: !(V.Vector Any)
   , csCount :: !Int
   }
 
@@ -734,6 +738,28 @@ eachPDirect (E.Plan req forb runP) f =
       done () = ((), mempty)
   in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
 
+eachPSet2 :: forall c a b msg.
+  (E.Component c a, E.ComponentBit c a, E.Component c b, E.ComponentBit c b) =>
+  E.Plan c (a, b) ->
+  ((a, b) -> (a, b)) ->
+  Batch c msg ()
+{-# INLINE eachPSet2 #-}
+eachPSet2 (E.Plan req forb runP) f =
+  let matches sig = (sig .&. req) == req && (sig .&. forb) == 0
+      bitA = bit (componentBitOfType @c @a)
+      bitB = bit (componentBitOfType @c @b)
+      step _ sig bag ()
+        | matches sig =
+            let ab = runP bag
+                (a', b') = f ab
+                sig' = sig .|. bitA .|. bitB
+                bag' = E.bagSet2Direct @c @a @b a' b' bag
+            in (sig', bag', ())
+        | otherwise = (sig, bag, ())
+      done () = ((), mempty)
+  in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
+
+
 data EachAcc c msg = EachAcc
   { eaOut :: !(Out msg)
   , eaOld :: !(IntMap.IntMap (ProgState c msg))
@@ -854,6 +880,10 @@ eachMP (E.Plan req forb runP) f =
 eachMPure :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
 {-# INLINE eachMPure #-}
 eachMPure = eachP
+
+eachMPDirect :: E.Plan c a -> (a -> DirectPatch c) -> Batch c msg ()
+{-# INLINE eachMPDirect #-}
+eachMPDirect = eachPDirect
 
 eachMPEdit :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
 {-# INLINE eachMPEdit #-}
@@ -1242,20 +1272,19 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       let BatchRun ops n k = unBatch b d inbox locals
           kAny xs = unsafeCoerce (fst (k xs 0))
           contAny v = unsafeCoerce (cont (unsafeCoerce v))
-          steps = foldr (\op acc -> opToStep pid op : acc) [] (buildToList ops)
-          stepCount = length steps
           cached =
-            case IntMap.lookup compiledStepsKey (localsGlobal locals) of
+            case IntMap.lookup compiledStepsKey (localsCache locals) of
               Just v -> Just (unsafeCoerce v :: CompiledSteps c msg)
               Nothing -> Nothing
-          (statics, cacheUpdate) =
+          (statics, states, cacheUpdate) =
             case cached of
-              Just cache | csCount cache == stepCount ->
-                (csStatics cache, Nothing)
+              Just cache | csCount cache == n ->
+                (csStatics cache, csStates0 cache, Nothing)
               _ ->
-                let statics' = V.fromList (map mkStatic steps)
-                in (statics', Just (CompiledSteps statics' stepCount))
-          states = V.fromList (map mkState steps)
+                let steps = foldr (\op acc -> opToStep pid op : acc) [] (buildToList ops)
+                    statics' = V.fromList (map mkStatic steps)
+                    states' = V.fromList (map mkState steps)
+                in (statics', states', Just (CompiledSteps statics' states' n))
           group =
             BatchGroup
               { bgPid = pid
@@ -1342,10 +1371,10 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
     processRowsForStep :: StepStatic c msg -> Any -> RowVec c -> (RowVec c, Any)
     processRowsForStep stc st0 rows =
       let rowsLen = V.length rows
-          stepRow (st, build) (eid', sig, bag) =
+          stepRow (st, build) (E.EntityRow eid' sig bag) =
             let e = E.Entity eid'
                 (sig', bag', st') = ssStep stc e sig bag st
-                build' = build . ((eid', sig', bag') :)
+                build' = build . (E.EntityRow eid' sig' bag' :)
             in sig' `seq` bag' `seq` st' `seq` (st', build')
           (stFinal, build) = V.foldl' stepRow (st0, id) rows
       in (V.fromListN rowsLen (build []), stFinal)
@@ -1419,11 +1448,11 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                           Nothing -> locals0
                           Just cache ->
                             locals0
-                              { localsGlobal =
+                              { localsCache =
                                   IntMap.insert
                                     compiledStepsKey
                                     (unsafeCoerce cache)
-                                    (localsGlobal locals0)
+                                    (localsCache locals0)
                               }
                       locals' = boLocals (accOut accVal) locals1
                   in IntMap.insert pid (ProgramUpdate locals' progAny) acc
