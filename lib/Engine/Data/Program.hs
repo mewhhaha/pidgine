@@ -16,6 +16,7 @@
 module Engine.Data.Program
   ( Patch
   , EntityPatch
+  , DirectPatch
   , patch
   , emptyPatch
   , ProgramId
@@ -31,8 +32,10 @@ module Engine.Data.Program
   , compute
   , each
   , eachP
+  , eachPDirect
   , eachM
   , eachMP
+  , eachMPEdit
   , eachMPure
   , collect
   , GraphM
@@ -49,6 +52,7 @@ module Engine.Data.Program
   , allIds
   , selfId
   , edit
+  , editDirect
   , world
   , send
   , dt
@@ -67,6 +71,9 @@ module Engine.Data.Program
   , set
   , set2
   , set3
+  , setDirect
+  , set2Direct
+  , set3Direct
   , update
   , del
   , at
@@ -110,6 +117,8 @@ patch :: (World c -> World c) -> Patch c
 patch = Patch
 
 newtype EntityPatch c = EntityPatch (Sig -> E.Bag c -> (Sig, E.Bag c))
+
+type DirectPatch c = Sig -> E.Bag c -> (Sig, E.Bag c)
 
 emptyPatch :: Patch c
 emptyPatch = mempty
@@ -172,6 +181,33 @@ set3 a b d =
       bitD = bit (componentBitOfType @c @d)
   in EntityPatch (\sig bag ->
         (sig .|. bitA .|. bitB .|. bitD, E.bagSet3Direct @c @a @b @d a b d bag))
+
+setDirect :: forall a c. (E.Component c a, E.ComponentBit c a) => a -> DirectPatch c
+{-# INLINE setDirect #-}
+setDirect a sig bag =
+  let bitC = bit (componentBitOfType @c @a)
+  in (sig .|. bitC, E.bagSetDirect @c @a a bag)
+
+set2Direct :: forall a b c.
+  (E.Component c a, E.ComponentBit c a, E.Component c b, E.ComponentBit c b)
+  => a -> b -> DirectPatch c
+{-# INLINE set2Direct #-}
+set2Direct a b sig bag =
+  let bitA = bit (componentBitOfType @c @a)
+      bitB = bit (componentBitOfType @c @b)
+  in (sig .|. bitA .|. bitB, E.bagSet2Direct @c @a @b a b bag)
+
+set3Direct :: forall a b d c.
+  (E.Component c a, E.ComponentBit c a
+  ,E.Component c b, E.ComponentBit c b
+  ,E.Component c d, E.ComponentBit c d
+  ) => a -> b -> d -> DirectPatch c
+{-# INLINE set3Direct #-}
+set3Direct a b d sig bag =
+  let bitA = bit (componentBitOfType @c @a)
+      bitB = bit (componentBitOfType @c @b)
+      bitD = bit (componentBitOfType @c @d)
+  in (sig .|. bitA .|. bitB .|. bitD, E.bagSet3Direct @c @a @b @d a b d bag)
 
 drive :: forall a c. (E.Component c a, E.ComponentBit c a) => F.Step () a -> EntityPatch c
 drive s0 =
@@ -432,11 +468,12 @@ data BatchGroup c msg = BatchGroup
   , bgK :: !(V.Vector Any -> Any)
   , bgCont :: !(Any -> Any)
   , bgOpCount :: !Int
+  , bgCacheUpdate :: !(Maybe (CompiledSteps c msg))
   }
 
 data PendingStep c msg where
   PendingStep ::
-    Int ->
+    ProgramId ->
     s ->
     (Entity -> E.Sig -> E.Bag c -> s -> (E.Sig, E.Bag c, s)) ->
     (s -> (Any, BatchOut c msg)) ->
@@ -445,7 +482,7 @@ data PendingStep c msg where
     PendingStep c msg
 
 data StepStatic c msg = StepStatic
-  { ssGroup :: !Int
+  { ssGroup :: !ProgramId
   , ssStep :: !(Entity -> Sig -> E.Bag c -> Any -> (Sig, E.Bag c, Any))
   , ssDone :: !(Any -> (Any, BatchOut c msg))
   , ssMerge :: !(Any -> Any -> Any)
@@ -456,6 +493,22 @@ data PendingState c msg = PendingState
   { psStatics :: !(V.Vector (StepStatic c msg))
   , psStates :: !(V.Vector Any)
   }
+
+data CompiledBatch c msg = CompiledBatch
+  { cbStatics :: !(V.Vector (StepStatic c msg))
+  , cbStates :: !(V.Vector Any)
+  , cbGroup :: !(BatchGroup c msg)
+  }
+
+data CompiledStepsKey
+
+data CompiledSteps c msg = CompiledSteps
+  { csStatics :: !(V.Vector (StepStatic c msg))
+  , csCount :: !Int
+  }
+
+compiledStepsKey :: Int
+compiledStepsKey = E.typeIdOf @CompiledStepsKey
 
 data ProgramUpdate c msg = ProgramUpdate
   { puLocals :: Locals c msg
@@ -669,14 +722,28 @@ eachP (E.Plan req forb runP) f =
       done () = ((), mempty)
   in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
 
+eachPDirect :: E.Plan c a -> (a -> DirectPatch c) -> Batch c msg ()
+eachPDirect (E.Plan req forb runP) f =
+  let matches sig = (sig .&. req) == req && (sig .&. forb) == 0
+      step _ sig bag ()
+        | matches sig =
+            let a = runP bag
+                (sig', bag') = f a sig bag
+            in (sig', bag', ())
+        | otherwise = (sig, bag, ())
+      done () = ((), mempty)
+  in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
+
 data EachAcc c msg = EachAcc
   { eaOut :: !(Out msg)
   , eaOld :: !(IntMap.IntMap (ProgState c msg))
   , eaNew :: ![(Int, ProgState c msg)]
+  , eaDt :: !DTime
+  , eaInbox :: !(Inbox msg)
   }
 
-emptyEachAcc :: IntMap.IntMap (ProgState c msg) -> EachAcc c msg
-emptyEachAcc prog = EachAcc mempty prog []
+emptyEachAcc :: DTime -> Inbox msg -> IntMap.IntMap (ProgState c msg) -> EachAcc c msg
+emptyEachAcc d inbox prog = EachAcc mempty prog [] d inbox
 
 mergeEachAcc :: EachAcc c msg -> EachAcc c msg -> EachAcc c msg
 mergeEachAcc a b =
@@ -684,6 +751,8 @@ mergeEachAcc a b =
     { eaOut = eaOut a <> eaOut b
     , eaOld = IntMap.empty
     , eaNew = eaNew a <> eaNew b
+    , eaDt = eaDt a
+    , eaInbox = eaInbox a
     }
 
 eachM :: forall (key :: Type) c msg a.
@@ -717,17 +786,19 @@ eachMWith req runMatch f =
             case IntMap.lookup progKey (localsGlobal locals) of
               Just v -> unsafeCoerce v
               Nothing -> IntMap.empty
-          step = stepEntity d inbox
-      in batchRun1 (Gather (emptyEachAcc progMap0) step done merge split)
+          acc0 = emptyEachAcc d inbox progMap0
+      in batchRun1 (Gather acc0 stepEntity done merge split)
     ) req True
   where
     progKey = E.typeIdOf @(ProgramKey key)
-    stepEntity d inbox e sig bag acc =
+    stepEntity e sig bag acc =
       case runMatch e sig bag of
         Nothing ->
           (sig, bag, acc)
         Just a ->
-          let eid' = E.eid e
+          let d = eaDt acc
+              inbox = eaInbox acc
+              eid' = E.eid e
               mState = IntMap.lookup eid' (eaOld acc)
               (prog0, machines0) =
                 case mState of
@@ -762,7 +833,9 @@ eachMWith req runMatch f =
     merge = mergeEachAcc
     split _ acc =
       let prog = eaOld acc
-      in (emptyEachAcc prog, emptyEachAcc prog)
+          d = eaDt acc
+          inbox = eaInbox acc
+      in (emptyEachAcc d inbox prog, emptyEachAcc d inbox prog)
 
 eachMP :: forall (key :: Type) c msg a.
   (Typeable key, Typeable msg) =>
@@ -781,6 +854,10 @@ eachMP (E.Plan req forb runP) f =
 eachMPure :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
 {-# INLINE eachMPure #-}
 eachMPure = eachP
+
+eachMPEdit :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
+{-# INLINE eachMPEdit #-}
+eachMPEdit = eachP
 
 collect :: E.Query c a -> Batch c msg [(Entity, a)]
 collect q =
@@ -949,6 +1026,12 @@ edit :: EntityPatch c -> EntityM c msg ()
 {-# INLINE edit #-}
 edit p = EntityM $ \ctx ->
   let (sig', bag') = runEntityPatchUnsafe p (ctxSig ctx) (ctxBag ctx)
+  in (ctx { ctxSig = sig', ctxBag = bag' }, Done ())
+
+editDirect :: DirectPatch c -> EntityM c msg ()
+{-# INLINE editDirect #-}
+editDirect f = EntityM $ \ctx ->
+  let (sig', bag') = f (ctxSig ctx) (ctxBag ctx)
   in (ctx { ctxSig = sig', ctxBag = bag' }, Done ())
 
 world :: Patch c -> ProgramM c msg ()
@@ -1128,16 +1211,21 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       let pendingSorted = pending
           wStep = if stepped0 then w else E.stepWorld d w
           stepped1 = True
-          compiled = zipWith (compilePending d) [0..] pendingSorted
-          steps =
-            buildToList $
-              foldl' (\acc (xs, _) -> acc <> buildFromList xs) mempty compiled
+          compiled = map (compilePending d) pendingSorted
+          statics =
+            V.concat $
+              foldr (\c acc -> cbStatics c : acc) [] compiled
+          states =
+            V.concat $
+              foldr (\c acc -> cbStates c : acc) [] compiled
           groups =
-            V.fromList $
-              foldr (\(_, g) acc -> g : acc) [] compiled
+            foldl' (\acc c ->
+                      let grp = cbGroup c
+                      in IntMap.insert (bgPid grp) grp acc
+                   ) IntMap.empty compiled
           parOk = all pendingPar pendingSorted
-          rows = E.entityRows wStep
-          state0 = stepsFromPending steps
+          rows = E.entityRowsV wStep
+          state0 = PendingState statics states
           (w', state') =
             if parOk
               then runPendingStepsPar rows state0 wStep
@@ -1150,10 +1238,24 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
 
     pendingPar (PendingBatch _ _ _ b _) = batchPar b
 
-    compilePending d gid (PendingBatch pid locals inbox b cont) =
+    compilePending d (PendingBatch pid locals inbox b cont) =
       let BatchRun ops n k = unBatch b d inbox locals
           kAny xs = unsafeCoerce (fst (k xs 0))
           contAny v = unsafeCoerce (cont (unsafeCoerce v))
+          steps = foldr (\op acc -> opToStep pid op : acc) [] (buildToList ops)
+          stepCount = length steps
+          cached =
+            case IntMap.lookup compiledStepsKey (localsGlobal locals) of
+              Just v -> Just (unsafeCoerce v :: CompiledSteps c msg)
+              Nothing -> Nothing
+          (statics, cacheUpdate) =
+            case cached of
+              Just cache | csCount cache == stepCount ->
+                (csStatics cache, Nothing)
+              _ ->
+                let statics' = V.fromList (map mkStatic steps)
+                in (statics', Just (CompiledSteps statics' stepCount))
+          states = V.fromList (map mkState steps)
           group =
             BatchGroup
               { bgPid = pid
@@ -1161,23 +1263,21 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
               , bgK = kAny
               , bgCont = contAny
               , bgOpCount = n
+              , bgCacheUpdate = cacheUpdate
               }
-          steps = foldr (\op acc -> opToStep gid op : acc) [] (buildToList ops)
-      in (steps, group)
+      in CompiledBatch statics states group
 
-    opToStep gid (BatchOp g) =
+    opToStep pid (BatchOp g) =
       case g of
-        Gather s step done merge split -> PendingStep gid s step done merge split
+        Gather s step done merge split -> PendingStep pid s step done merge split
 
-    runPendingSteps rows state0 wStep =
-      let rowsV = V.fromList rows
-          (rowsV', state1) = processRows rowsV state0
-          w' = E.setEntityRows (V.toList rowsV') wStep
+    runPendingSteps rowsV state0 wStep =
+      let (rowsV', state1) = processRows rowsV state0
+          w' = E.setEntityRowsV rowsV' wStep
       in (w', state1)
 
-    runPendingStepsPar rows state0 wStep =
-      let rowsV = V.fromList rows
-          rowsLen = V.length rowsV
+    runPendingStepsPar rowsV state0 wStep =
+      let rowsLen = V.length rowsV
           chunkSize =
             if rowsLen <= 0
               then 0
@@ -1190,7 +1290,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
           rows' = V.concat (foldr ((:) . fst) [] chunkResults)
           state' =
             mergeStateChunks state0 (foldr ((:) . snd) [] chunkResults)
-          w' = E.setEntityRows (V.toList rows') wStep
+          w' = E.setEntityRowsV rows' wStep
       in (w', state')
 
     forceChunk (rows', st) = V.length rows' `seq` (rows', st)
@@ -1208,34 +1308,29 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
           then []
           else go 0 []
 
-    stepsFromPending steps =
-      let statics = V.fromList (map mkStatic steps)
-          states = V.fromList (map mkState steps)
-      in PendingState statics states
-      where
-        mkStatic (PendingStep gid st step done merge split) =
-          StepStatic
-            { ssGroup = gid
-            , ssStep = \e sig bag stAny ->
-                let (sig', bag', st') = step e sig bag (unsafeCoerce stAny)
-                in (sig', bag', unsafeCoerce st')
-            , ssDone = \stAny ->
-                let (a, bout) = done (unsafeCoerce stAny)
-                in (unsafeCoerce a, bout)
-            , ssMerge = \a b -> unsafeCoerce (merge (unsafeCoerce a) (unsafeCoerce b))
-            , ssSplit = \rows stAny ->
-                let (s1, s2) = split rows (unsafeCoerce stAny)
-                in (unsafeCoerce s1, unsafeCoerce s2)
-            }
-        mkState (PendingStep _ st _ _ _ _) = unsafeCoerce st
+    mkStatic (PendingStep gid _ step done merge split) =
+      StepStatic
+        { ssGroup = gid
+        , ssStep = \e sig bag stAny ->
+            let (sig', bag', st') = step e sig bag (unsafeCoerce stAny)
+            in (sig', bag', unsafeCoerce st')
+        , ssDone = \stAny ->
+            let (a, bout) = done (unsafeCoerce stAny)
+            in (unsafeCoerce a, bout)
+        , ssMerge = \a b -> unsafeCoerce (merge (unsafeCoerce a) (unsafeCoerce b))
+        , ssSplit = \rows stAny ->
+            let (s1, s2) = split rows (unsafeCoerce stAny)
+            in (unsafeCoerce s1, unsafeCoerce s2)
+        }
+
+    mkState (PendingStep _ st _ _ _ _) = unsafeCoerce st
 
     processRows rows (PendingState statics states0) =
       let len = V.length statics
-          rowsLen = V.length rows
           stepRows (rowsAcc, statesAcc) i =
             let stc = V.unsafeIndex statics i
                 st0 = V.unsafeIndex statesAcc i
-                (rows', st') = processRowsForStep rowsLen stc st0 rowsAcc
+                (rows', st') = processRowsForStep stc st0 rowsAcc
                 statesAcc' = statesAcc V.// [(i, st')]
             in (rows', statesAcc')
           (rows', states') =
@@ -1244,9 +1339,10 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
               else foldl' stepRows (rows, states0) [0 .. len - 1]
       in (rows', PendingState statics states')
 
-    processRowsForStep :: Int -> StepStatic c msg -> Any -> RowVec c -> (RowVec c, Any)
-    processRowsForStep rowsLen stc st0 rows =
-      let stepRow (st, build) (eid', sig, bag) =
+    processRowsForStep :: StepStatic c msg -> Any -> RowVec c -> (RowVec c, Any)
+    processRowsForStep stc st0 rows =
+      let rowsLen = V.length rows
+          stepRow (st, build) (eid', sig, bag) =
             let e = E.Entity eid'
                 (sig', bag', st') = ssStep stc e sig bag st
                 build' = build . ((eid', sig', bag') :)
@@ -1283,7 +1379,6 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
 
     finalizePendingState (PendingState statics states0) groups =
       let len = V.length statics
-          groupCount = V.length groups
           emptyAcc = Acc mempty mempty 0
           combine acc delta =
             Acc
@@ -1297,29 +1392,42 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
               else
                 let stc = V.unsafeIndex statics i
                     st = V.unsafeIndex states0 i
-                    StepStatic gid _ done _ _ = stc
+                    StepStatic pid _ done _ _ = stc
                     (aAny, bout) = done st
                     delta = Acc (buildOne aAny) bout 1
                     !accOut' = accOut <> boOut bout
-                in go (i + 1) ((gid, delta) : accUpdates) accOut'
+                in go (i + 1) ((pid, delta) : accUpdates) accOut'
           (accUpdatesRev, outList) = go 0 [] mempty
           accUpdates = reverse accUpdatesRev
-          accVec =
-            if groupCount == 0
-              then V.empty
-              else V.accum combine (V.replicate groupCount emptyAcc) accUpdates
-          applyUpdate acc gid accVal =
+          accMap =
+            foldl'
+              (\acc (pid, delta) -> IntMap.insertWith combine pid delta acc)
+              IntMap.empty
+              accUpdates
+          applyUpdate acc pid accVal =
             if accCount accVal == 0
               then acc
-              else case groups V.!? gid of
+              else case IntMap.lookup pid groups of
                 Nothing -> acc
                 Just grp ->
                   let results = V.fromList (buildToList (accRes accVal))
                       aAny = bgK grp results
                       progAny = bgCont grp aAny
-                      locals' = boLocals (accOut accVal) (bgLocals grp)
-                  in IntMap.insert (bgPid grp) (ProgramUpdate locals' progAny) acc
-          updates = V.ifoldl' applyUpdate IntMap.empty accVec
+                      locals0 = bgLocals grp
+                      locals1 =
+                        case bgCacheUpdate grp of
+                          Nothing -> locals0
+                          Just cache ->
+                            locals0
+                              { localsGlobal =
+                                  IntMap.insert
+                                    compiledStepsKey
+                                    (unsafeCoerce cache)
+                                    (localsGlobal locals0)
+                              }
+                      locals' = boLocals (accOut accVal) locals1
+                  in IntMap.insert pid (ProgramUpdate locals' progAny) acc
+          updates = IntMap.foldlWithKey' applyUpdate IntMap.empty accMap
       in (updates, outList)
 
     applyProgramUpdates progs updates = go progs

@@ -25,11 +25,13 @@ module Engine.Data.ECS
   , emptyWorld
   , entities
   , entityRows
+  , entityRowsV
   , stepWorld
   , foldEntities
   , foldEntitiesFrom
   , mapEntities
   , setEntityRows
+  , setEntityRowsV
   , nextId
   , spawn
   , kill
@@ -224,7 +226,7 @@ instance ComponentId c => Monoid (Bag c) where
 
 data World c = World
   { nextIdW :: !Int
-  , entitiesW :: ![EntityRow c]
+  , entitiesW :: !(V.Vector (EntityRow c))
   , resourcesW :: !(IntMap Any)
   , relOutW :: !(IntMap (IntMap IntSet))
   , relInW :: !(IntMap (IntMap IntSet))
@@ -234,17 +236,20 @@ emptyWorld :: World c
 emptyWorld =
   World
     { nextIdW = 0
-    , entitiesW = []
+    , entitiesW = V.empty
     , resourcesW = IntMap.empty
     , relOutW = IntMap.empty
     , relInW = IntMap.empty
     }
 
 entities :: World c -> [Entity]
-entities = map (Entity . (\(eid', _, _) -> eid')) . entitiesW
+entities = V.toList . V.map (\(eid', _, _) -> Entity eid') . entitiesW
 
 entityRows :: World c -> [EntityRow c]
-entityRows = entitiesW
+entityRows = V.toList . entitiesW
+
+entityRowsV :: World c -> V.Vector (EntityRow c)
+entityRowsV = entitiesW
 
 nextId :: World c -> Int
 nextId = nextIdW
@@ -257,12 +262,16 @@ foldEntitiesFrom rows f s0 _ =
     rows
 
 foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
-foldEntities f s0 w = foldEntitiesFrom (entitiesW w) f s0 w
+foldEntities f s0 w =
+  V.foldl'
+    (\acc (eid', sig, bag) -> f (Entity eid') sig bag acc)
+    s0
+    (entitiesW w)
 
 mapEntities :: (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
 mapEntities f w =
   let ents' =
-        map
+        V.map
           (\(eid', sig, bag) ->
             let bag' = f (Entity eid') sig bag
                 sig' = sigFromBag bag'
@@ -272,7 +281,10 @@ mapEntities f w =
   in w { entitiesW = ents' }
 
 setEntityRows :: [EntityRow c] -> World c -> World c
-setEntityRows rows w = w { entitiesW = rows }
+setEntityRows rows w = w { entitiesW = V.fromList rows }
+
+setEntityRowsV :: V.Vector (EntityRow c) -> World c -> World c
+setEntityRowsV rows w = w { entitiesW = rows }
 
 class Typeable a => Component c a where
   inj :: a -> c
@@ -472,7 +484,7 @@ spawn a w =
       bag = bundle a
       sig = sigFromBag bag
       eid' = eid e
-      ents' = (eid', sig, bag) : entitiesW w
+      ents' = V.cons (eid', sig, bag) (entitiesW w)
       w' =
         w
           { nextIdW = nextIdW w + 1
@@ -483,7 +495,7 @@ spawn a w =
 kill :: Entity -> World c -> World c
 kill e w =
   let eid' = eid e
-      ents' = filter (\(eid0, _, _) -> eid0 /= eid') (entitiesW w)
+      ents' = V.filter (\(eid0, _, _) -> eid0 /= eid') (entitiesW w)
       out' = dropRelEntity eid' (relOutW w)
       in' = dropRelEntity eid' (relInW w)
   in w
@@ -858,19 +870,14 @@ del e w =
 has :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Bool
 has e w = isJust (get @a e w)
 
-lookupRow :: Int -> [EntityRow c] -> Maybe (Sig, Bag c)
-lookupRow _ [] = Nothing
-lookupRow eid' ((eid0, sig, bag) : rest)
-  | eid' == eid0 = Just (sig, bag)
-  | eid' > eid0 = Nothing
-  | otherwise = lookupRow eid' rest
+lookupRow :: Int -> V.Vector (EntityRow c) -> Maybe (Sig, Bag c)
+lookupRow eid' rows =
+  (\(_, sig, bag) -> (sig, bag))
+    <$> V.find (\(eid0, _, _) -> eid0 == eid') rows
 
-replaceRow :: Int -> Sig -> Bag c -> [EntityRow c] -> [EntityRow c]
-replaceRow _ _ _ [] = []
-replaceRow eid' sig' bag' (row@(eid0, sig0, bag0) : rest)
-  | eid' == eid0 = (eid', sig', bag') : rest
-  | eid' > eid0 = row : rest
-  | otherwise = row : replaceRow eid' sig' bag' rest
+replaceRow :: Int -> Sig -> Bag c -> V.Vector (EntityRow c) -> V.Vector (EntityRow c)
+replaceRow eid' sig' bag' =
+  V.map (\row@(eid0, _, _) -> if eid0 == eid' then (eid0, sig', bag') else row)
 
 data QueryInfo = QueryInfo
   { requireQ :: Sig
@@ -944,11 +951,11 @@ runq q w =
             Nothing -> acc
             Just a -> (Entity eid', a) : acc
           else acc
-  in foldr step [] (entitiesW w)
+  in V.foldr step [] (entitiesW w)
 
 foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
-  foldl'
+  V.foldl'
     (\acc (eid', sig, bag) ->
       if matchSig (queryInfoQ q) sig
         then case runQuery q (Entity eid') bag of
@@ -1175,12 +1182,12 @@ deleteRel rid src dst table =
   in table'
 stepWorld :: F.DTime -> World c -> World c
 stepWorld d w =
-  let stepRow (eid', sig, bag) (hasSteps, acc)
-        | stepsNull (bagSteps bag) = (hasSteps, (eid', sig, bag) : acc)
-        | otherwise =
-            let bag' = stepBag d bag
-            in (True, (eid', sig, bag') : acc)
-      (hasSteps, ents') = foldr stepRow (False, []) (entitiesW w)
+  let stepRow (eid', sig, bag) =
+        if stepsNull (bagSteps bag)
+          then (False, (eid', sig, bag))
+          else (True, (eid', sig, stepBag d bag))
+      (flags, ents') = V.unzip (V.map stepRow (entitiesW w))
+      hasSteps = V.any id flags
   in if not hasSteps
       then w
       else w { entitiesW = ents' }

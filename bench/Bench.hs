@@ -11,13 +11,13 @@ import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
 import qualified Engine.Data.Program as S
 
-data Pos = Pos Double Double
+data Pos = Pos {-# UNPACK #-} !Double {-# UNPACK #-} !Double
   deriving (Eq, Show)
 
-data Vel = Vel Double Double
+data Vel = Vel {-# UNPACK #-} !Double {-# UNPACK #-} !Double
   deriving (Eq, Show)
 
-data Acc = Acc Double Double
+data Acc = Acc {-# UNPACK #-} !Double {-# UNPACK #-} !Double
   deriving (Eq, Show)
 
 data Hp = Hp Int
@@ -195,8 +195,21 @@ movePatch (Pos x y, Vel vx vy) =
       v = Vel vx vy
   in S.set2 p v
 
+moveDirect :: (Pos, Vel) -> S.DirectPatch C
+moveDirect (Pos x y, Vel vx vy) =
+  let p = Pos (x + vx) (y + vy)
+      v = Vel vx vy
+  in S.set2Direct p v
+
 moveProgM :: Program String ()
 moveProgM = S.program (S.handle 0) $ do
+  _ <- S.await $ computeS $
+    S.eachMP @MoveLoop pPV $ \x -> do
+      S.editDirect (moveDirect x)
+  pure ()
+
+moveProgMPure :: Program String ()
+moveProgMPure = S.program (S.handle 0) $ do
   _ <- S.await $ computeS $
     S.eachMPure pPV movePatch
   pure ()
@@ -285,6 +298,9 @@ graphEachMTwoEach = S.graph @String moveProgMTwoEach
 graphEachMLogic :: Graph String
 graphEachMLogic = S.graph @String moveProgMLogic
 
+graphEachMPure :: Graph String
+graphEachMPure = S.graph @String moveProgMPure
+
 runWarmTick :: Double -> World -> Graph String -> World
 runWarmTick dt w0 g0 =
   let (w1, _, g1) = S.run dt w0 [] g0
@@ -352,6 +368,11 @@ main = defaultMain
           , let w = buildWorld 10000
             in bench "eachm" $ nf (\w0 ->
                 let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "eachm-pure" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachMPure
                 in length (E.entities w1)
               ) w
           , let w = buildWorld 10000
@@ -424,6 +445,11 @@ main = defaultMain
           , let w = buildWorld 10000
             in bench "eachm" $ nf (\w0 ->
                 let w1 = runWarmTick 0.016 w0 graphEachM
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "eachm-pure" $ nf (\w0 ->
+                let w1 = runWarmTick 0.016 w0 graphEachMPure
                 in length (E.entities w1)
               ) w
           , let w = buildWorld 10000
