@@ -507,7 +507,6 @@ data CompiledStepsKey
 
 data CompiledSteps c msg = CompiledSteps
   { csStatics :: !(V.Vector (StepStatic c msg))
-  , csStates0 :: !(V.Vector Any)
   , csCount :: !Int
   }
 
@@ -1279,12 +1278,14 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
           (statics, states, cacheUpdate) =
             case cached of
               Just cache | csCount cache == n ->
-                (csStatics cache, csStates0 cache, Nothing)
+                let steps = foldr (\op acc -> opToStep pid op : acc) [] (buildToList ops)
+                    states' = V.fromList (map mkState steps)
+                in (csStatics cache, states', Nothing)
               _ ->
                 let steps = foldr (\op acc -> opToStep pid op : acc) [] (buildToList ops)
                     statics' = V.fromList (map mkStatic steps)
                     states' = V.fromList (map mkState steps)
-                in (statics', states', Just (CompiledSteps statics' states' n))
+                in (statics', states', Just (CompiledSteps statics' n))
           group =
             BatchGroup
               { bgPid = pid
