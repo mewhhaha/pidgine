@@ -93,6 +93,7 @@ module Engine.Data.Program
 import Prelude
 
 import Control.Monad (ap)
+import Control.Monad.ST (runST)
 import Control.Parallel.Strategies (parListChunk, rseq, withStrategy)
 import Data.Bits (bit, complement, setBit, testBit, (.&.), (.|.))
 import Data.Kind (Type)
@@ -100,6 +101,7 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import qualified Data.Vector as V
+import qualified Data.Vector.Mutable as MV
 import Data.Word (Word64)
 import GHC.Conc (numCapabilities)
 import GHC.Exts (Any)
@@ -354,11 +356,10 @@ handle = Handle
 
 data Locals c msg = Locals
   { localsGlobal :: IntMap.IntMap Any
-  , localsCache :: IntMap.IntMap Any
   }
 
 emptyLocals :: Locals c msg
-emptyLocals = Locals IntMap.empty IntMap.empty
+emptyLocals = Locals IntMap.empty
 
 data Program c (msg :: Type) (a :: Type) = ProgramDef
   { programHandle :: Handle a
@@ -470,13 +471,13 @@ data BatchGroup c msg = BatchGroup
   , bgLocals :: !(Locals c msg)
   , bgK :: !(V.Vector Any -> Any)
   , bgCont :: !(Any -> Any)
-  , bgOpCount :: !Int
-  , bgCacheUpdate :: !(Maybe (CompiledSteps c msg))
   }
 
 data PendingStep c msg where
   PendingStep ::
     ProgramId ->
+    E.Sig ->
+    E.Sig ->
     s ->
     (Entity -> E.Sig -> E.Bag c -> s -> (E.Sig, E.Bag c, s)) ->
     (s -> (Any, BatchOut c msg)) ->
@@ -486,6 +487,8 @@ data PendingStep c msg where
 
 data StepStatic c msg = StepStatic
   { ssGroup :: !ProgramId
+  , ssReq :: !E.Sig
+  , ssForb :: !E.Sig
   , ssStep :: !(Entity -> Sig -> E.Bag c -> Any -> (Sig, E.Bag c, Any))
   , ssDone :: !(Any -> (Any, BatchOut c msg))
   , ssMerge :: !(Any -> Any -> Any)
@@ -502,16 +505,6 @@ data CompiledBatch c msg = CompiledBatch
   , cbStates :: !(V.Vector Any)
   , cbGroup :: !(BatchGroup c msg)
   }
-
-data CompiledStepsKey
-
-data CompiledSteps c msg = CompiledSteps
-  { csStatics :: !(V.Vector (StepStatic c msg))
-  , csCount :: !Int
-  }
-
-compiledStepsKey :: Int
-compiledStepsKey = E.typeIdOf @CompiledStepsKey
 
 data ProgramUpdate c msg = ProgramUpdate
   { puLocals :: Locals c msg
@@ -612,11 +605,13 @@ instance Monoid (BatchOut c msg) where
   mempty = BatchOut id mempty
 
 data BatchOp c msg = BatchOp
-  { opGather :: Gather c msg (Any, BatchOut c msg)
+  { opReq :: !E.Sig
+  , opForb :: !E.Sig
+  , opGather :: Gather c msg (Any, BatchOut c msg)
   }
 
 data BatchRun c msg a = BatchRun
-  { brOps :: !(Build (BatchOp c msg))
+  { brOps :: !(V.Vector (BatchOp c msg))
   , brCount :: !Int
   , brK :: !(V.Vector Any -> Int -> (a, Int))
   }
@@ -638,7 +633,7 @@ instance Functor (Batch c msg) where
       parOk
 
 instance Applicative (Batch c msg) where
-  pure a = Batch (\_ _ _ -> BatchRun mempty 0 (\_ i -> (a, i))) 0 True
+  pure a = Batch (\_ _ _ -> BatchRun V.empty 0 (\_ i -> (a, i))) 0 True
   Batch gf reqF parF <*> Batch ga reqA parA =
     Batch
       (\d inbox locals ->
@@ -648,7 +643,7 @@ instance Applicative (Batch c msg) where
               let (f, i1) = kF xs i0
                   (a, i2) = kA xs i1
               in (f a, i2)
-        in BatchRun (opsF <> opsA) (nF + nA) k
+        in BatchRun (opsF V.++ opsA) (nF + nA) k
       )
       (reqF .|. reqA)
       (parF && parA)
@@ -683,59 +678,46 @@ instance Applicative (Gather c msg) where
             (stA1, stA2) = splitA rows stA
         in ((stF1, stA1), (stF2, stA2))
 
-planQuery :: E.Plan c a -> E.Query c a
-planQuery (E.Plan req forb runP) =
-  E.Query (\_ bag -> Just (runP bag)) (E.QueryInfo req forb)
-
-batchRun1 :: Gather c msg (a, BatchOut c msg) -> BatchRun c msg a
-batchRun1 g =
+batchRun1 :: E.Sig -> E.Sig -> Gather c msg (a, BatchOut c msg) -> BatchRun c msg a
+batchRun1 req forb g =
   let g' = fmap (\(a, bout) -> (unsafeCoerce a, bout)) g
       k xs i =
         if i < V.length xs
           then (unsafeCoerce (V.unsafeIndex xs i), i + 1)
           else error "compute: missing batch result"
-  in BatchRun (buildOne (BatchOp g')) 1 k
+  in BatchRun (V.singleton (BatchOp req forb g')) 1 k
 
 each :: E.Query c a -> (a -> EntityPatch c) -> Batch c msg ()
 each q f =
   let E.Query runQ info = q
       req = E.requireQ info
       forb = E.forbidQ info
-      matches sig = (sig .&. req) == req && (sig .&. forb) == 0
-      step e sig bag ()
-        | matches sig =
-            case runQ e bag of
-              Nothing -> (sig, bag, ())
-              Just a ->
-                let (sig', bag') = runEntityPatchUnsafe (f a) sig bag
-                in (sig', bag', ())
-        | otherwise = (sig, bag, ())
+      step e sig bag () =
+        case runQ e bag of
+          Nothing -> (sig, bag, ())
+          Just a ->
+            let (sig', bag') = runEntityPatchUnsafe (f a) sig bag
+            in (sig', bag', ())
       done () = ((), mempty)
-  in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
+  in Batch (\_ _ _ -> batchRun1 req forb (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
 
 eachP :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
 eachP (E.Plan req forb runP) f =
-  let matches sig = (sig .&. req) == req && (sig .&. forb) == 0
-      step _ sig bag ()
-        | matches sig =
-            let a = runP bag
-                (sig', bag') = runEntityPatchUnsafe (f a) sig bag
-            in (sig', bag', ())
-        | otherwise = (sig, bag, ())
+  let step _ sig bag () =
+        let a = runP bag
+            (sig', bag') = runEntityPatchUnsafe (f a) sig bag
+        in (sig', bag', ())
       done () = ((), mempty)
-  in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
+  in Batch (\_ _ _ -> batchRun1 req forb (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
 
 eachPDirect :: E.Plan c a -> (a -> DirectPatch c) -> Batch c msg ()
 eachPDirect (E.Plan req forb runP) f =
-  let matches sig = (sig .&. req) == req && (sig .&. forb) == 0
-      step _ sig bag ()
-        | matches sig =
-            let a = runP bag
-                (sig', bag') = f a sig bag
-            in (sig', bag', ())
-        | otherwise = (sig, bag, ())
+  let step _ sig bag () =
+        let a = runP bag
+            (sig', bag') = f a sig bag
+        in (sig', bag', ())
       done () = ((), mempty)
-  in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
+  in Batch (\_ _ _ -> batchRun1 req forb (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
 
 eachPSet2 :: forall c a b msg.
   (E.Component c a, E.ComponentBit c a, E.Component c b, E.ComponentBit c b) =>
@@ -744,19 +726,16 @@ eachPSet2 :: forall c a b msg.
   Batch c msg ()
 {-# INLINE eachPSet2 #-}
 eachPSet2 (E.Plan req forb runP) f =
-  let matches sig = (sig .&. req) == req && (sig .&. forb) == 0
-      bitA = bit (componentBitOfType @c @a)
+  let bitA = bit (componentBitOfType @c @a)
       bitB = bit (componentBitOfType @c @b)
-      step _ sig bag ()
-        | matches sig =
-            let ab = runP bag
-                (a', b') = f ab
-                sig' = sig .|. bitA .|. bitB
-                bag' = E.bagSet2Direct @c @a @b a' b' bag
-            in (sig', bag', ())
-        | otherwise = (sig, bag, ())
+      step _ sig bag () =
+        let ab = runP bag
+            (a', b') = f ab
+            sig' = sig .|. bitA .|. bitB
+            bag' = E.bagSet2Direct @c @a @b a' b' bag
+        in (sig', bag', ())
       done () = ((), mempty)
-  in Batch (\_ _ _ -> batchRun1 (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
+  in Batch (\_ _ _ -> batchRun1 req forb (Gather () step done (\_ _ -> ()) (\_ s -> (s, s)))) req True
 
 
 data EachAcc c msg = EachAcc
@@ -790,21 +769,18 @@ eachM q f =
   let E.Query runQ info = q
       req = E.requireQ info
       forb = E.forbidQ info
-      matches sig = (sig .&. req) == req && (sig .&. forb) == 0
-      runMatch e sig bag =
-        if matches sig
-          then runQ e bag
-          else Nothing
-  in eachMWith @key req runMatch f
+      runMatch e _ bag = runQ e bag
+  in eachMWith @key req forb runMatch f
 
 eachMWith :: forall (key :: Type) c msg a.
   (Typeable key, Typeable msg) =>
+  E.Sig ->
   E.Sig ->
   (Entity -> E.Sig -> E.Bag c -> Maybe a) ->
   (a -> EntityM c msg ()) ->
   Batch c msg ()
 {-# INLINE eachMWith #-}
-eachMWith req runMatch f =
+eachMWith req forb runMatch f =
   Batch (\d inbox locals ->
       let progMap0 :: IntMap.IntMap (ProgState c msg)
           progMap0 =
@@ -812,7 +788,7 @@ eachMWith req runMatch f =
               Just v -> unsafeCoerce v
               Nothing -> IntMap.empty
           acc0 = emptyEachAcc d inbox progMap0
-      in batchRun1 (Gather acc0 stepEntity done merge split)
+      in batchRun1 req forb (Gather acc0 stepEntity done merge split)
     ) req True
   where
     progKey = E.typeIdOf @(ProgramKey key)
@@ -869,12 +845,8 @@ eachMP :: forall (key :: Type) c msg a.
   Batch c msg ()
 {-# INLINE eachMP #-}
 eachMP (E.Plan req forb runP) f =
-  let matches sig = (sig .&. req) == req && (sig .&. forb) == 0
-      runMatch _ sig bag =
-        if matches sig
-          then Just (runP bag)
-          else Nothing
-  in eachMWith @key req runMatch f
+  let runMatch _ _ bag = Just (runP bag)
+  in eachMWith @key req forb runMatch f
 
 eachMPure :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
 {-# INLINE eachMPure #-}
@@ -890,14 +862,15 @@ eachMPEdit = eachP
 
 collect :: E.Query c a -> Batch c msg [(Entity, a)]
 collect q =
-  let req = E.requireQ (E.queryInfo q)
-  in Batch (\_ _ _ -> batchRun1 (Gather mempty step done (<>) (\_ s -> (s, s)))) req True
-  where
-    step e sig bag acc =
-      case E.runQuerySig q sig e bag of
-        Nothing -> (sig, bag, acc)
-        Just a -> (sig, bag, acc <> buildOne (e, a))
-    done acc = (buildToList acc, mempty)
+  let E.Query runQ info = q
+      req = E.requireQ info
+      forb = E.forbidQ info
+      step e sig bag acc =
+        case runQ e bag of
+          Nothing -> (sig, bag, acc)
+          Just a -> (sig, bag, acc <> buildOne (e, a))
+      done acc = (buildToList acc, mempty)
+  in Batch (\_ _ _ -> batchRun1 req forb (Gather mempty step done (<>) (\_ s -> (s, s)))) req True
 
 
 data ProgCtx c msg = ProgCtx
@@ -957,9 +930,6 @@ instance Monoid (Build a) where
 
 buildOne :: a -> Build a
 buildOne a = Build (a :)
-
-buildFromList :: [a] -> Build a
-buildFromList xs = Build (\ys -> foldr (:) ys xs)
 
 buildToList :: Build a -> [a]
 buildToList (Build f) = f []
@@ -1068,18 +1038,6 @@ world p = ProgramM $ \ctx ->
   let w' = apply p (sysWorld ctx)
       patch' = sysPatch ctx <> p
   in (ctx { sysWorld = w', sysPatch = patch' }, ProgDone ())
-
-localStateId :: forall s c msg a. Typeable s => E.TypeId -> s -> (s -> (a, s)) -> ProgramM c msg a
-localStateId key s0 f = ProgramM $ \ctx ->
-  let locals0 = sysLocals ctx
-      globals0 = localsGlobal locals0
-      s = case IntMap.lookup key globals0 of
-        Just v -> unsafeCoerce v
-        Nothing -> s0
-      (a, s') = f s
-      globals' = IntMap.insert key (unsafeCoerce s') globals0
-      locals' = locals0 { localsGlobal = globals' }
-  in (ctx { sysLocals = locals' }, ProgDone a)
 
 
 data TimeKey
@@ -1240,7 +1198,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       let pendingSorted = pending
           wStep = if stepped0 then w else E.stepWorld d w
           stepped1 = True
-          compiled = map (compilePending d) pendingSorted
+          compiled = foldr (\p acc -> compilePending d p : acc) [] pendingSorted
           statics =
             V.concat $
               foldr (\c acc -> cbStatics c : acc) [] compiled
@@ -1271,35 +1229,28 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       let BatchRun ops n k = unBatch b d inbox locals
           kAny xs = unsafeCoerce (fst (k xs 0))
           contAny v = unsafeCoerce (cont (unsafeCoerce v))
-          cached =
-            case IntMap.lookup compiledStepsKey (localsCache locals) of
-              Just v -> Just (unsafeCoerce v :: CompiledSteps c msg)
-              Nothing -> Nothing
-          (statics, states, cacheUpdate) =
-            case cached of
-              Just cache | csCount cache == n ->
-                let steps = foldr (\op acc -> opToStep pid op : acc) [] (buildToList ops)
-                    states' = V.fromList (map mkState steps)
-                in (csStatics cache, states', Nothing)
-              _ ->
-                let steps = foldr (\op acc -> opToStep pid op : acc) [] (buildToList ops)
-                    statics' = V.fromList (map mkStatic steps)
-                    states' = V.fromList (map mkState steps)
-                in (statics', states', Just (CompiledSteps statics' n))
+          (staticsList, statesList) =
+            V.foldr
+              (\op (ss, st) ->
+                let step = opToStep pid op
+                in (mkStatic step : ss, mkState step : st)
+              )
+              ([], [])
+              ops
+          statics = V.fromListN n staticsList
+          states = V.fromListN n statesList
           group =
             BatchGroup
               { bgPid = pid
               , bgLocals = locals
               , bgK = kAny
               , bgCont = contAny
-              , bgOpCount = n
-              , bgCacheUpdate = cacheUpdate
               }
       in CompiledBatch statics states group
 
-    opToStep pid (BatchOp g) =
+    opToStep pid (BatchOp req forb g) =
       case g of
-        Gather s step done merge split -> PendingStep pid s step done merge split
+        Gather s step done merge split -> PendingStep pid req forb s step done merge split
 
     runPendingSteps rowsV state0 wStep =
       let (rowsV', state1) = processRows rowsV state0
@@ -1338,48 +1289,6 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
           then []
           else go 0 []
 
-    mkStatic (PendingStep gid _ step done merge split) =
-      StepStatic
-        { ssGroup = gid
-        , ssStep = \e sig bag stAny ->
-            let (sig', bag', st') = step e sig bag (unsafeCoerce stAny)
-            in (sig', bag', unsafeCoerce st')
-        , ssDone = \stAny ->
-            let (a, bout) = done (unsafeCoerce stAny)
-            in (unsafeCoerce a, bout)
-        , ssMerge = \a b -> unsafeCoerce (merge (unsafeCoerce a) (unsafeCoerce b))
-        , ssSplit = \rows stAny ->
-            let (s1, s2) = split rows (unsafeCoerce stAny)
-            in (unsafeCoerce s1, unsafeCoerce s2)
-        }
-
-    mkState (PendingStep _ st _ _ _ _) = unsafeCoerce st
-
-    processRows rows (PendingState statics states0) =
-      let len = V.length statics
-          stepRows (rowsAcc, statesAcc) i =
-            let stc = V.unsafeIndex statics i
-                st0 = V.unsafeIndex statesAcc i
-                (rows', st') = processRowsForStep stc st0 rowsAcc
-                statesAcc' = statesAcc V.// [(i, st')]
-            in (rows', statesAcc')
-          (rows', states') =
-            if len == 0
-              then (rows, states0)
-              else foldl' stepRows (rows, states0) [0 .. len - 1]
-      in (rows', PendingState statics states')
-
-    processRowsForStep :: StepStatic c msg -> Any -> RowVec c -> (RowVec c, Any)
-    processRowsForStep stc st0 rows =
-      let rowsLen = V.length rows
-          stepRow (st, build) (E.EntityRow eid' sig bag) =
-            let e = E.Entity eid'
-                (sig', bag', st') = ssStep stc e sig bag st
-                build' = build . (E.EntityRow eid' sig' bag' :)
-            in sig' `seq` bag' `seq` st' `seq` (st', build')
-          (stFinal, build) = V.foldl' stepRow (st0, id) rows
-      in (V.fromListN rowsLen (build []), stFinal)
-
     splitStateChunks [] _ = []
     splitStateChunks (rows : rest) (PendingState statics states0) =
       let (chunkStates, restStates) = splitStates statics rows states0
@@ -1407,6 +1316,82 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
               b = V.unsafeIndex ys i
           in ssMerge stc a b
 
+
+    mkStatic (PendingStep gid req forb _ step done merge split) =
+      StepStatic
+        { ssGroup = gid
+        , ssReq = req
+        , ssForb = forb
+        , ssStep = \e sig bag stAny ->
+            let (sig', bag', st') = step e sig bag (unsafeCoerce stAny)
+            in (sig', bag', unsafeCoerce st')
+        , ssDone = \stAny ->
+            let (a, bout) = done (unsafeCoerce stAny)
+            in (unsafeCoerce a, bout)
+        , ssMerge = \a b -> unsafeCoerce (merge (unsafeCoerce a) (unsafeCoerce b))
+        , ssSplit = \rows stAny ->
+            let (s1, s2) = split rows (unsafeCoerce stAny)
+            in (unsafeCoerce s1, unsafeCoerce s2)
+        }
+
+    mkState (PendingStep _ _ _ st _ _ _ _) = unsafeCoerce st
+
+    processRows rows (PendingState statics states0) =
+      let len = V.length statics
+          stepRows (rowsAcc, statesAcc) i =
+            let stc = V.unsafeIndex statics i
+                st0 = V.unsafeIndex statesAcc i
+                (rows', st') = processRowsForStep stc st0 rowsAcc
+                statesAcc' = statesAcc V.// [(i, st')]
+            in (rows', statesAcc')
+          (rows', states') =
+            if len == 0
+              then (rows, states0)
+              else foldl' stepRows (rows, states0) [0 .. len - 1]
+      in (rows', PendingState statics states')
+
+    processRowsForStep :: StepStatic c msg -> Any -> RowVec c -> (RowVec c, Any)
+    processRowsForStep stc st0 rows =
+      let rowsLen = V.length rows
+      in if rowsLen == 0
+          then (rows, st0)
+          else
+            let req = ssReq stc
+                forb = ssForb stc
+                matches sig = (sig .&. req) == req && (sig .&. forb) == 0
+                stepRowMatch st row@(E.EntityRow eid' sig bag) =
+                  if matches sig
+                    then
+                      let e = E.Entity eid'
+                          (sig', bag', st') = ssStep stc e sig bag st
+                      in sig' `seq` bag' `seq` st' `seq` (st', E.EntityRow eid' sig' bag')
+                    else (st, row)
+                stepRowAll st (E.EntityRow eid' sig bag) =
+                  let e = E.Entity eid'
+                      (sig', bag', st') = ssStep stc e sig bag st
+                  in sig' `seq` bag' `seq` st' `seq` (st', E.EntityRow eid' sig' bag')
+                run stepRow = mapAccumLVector stepRow st0 rows
+                mapAccumLVector f acc0 vec =
+                  runST $ do
+                    let len = V.length vec
+                    mv <- MV.new len
+                    let go !i !acc
+                          | i >= len = pure acc
+                          | otherwise =
+                              let a = V.unsafeIndex vec i
+                                  (acc', b) = f acc a
+                              in b `seq` acc' `seq` MV.unsafeWrite mv i b >> go (i + 1) acc'
+                    accFinal <- go 0 acc0
+                    v' <- V.unsafeFreeze mv
+                    pure (v', accFinal)
+            in if req == 0 && forb == 0
+                then run stepRowAll
+                else
+                  case V.findIndex (\(E.EntityRow _ sig _) -> matches sig) rows of
+                    Nothing -> (rows, st0)
+                    Just _ -> run stepRowMatch
+
+
     finalizePendingState (PendingState statics states0) groups =
       let len = V.length statics
           emptyAcc = Acc mempty mempty 0
@@ -1422,7 +1407,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
               else
                 let stc = V.unsafeIndex statics i
                     st = V.unsafeIndex states0 i
-                    StepStatic pid _ done _ _ = stc
+                    StepStatic pid _ _ _ done _ _ = stc
                     (aAny, bout) = done st
                     delta = Acc (buildOne aAny) bout 1
                     !accOut' = accOut <> boOut bout
@@ -1444,18 +1429,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                       aAny = bgK grp results
                       progAny = bgCont grp aAny
                       locals0 = bgLocals grp
-                      locals1 =
-                        case bgCacheUpdate grp of
-                          Nothing -> locals0
-                          Just cache ->
-                            locals0
-                              { localsCache =
-                                  IntMap.insert
-                                    compiledStepsKey
-                                    (unsafeCoerce cache)
-                                    (localsCache locals0)
-                              }
-                      locals' = boLocals (accOut accVal) locals1
+                      locals' = boLocals (accOut accVal) locals0
                   in IntMap.insert pid (ProgramUpdate locals' progAny) acc
           updates = IntMap.foldlWithKey' applyUpdate IntMap.empty accMap
       in (updates, outList)

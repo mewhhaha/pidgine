@@ -160,14 +160,14 @@ data BagOp
 type StaticEdits = [(Int, Maybe Any)]
 
 newtype BagEdit c = BagEdit
-  { runBagEdit :: forall r. (BagOp -> r -> r) -> r -> r
+  { bagEditOps :: [BagOp]
   }
 
 instance Semigroup (BagEdit c) where
-  BagEdit f <> BagEdit g = BagEdit (\k z -> f k (g k z))
+  BagEdit xs <> BagEdit ys = BagEdit (ys <> xs)
 
 instance Monoid (BagEdit c) where
-  mempty = BagEdit (\_ z -> z)
+  mempty = BagEdit []
 
 stepsEmpty :: Steps
 stepsEmpty = Steps IntMap.empty
@@ -608,7 +608,7 @@ bagEditSet :: forall c a. (Component c a, ComponentBit c a) => a -> BagEdit c
 bagEditSet a =
   let bitIx = componentBitOf @c @a
       vAny = unsafeCoerce a
-  in BagEdit (\k z -> k (BagOpSet bitIx vAny) z)
+  in BagEdit [BagOpSet bitIx vAny]
 
 bagEditSetStep :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> BagEdit c
 bagEditSetStep s0 =
@@ -616,22 +616,22 @@ bagEditSetStep s0 =
       (vAny, s1) = F.stepS stepAny 0 ()
       bitIx = componentBitOf @c @a
       slot = StepSlot vAny (unsafeCoerce s1)
-  in BagEdit (\k z -> k (BagOpSetStep bitIx slot) z)
+  in BagEdit [BagOpSetStep bitIx slot]
 
 bagEditUpdate :: forall c a. (Component c a, ComponentBit c a) => (a -> a) -> BagEdit c
 bagEditUpdate f =
   let bitIx = componentBitOf @c @a
       fAny v = unsafeCoerce (f (unsafeCoerce v))
-  in BagEdit (\k z -> k (BagOpUpdate bitIx fAny) z)
+  in BagEdit [BagOpUpdate bitIx fAny]
 
 bagEditDel :: forall c a. (Component c a, ComponentBit c a) => BagEdit c
 bagEditDel =
   let bitIx = componentBitOf @c @a
-  in BagEdit (\k z -> k (BagOpDel bitIx) z)
+  in BagEdit [BagOpDel bitIx]
 
 bagApplyEdit :: BagEdit c -> Bag c -> Bag c
 bagApplyEdit edit (Bag static steps) =
-  let step op (stepsAcc, edits) =
+  let step (stepsAcc, edits) op =
         case op of
           BagOpSet bitIx vAny ->
             case stepsLookup bitIx stepsAcc of
@@ -668,7 +668,7 @@ bagApplyEdit edit (Bag static steps) =
             let steps' = stepsDelete bitIx stepsAcc
                 edits' = setStaticIfChanged static bitIx Nothing edits
             in (steps', edits')
-      (steps', staticEdits) = runBagEdit edit step (steps, [])
+      (steps', staticEdits) = foldl' step (steps, []) (bagEditOps edit)
       static' =
         if null staticEdits
           then static

@@ -6,6 +6,7 @@ module Main where
 
 import Criterion.Main
 import Data.List (foldl')
+import qualified Data.Vector as V
 import GHC.Generics (Generic)
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
@@ -39,6 +40,23 @@ type Graph msg = S.Graph C msg
 
 computeS :: S.Batch C String a -> S.Batch C String a
 computeS = S.compute
+
+forceEachm :: World -> Double
+forceEachm w =
+  V.foldl'
+    (\acc (E.EntityRow _ _ bag) ->
+      let sumPos =
+            case E.bagGet @C @Pos bag of
+              Just (Pos x y) -> x + y
+              Nothing -> 0
+          sumVel =
+            case E.bagGet @C @Vel bag of
+              Just (Vel vx vy) -> vx + vy
+              Nothing -> 0
+      in acc + sumPos + sumVel
+    )
+    0
+    (E.entityRowsV w)
 
 data MoveLoop
 data MoveLoop1
@@ -373,7 +391,7 @@ main = defaultMain
           , let w = buildWorld 10000
             in bench "eachm" $ nf (\w0 ->
                 let (w1, _, _) = S.run 0.016 w0 [] graphEachM
-                in length (E.entities w1)
+                in forceEachm w1
               ) w
           , let w = buildWorld 10000
             in bench "eachm-pure" $ nf (\w0 ->
@@ -450,7 +468,7 @@ main = defaultMain
           , let w = buildWorld 10000
             in bench "eachm" $ nf (\w0 ->
                 let w1 = runWarmTick 0.016 w0 graphEachM
-                in length (E.entities w1)
+                in forceEachm w1
               ) w
           , let w = buildWorld 10000
             in bench "eachm-pure" $ nf (\w0 ->
