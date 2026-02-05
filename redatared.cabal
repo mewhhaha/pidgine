@@ -31,6 +31,7 @@ library
                       , containers
                       , parallel
                       , vector ^>=0.13
+                      , rrb-vector
     hs-source-dirs:   lib
     default-language: GHC2024
 
@@ -46,6 +47,7 @@ test-suite redatared-tests
                       , containers
                       , parallel
                       , vector ^>=0.13
+                      , rrb-vector
                       , QuickCheck
                       , redatared
     default-language: GHC2024
@@ -60,6 +62,8 @@ benchmark redatared-bench
                       , containers
                       , parallel
                       , vector ^>=0.13
+                      , rrb-vector
                       , criterion
+                      , aztecs
                       , redatared
     default-language: GHC2024

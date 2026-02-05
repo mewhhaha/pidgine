@@ -26,6 +26,11 @@ module Engine.Data.ECS
   , entities
   , entityRows
   , entityRowsV
+  , matchingArchetypes
+  , matchingIndices
+  , matchingCandidates
+  , applyEntityRowUpdates
+  , applyArchetypeRunUpdates
   , stepWorld
   , foldEntities
   , foldEntitiesFrom
@@ -95,16 +100,18 @@ module Engine.Data.ECS
   ) where
 
 import Control.Applicative (Alternative(..))
-import Data.Bits (bit, complement, finiteBitSize, (.&.), (.|.), xor)
+import Data.Bits (bit, complement, countTrailingZeros, finiteBitSize, popCount, (.&.), (.|.), xor)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.Kind (Constraint, Type)
+import qualified Data.Foldable as Foldable
 import Data.Maybe (isJust)
 import Data.Proxy (Proxy(..))
 import Data.Typeable (Typeable, cast, typeRep, typeRepFingerprint)
 import qualified Data.Vector as V
+import qualified Data.RRBVector as RV
 import Data.Word (Word64)
 import GHC.TypeLits (TypeError, ErrorMessage(..))
 import GHC.Exts (Any, isTrue#, reallyUnsafePtrEquality#)
@@ -140,11 +147,20 @@ newtype Steps = Steps
   }
 
 data Bag c = Bag
-  { bagStatic :: !(V.Vector (Maybe Any))
+  { bagStaticMask :: !Sig
+  , bagStaticVals :: !(V.Vector Any)
   , bagSteps :: !Steps
   }
 
 type Sig = Word64
+
+type ArchKey = Int
+
+archKey :: Sig -> ArchKey
+archKey = fromIntegral
+
+sigFromKey :: ArchKey -> Sig
+sigFromKey = fromIntegral
 
 data EntityRow c = EntityRow
   {-# UNPACK #-} !Int
@@ -156,8 +172,6 @@ data BagOp
   | BagOpSetStep !Int !StepSlot
   | BagOpUpdate !Int (Any -> Any)
   | BagOpDel !Int
-
-type StaticEdits = [(Int, Maybe Any)]
 
 newtype BagEdit c = BagEdit
   { bagEditOps :: [BagOp]
@@ -196,40 +210,101 @@ emptyBag :: forall c. ComponentId c => Bag c
 emptyBag =
   let size = componentCount @c
       limit = finiteBitSize (0 :: Word64)
-      _ =
-        if size > limit
-          then error ("ComponentId: componentCount exceeds Sig bit width (" <> show limit <> ")")
-          else ()
-      vec =
-        if size <= 0
-          then V.empty
-          else V.replicate size Nothing
-  in Bag vec stepsEmpty
+  in if size > limit
+      then error ("ComponentId: componentCount exceeds Sig bit width (" <> show limit <> ")")
+      else Bag 0 V.empty stepsEmpty
 
 stepsMerge :: Steps -> Steps -> Steps
 stepsMerge (Steps base) (Steps extra) =
   Steps (IntMap.union extra base)
 
-mergeStatic :: V.Vector (Maybe Any) -> V.Vector (Maybe Any) -> V.Vector (Maybe Any)
-mergeStatic s1 s2 =
-  let len = V.length s1
-  in if len == 0
-      then s1
-      else V.generate len $ \i ->
-            case V.unsafeIndex s2 i of
-              Just v -> Just v
-              Nothing -> V.unsafeIndex s1 i
+maskHas :: Sig -> Int -> Bool
+{-# INLINE maskHas #-}
+maskHas mask bitIx = (mask .&. bit bitIx) /= 0
+
+lowerBitsMask :: Int -> Sig
+{-# INLINE lowerBitsMask #-}
+lowerBitsMask bitIx
+  | bitIx <= 0 = 0
+  | otherwise = bit bitIx - 1
+
+staticIndex :: Sig -> Int -> Int
+{-# INLINE staticIndex #-}
+staticIndex mask bitIx = popCount (mask .&. lowerBitsMask bitIx)
+
+vectorInsertAt :: Int -> Any -> V.Vector Any -> V.Vector Any
+{-# INLINE vectorInsertAt #-}
+vectorInsertAt i x vec =
+  let (l, r) = V.splitAt i vec
+  in l V.++ V.singleton x V.++ r
+
+vectorDeleteAt :: Int -> V.Vector Any -> V.Vector Any
+{-# INLINE vectorDeleteAt #-}
+vectorDeleteAt i vec =
+  let (l, r0) = V.splitAt i vec
+      r = V.drop 1 r0
+  in l V.++ r
+
+staticLookup :: Sig -> V.Vector Any -> Int -> Maybe Any
+{-# INLINE staticLookup #-}
+staticLookup mask vals bitIx =
+  if maskHas mask bitIx
+    then Just (V.unsafeIndex vals (staticIndex mask bitIx))
+    else Nothing
+
+staticSetAny :: Sig -> V.Vector Any -> Int -> Any -> (Sig, V.Vector Any)
+{-# INLINE staticSetAny #-}
+staticSetAny mask vals bitIx vAny =
+  if maskHas mask bitIx
+    then
+      let i = staticIndex mask bitIx
+          old = V.unsafeIndex vals i
+      in if ptrEq old vAny
+          then (mask, vals)
+          else (mask, vals V.// [(i, vAny)])
+    else
+      let i = staticIndex mask bitIx
+          mask' = mask .|. bit bitIx
+      in (mask', vectorInsertAt i vAny vals)
+
+staticDelAny :: Sig -> V.Vector Any -> Int -> (Sig, V.Vector Any)
+{-# INLINE staticDelAny #-}
+staticDelAny mask vals bitIx =
+  if maskHas mask bitIx
+    then
+      let i = staticIndex mask bitIx
+          mask' = mask .&. complement (bit bitIx)
+      in (mask', vectorDeleteAt i vals)
+    else (mask, vals)
+
+mergeStatic :: Sig -> V.Vector Any -> Sig -> V.Vector Any -> (Sig, V.Vector Any)
+mergeStatic mask0 vals0 maskExtra valsExtra =
+  let go !mask !vals !i !sigBits =
+        if sigBits == 0
+          then (mask, vals)
+          else
+            let bitIx = countTrailingZeros sigBits
+                sigBits' = sigBits .&. (sigBits - 1)
+                vAny = V.unsafeIndex valsExtra i
+                (mask', vals') = staticSetAny mask vals bitIx vAny
+            in go mask' vals' (i + 1) sigBits'
+  in go mask0 vals0 0 maskExtra
 
 instance ComponentId c => Semigroup (Bag c) where
-  Bag s1 st1 <> Bag s2 st2 =
-    Bag (mergeStatic s1 s2) (stepsMerge st1 st2)
+  Bag mask1 vals1 st1 <> Bag mask2 vals2 st2 =
+    let (mask', vals') = mergeStatic mask1 vals1 mask2 vals2
+    in Bag mask' vals' (stepsMerge st1 st2)
 
 instance ComponentId c => Monoid (Bag c) where
   mempty = emptyBag
 
+data Loc = Loc !Sig !Int
+
 data World c = World
   { nextIdW :: !Int
-  , entitiesW :: !(V.Vector (EntityRow c))
+  , entityCountW :: !Int
+  , archW :: !(IntMap (RV.Vector (EntityRow c)))
+  , entityLocW :: !(IntMap Loc)
   , resourcesW :: !(IntMap Any)
   , relOutW :: !(IntMap (IntMap IntSet))
   , relInW :: !(IntMap (IntMap IntSet))
@@ -239,20 +314,36 @@ emptyWorld :: World c
 emptyWorld =
   World
     { nextIdW = 0
-    , entitiesW = V.empty
+    , entityCountW = 0
+    , archW = IntMap.empty
+    , entityLocW = IntMap.empty
     , resourcesW = IntMap.empty
     , relOutW = IntMap.empty
     , relInW = IntMap.empty
     }
 
+locInsert :: Int -> Loc -> IntMap Loc -> IntMap Loc
+locInsert = IntMap.insert
+
+locDelete :: Int -> IntMap Loc -> IntMap Loc
+locDelete = IntMap.delete
+
 entities :: World c -> [Entity]
-entities = V.toList . V.map (\(EntityRow eid' _ _) -> Entity eid') . entitiesW
+entities w =
+  foldr
+    (\(EntityRow eid' _ _) acc -> Entity eid' : acc)
+    []
+    (entityRows w)
 
 entityRows :: World c -> [EntityRow c]
-entityRows = V.toList . entitiesW
+entityRows w =
+  IntMap.foldr
+    (\rows acc -> Foldable.toList rows <> acc)
+    []
+    (archW w)
 
-entityRowsV :: World c -> V.Vector (EntityRow c)
-entityRowsV = entitiesW
+entityRowsV :: World c -> RV.Vector (EntityRow c)
+entityRowsV w = RV.fromList (entityRows w)
 
 nextId :: World c -> Int
 nextId = nextIdW
@@ -266,28 +357,215 @@ foldEntitiesFrom rows f s0 _ =
 
 foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
 foldEntities f s0 w =
-  V.foldl'
-    (\acc (EntityRow eid' sig bag) -> f (Entity eid') sig bag acc)
+  IntMap.foldl'
+    (Foldable.foldl'
+      (\acc' (EntityRow eid' sig bag) -> f (Entity eid') sig bag acc')
+    )
     s0
-    (entitiesW w)
+    (archW w)
 
 mapEntities :: (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
 mapEntities f w =
-  let ents' =
-        V.map
-          (\(EntityRow eid' sig bag) ->
-            let bag' = f (Entity eid') sig bag
-                sig' = sigFromBag bag'
-            in EntityRow eid' sig' bag'
-          )
-          (entitiesW w)
-  in w { entitiesW = ents' }
+  let stepRow (archAcc, locAcc, n) (EntityRow eid' sig bag) =
+        let e = Entity eid'
+            bag' = f e sig bag
+            sig' = sigFromBag bag'
+            row' = EntityRow eid' sig' bag'
+            (archAcc', locAcc') = insertRowArchLoc row' archAcc locAcc
+        in (archAcc', locAcc', n + 1)
+      stepRun = Foldable.foldl' stepRow
+      (archTmp, locs', nRows) =
+        IntMap.foldl'
+          stepRun
+          (IntMap.empty, IntMap.empty, 0)
+          (archW w)
+      arch' = finalizeArchRuns archTmp
+  in w
+      { archW = arch'
+      , entityLocW = locs'
+      , entityCountW = nRows
+      }
 
 setEntityRows :: [EntityRow c] -> World c -> World c
-setEntityRows rows w = w { entitiesW = V.fromList rows }
+setEntityRows rows = setEntityRowsV (RV.fromList rows)
 
-setEntityRowsV :: V.Vector (EntityRow c) -> World c -> World c
-setEntityRowsV rows w = w { entitiesW = rows }
+setEntityRowsV :: RV.Vector (EntityRow c) -> World c -> World c
+setEntityRowsV rows w =
+  let (arch', locs') = buildArchAndLocsV rows
+  in w
+      { archW = arch'
+      , entityLocW = locs'
+      , entityCountW = Foldable.length rows
+      }
+
+buildArchAndLocsV :: RV.Vector (EntityRow c) -> (IntMap (RV.Vector (EntityRow c)), IntMap Loc)
+buildArchAndLocsV rows =
+  let step _ (archAcc, locAcc) row =
+        insertRowArchLoc row archAcc locAcc
+      (archTmp, locs) = RV.ifoldl' step (IntMap.empty, IntMap.empty) rows
+      arch = finalizeArchRuns archTmp
+  in (arch, locs)
+
+insertRowArchLoc
+  :: EntityRow c
+  -> IntMap (Int, [EntityRow c])
+  -> IntMap Loc
+  -> (IntMap (Int, [EntityRow c]), IntMap Loc)
+insertRowArchLoc row@(EntityRow eid' sig _) archAcc locAcc =
+  let key = archKey sig
+  in case IntMap.lookup key archAcc of
+      Nothing ->
+        let archAcc' = IntMap.insert key (1 :: Int, [row]) archAcc
+            locAcc' = locInsert eid' (Loc sig 0) locAcc
+        in (archAcc', locAcc')
+      Just (n, rs) ->
+        let archAcc' = IntMap.insert key (n + 1, row : rs) archAcc
+            locAcc' = locInsert eid' (Loc sig n) locAcc
+        in (archAcc', locAcc')
+
+finalizeArchRuns :: IntMap (Int, [EntityRow c]) -> IntMap (RV.Vector (EntityRow c))
+finalizeArchRuns =
+  IntMap.foldlWithKey'
+    (\archAcc key (_, rs) ->
+      IntMap.insert key (RV.fromList (reverse rs)) archAcc
+    )
+    IntMap.empty
+
+applyEntityRowUpdates :: [(Sig, Int, EntityRow c)] -> World c -> World c
+applyEntityRowUpdates updates w =
+  case updates of
+    [] -> w
+    _ ->
+      let updatesBySig =
+            foldl'
+              (\acc (sig, idx, row) ->
+                IntMap.insertWith IntMap.union (archKey sig) (IntMap.singleton idx row) acc
+              )
+              IntMap.empty
+              updates
+          arch0 = archW w
+          locs0 = entityLocW w
+          (arch1, locs1, moved) =
+            IntMap.foldlWithKey'
+              (\(archAcc, locAcc, movedAcc) key updMap ->
+                let sig = sigFromKey key
+                in case IntMap.lookup key archAcc of
+                  Nothing -> (archAcc, locAcc, movedAcc)
+                  Just rows0 ->
+                    let anyMoved =
+                          IntMap.foldr
+                            (\(EntityRow _ newSig _) acc -> newSig /= sig || acc)
+                            False
+                            updMap
+                    in
+                      if not anyMoved
+                        then
+                          let rows' = RV.imap (\i row -> IntMap.findWithDefault row i updMap) rows0
+                              archAcc' = IntMap.insert key rows' archAcc
+                          in (archAcc', locAcc, movedAcc)
+                        else
+                          let step i (rowsAcc, movedRowsAcc) row =
+                                case IntMap.lookup i updMap of
+                                  Nothing -> (row : rowsAcc, movedRowsAcc)
+                                  Just row' ->
+                                    let EntityRow _ newSig _ = row'
+                                    in
+                                      if newSig == sig
+                                        then (row' : rowsAcc, movedRowsAcc)
+                                        else (rowsAcc, IntMap.insertWith (++) (archKey newSig) [row'] movedRowsAcc)
+                              (rowsRev, movedAcc') = RV.ifoldl' step ([], movedAcc) rows0
+                              rows' = RV.fromList (reverse rowsRev)
+                              archAcc' =
+                                if Foldable.null rows'
+                                  then IntMap.delete key archAcc
+                                  else IntMap.insert key rows' archAcc
+                              locAcc' = setLocsForRun locAcc sig rows'
+                          in (archAcc', locAcc', movedAcc')
+              )
+              (arch0, locs0, IntMap.empty)
+              updatesBySig
+          (arch2, locs2) =
+            IntMap.foldlWithKey'
+              (\(archAcc, locAcc) key rowsToAdd ->
+                let sig = sigFromKey key
+                    rows0 = IntMap.findWithDefault RV.empty key archAcc
+                    start = Foldable.length rows0
+                    rows1 = rows0 RV.>< RV.fromList rowsToAdd
+                    locAcc' =
+                      foldl'
+                        (\acc (i, EntityRow eid' _ _) ->
+                          locInsert eid' (Loc sig (start + i)) acc
+                        )
+                        locAcc
+                        (zip [0 ..] rowsToAdd)
+                in
+                  (IntMap.insert key rows1 archAcc, locAcc')
+              )
+              (arch1, locs1)
+              moved
+      in w
+          { archW = arch2
+          , entityLocW = locs2
+          }
+
+-- | Replace whole archetype runs without touching the entity->loc table.
+--
+-- This is safe / only valid when:
+-- - Every row in the run keeps the same archetype signature.
+-- - Entity ordering and run lengths are unchanged (so indices remain valid).
+--
+-- It exists to support fast "update all rows in-place" style operations (e.g. program stepping)
+-- without constructing per-row update lists.
+applyArchetypeRunUpdates :: [(Sig, RV.Vector (EntityRow c))] -> World c -> World c
+applyArchetypeRunUpdates runs w =
+  case runs of
+    [] -> w
+    _ ->
+      let arch1 =
+            foldl'
+              (\archAcc (sig, rows) ->
+                IntMap.insert (archKey sig) rows archAcc
+              )
+              (archW w)
+              runs
+      in w
+          { archW = arch1 }
+
+setLocsForRun :: IntMap Loc -> Sig -> RV.Vector (EntityRow c) -> IntMap Loc
+setLocsForRun locs sig =
+  RV.ifoldl'
+    (\i acc (EntityRow eid' _ _) -> locInsert eid' (Loc sig i) acc)
+    locs
+
+matchingArchetypes :: Sig -> Sig -> World c -> [(Sig, RV.Vector (EntityRow c))]
+matchingArchetypes req forb w =
+  IntMap.foldrWithKey'
+    (\key rows acc ->
+      let sig = sigFromKey key
+      in if (sig .&. req) == req && (sig .&. forb) == 0
+          then (sig, rows) : acc
+          else acc
+    )
+    []
+    (archW w)
+
+matchingIndices :: Sig -> Sig -> World c -> [Int]
+matchingIndices req forb w =
+  foldr
+    (\(_, rows) acc ->
+      Foldable.foldr
+        (\(EntityRow eid' _ _) acc' -> eid' : acc')
+        acc
+        rows
+    )
+    []
+    (matchingArchetypes req forb w)
+
+matchingCandidates :: Sig -> Sig -> World c -> Maybe [Int]
+matchingCandidates req forb w =
+  if req == 0
+    then Nothing
+    else Just (matchingIndices req forb w)
 
 class Typeable a => Component c a where
   inj :: a -> c
@@ -434,7 +712,7 @@ instance (GComponentBit l a, GComponentBit r a, GCount l) => GComponentBit (l :+
       Nothing -> gComponentBit @r @a (n + gCount @l)
 
 instance GComponentBit f a => GComponentBit (M1 i c f) a where
-  gComponentBit n = gComponentBit @f @a n
+  gComponentBit = gComponentBit @f @a
 
 instance (Typeable a, Typeable b) => GComponentBit (K1 i b) a where
   gComponentBit n =
@@ -487,25 +765,60 @@ spawn a w =
       bag = bundle a
       sig = sigFromBag bag
       eid' = eid e
-      ents' = V.cons (EntityRow eid' sig bag) (entitiesW w)
+      key = archKey sig
+      rows0 = IntMap.findWithDefault RV.empty (archKey sig) (archW w)
+      idx = Foldable.length rows0
+      rows' = rows0 RV.|> EntityRow eid' sig bag
+      arch' = IntMap.insert key rows' (archW w)
+      locs' = locInsert eid' (Loc sig idx) (entityLocW w)
       w' =
         w
           { nextIdW = nextIdW w + 1
-          , entitiesW = ents'
+          , entityCountW = entityCountW w + 1
+          , archW = arch'
+          , entityLocW = locs'
           }
   in (e, w')
 
 kill :: Entity -> World c -> World c
 kill e w =
   let eid' = eid e
-      ents' = V.filter (\(EntityRow eid0 _ _) -> eid0 /= eid') (entitiesW w)
       out' = dropRelEntity eid' (relOutW w)
       in' = dropRelEntity eid' (relInW w)
-  in w
-      { entitiesW = ents'
-      , relOutW = out'
-      , relInW = in'
-      }
+  in case IntMap.lookup eid' (entityLocW w) of
+      Nothing ->
+        w { relOutW = out', relInW = in' }
+      Just (Loc sig idx) ->
+        let arch0 = archW w
+            key = archKey sig
+            rows0 = IntMap.findWithDefault RV.empty key arch0
+            len = Foldable.length rows0
+            lastIdx = len - 1
+            rows1 =
+              if idx == lastIdx
+                then RV.take lastIdx rows0
+                else
+                  let rowLast = rows0 RV.! lastIdx
+                      rows' = RV.update idx rowLast rows0
+                  in RV.take lastIdx rows'
+            arch1 =
+              if Foldable.null rows1
+                then IntMap.delete key arch0
+                else IntMap.insert key rows1 arch0
+            locs1 =
+              if idx == lastIdx
+                then locDelete eid' (entityLocW w)
+                else
+                  let EntityRow eidLast _ _ = rows0 RV.! lastIdx
+                      acc1 = locDelete eid' (entityLocW w)
+                  in locInsert eidLast (Loc sig idx) acc1
+        in w
+            { archW = arch1
+            , entityLocW = locs1
+            , entityCountW = entityCountW w - 1
+            , relOutW = out'
+            , relInW = in'
+            }
 
 dropRelEntity :: Int -> IntMap (IntMap IntSet) -> IntMap (IntMap IntSet)
 dropRelEntity eid' =
@@ -516,13 +829,8 @@ dropRelEntity eid' =
 
 sigFromBag :: Bag c -> Sig
 sigFromBag bag =
-  let static = bagStatic bag
+  let sigStatic = bagStaticMask bag
       steps = bagSteps bag
-      sigStatic =
-        V.ifoldl' (\acc i v -> case v of
-                                Just _ -> acc .|. bit i
-                                Nothing -> acc
-                  ) 0 static
       sigSteps = IntMap.foldlWithKey' (\acc bitIx _ -> acc .|. bit bitIx) 0 (stepsMap steps)
   in sigStatic .|. sigSteps
 
@@ -541,13 +849,13 @@ keyOfType :: forall c a. (Component c a, ComponentBit c a) => Key c
 keyOfType = Key (componentBitOf @c @a)
 
 bagGetBy :: Int -> Bag c -> Maybe Any
-bagGetBy bitIx (Bag static steps) =
+bagGetBy bitIx (Bag mask vals steps) =
   if stepsNull steps
-    then V.unsafeIndex static bitIx
+    then staticLookup mask vals bitIx
     else
       case stepsLookup bitIx steps of
         Just slot -> Just (stepVal slot)
-        Nothing -> V.unsafeIndex static bitIx
+        Nothing -> staticLookup mask vals bitIx
 
 bagGetByTyped :: forall a c. Int -> Bag c -> Maybe a
 bagGetByTyped bitIx bag = unsafeCoerce <$> bagGetBy bitIx bag
@@ -558,51 +866,149 @@ bagGetByUnsafe bitIx bag =
     Just v -> unsafeCoerce v
     Nothing -> error "bagGetByUnsafe: missing component (signature mismatch?)"
 
+bagGetByUnsafe2 :: forall a b c. Int -> Int -> Bag c -> (a, b)
+{-# INLINE bagGetByUnsafe2 #-}
+bagGetByUnsafe2 bitA bitB (Bag mask vals steps) =
+  let unsafeStatic bitIx =
+        case staticLookup mask vals bitIx of
+          Just v -> v
+          Nothing -> error "bagGetByUnsafe2: missing component (signature mismatch?)"
+  in if stepsNull steps
+      then
+        ( unsafeCoerce (unsafeStatic bitA)
+        , unsafeCoerce (unsafeStatic bitB)
+        )
+      else
+        let getAny bitIx =
+              case stepsLookup bitIx steps of
+                Just slot -> stepVal slot
+                Nothing -> unsafeStatic bitIx
+        in (unsafeCoerce (getAny bitA), unsafeCoerce (getAny bitB))
+
+bagGetByUnsafe3 :: forall a b d c. Int -> Int -> Int -> Bag c -> (a, b, d)
+{-# INLINE bagGetByUnsafe3 #-}
+bagGetByUnsafe3 bitA bitB bitD (Bag mask vals steps) =
+  let unsafeStatic bitIx =
+        case staticLookup mask vals bitIx of
+          Just v -> v
+          Nothing -> error "bagGetByUnsafe3: missing component (signature mismatch?)"
+  in if stepsNull steps
+      then
+        ( unsafeCoerce (unsafeStatic bitA)
+        , unsafeCoerce (unsafeStatic bitB)
+        , unsafeCoerce (unsafeStatic bitD)
+        )
+      else
+        let getAny bitIx =
+              case stepsLookup bitIx steps of
+                Just slot -> stepVal slot
+                Nothing -> unsafeStatic bitIx
+        in
+          ( unsafeCoerce (getAny bitA)
+          , unsafeCoerce (getAny bitB)
+          , unsafeCoerce (getAny bitD)
+          )
+
+planRunForSig1 :: forall a c. Int -> Sig -> Bag c -> a
+{-# INLINE planRunForSig1 #-}
+planRunForSig1 bitA sig =
+  if maskHas sig bitA
+    then
+      let idxA = staticIndex sig bitA
+      in \bag@(Bag staticMask vals steps) ->
+          if stepsNull steps && staticMask == sig
+            then unsafeCoerce (V.unsafeIndex vals idxA)
+            else bagGetByUnsafe bitA bag
+    else bagGetByUnsafe bitA
+
+planRunForSig2 :: forall a b c. Int -> Int -> Sig -> Bag c -> (a, b)
+{-# INLINE planRunForSig2 #-}
+planRunForSig2 bitA bitB sig =
+  if maskHas sig bitA && maskHas sig bitB
+    then
+      let idxA = staticIndex sig bitA
+          idxB = staticIndex sig bitB
+      in \bag@(Bag staticMask vals steps) ->
+          if stepsNull steps && staticMask == sig
+            then
+              ( unsafeCoerce (V.unsafeIndex vals idxA)
+              , unsafeCoerce (V.unsafeIndex vals idxB)
+              )
+            else bagGetByUnsafe2 bitA bitB bag
+    else bagGetByUnsafe2 bitA bitB
+
+planRunForSig3 :: forall a b d c. Int -> Int -> Int -> Sig -> Bag c -> (a, b, d)
+{-# INLINE planRunForSig3 #-}
+planRunForSig3 bitA bitB bitD sig =
+  if maskHas sig bitA && maskHas sig bitB && maskHas sig bitD
+    then
+      let idxA = staticIndex sig bitA
+          idxB = staticIndex sig bitB
+          idxD = staticIndex sig bitD
+      in \bag@(Bag staticMask vals steps) ->
+          if stepsNull steps && staticMask == sig
+            then
+              ( unsafeCoerce (V.unsafeIndex vals idxA)
+              , unsafeCoerce (V.unsafeIndex vals idxB)
+              , unsafeCoerce (V.unsafeIndex vals idxD)
+              )
+            else bagGetByUnsafe3 bitA bitB bitD bag
+    else bagGetByUnsafe3 bitA bitB bitD
+
 bagGet :: forall c a. (Component c a, ComponentBit c a) => Bag c -> Maybe a
-bagGet bag = bagGetByTyped (componentBitOf @c @a) bag
+bagGet = bagGetByTyped (componentBitOf @c @a)
 
 ptrEq :: Any -> Any -> Bool
 ptrEq a b = isTrue# (reallyUnsafePtrEquality# a b)
 
-eqMaybe :: Maybe Any -> Maybe Any -> Bool
-eqMaybe (Just a) (Just b) = ptrEq a b
-eqMaybe Nothing Nothing = True
-eqMaybe _ _ = False
+bagSetByAny :: Int -> Any -> Bag c -> Bag c
+{-# INLINE bagSetByAny #-}
+bagSetByAny bitIx vAny (Bag mask vals steps) =
+  case stepsLookup bitIx steps of
+    Just (StepSlot vOld sAny) ->
+      let steps' =
+            if ptrEq vOld vAny
+              then steps
+              else stepsInsert bitIx (StepSlot vAny sAny) steps
+          (mask', vals') = staticDelAny mask vals bitIx
+      in Bag mask' vals' steps'
+    Nothing ->
+      let (mask', vals') = staticSetAny mask vals bitIx vAny
+      in Bag mask' vals' steps
 
-updateStatic :: V.Vector (Maybe Any) -> Int -> Maybe Any -> V.Vector (Maybe Any)
-updateStatic static bitIx newVal =
-  let cur = V.unsafeIndex static bitIx
-  in if eqMaybe cur newVal
-      then static
-      else static V.// [(bitIx, newVal)]
+bagSetStepSlotBy :: Int -> StepSlot -> Bag c -> Bag c
+{-# INLINE bagSetStepSlotBy #-}
+bagSetStepSlotBy bitIx slot (Bag mask vals steps) =
+  let steps' = stepsInsert bitIx slot steps
+      (mask', vals') = staticDelAny mask vals bitIx
+  in Bag mask' vals' steps'
 
-lookupStatic :: V.Vector (Maybe Any) -> StaticEdits -> Int -> Maybe Any
-lookupStatic static edits bitIx =
-  case lookupEdit bitIx edits of
-    Just v -> v
-    Nothing -> V.unsafeIndex static bitIx
+bagUpdateByAny :: Int -> (Any -> Any) -> Bag c -> Bag c
+{-# INLINE bagUpdateByAny #-}
+bagUpdateByAny bitIx fAny (Bag mask vals steps) =
+  case stepsLookup bitIx steps of
+    Just (StepSlot vAny sAny) ->
+      let vAny' = fAny vAny
+      in if ptrEq vAny vAny'
+          then Bag mask vals steps
+          else Bag mask vals (stepsInsert bitIx (StepSlot vAny' sAny) steps)
+    Nothing ->
+      case staticLookup mask vals bitIx of
+        Nothing -> Bag mask vals steps
+        Just vAny ->
+          let vAny' = fAny vAny
+          in if ptrEq vAny vAny'
+              then Bag mask vals steps
+              else
+                let (mask', vals') = staticSetAny mask vals bitIx vAny'
+                in Bag mask' vals' steps
 
-lookupEdit :: Int -> StaticEdits -> Maybe (Maybe Any)
-lookupEdit _ [] = Nothing
-lookupEdit bitIx ((i, v) : rest)
-  | i == bitIx = Just v
-  | otherwise = lookupEdit bitIx rest
-
-upsertEdit :: Int -> Maybe Any -> StaticEdits -> StaticEdits
-upsertEdit bitIx newVal [] = [(bitIx, newVal)]
-upsertEdit bitIx newVal ((i, v) : rest)
-  | i == bitIx = (bitIx, newVal) : rest
-  | otherwise = (i, v) : upsertEdit bitIx newVal rest
-
-setStaticIfChanged :: V.Vector (Maybe Any) -> Int -> Maybe Any -> StaticEdits -> StaticEdits
-setStaticIfChanged static bitIx newVal edits =
-  let cur =
-        case lookupEdit bitIx edits of
-          Just v -> v
-          Nothing -> V.unsafeIndex static bitIx
-  in if eqMaybe cur newVal
-      then edits
-      else upsertEdit bitIx newVal edits
+bagDelByBit :: Int -> Bag c -> Bag c
+{-# INLINE bagDelByBit #-}
+bagDelByBit bitIx (Bag mask vals steps) =
+  let steps' = stepsDelete bitIx steps
+      (mask', vals') = staticDelAny mask vals bitIx
+  in Bag mask' vals' steps'
 
 bagEditSet :: forall c a. (Component c a, ComponentBit c a) => a -> BagEdit c
 bagEditSet a =
@@ -630,149 +1036,38 @@ bagEditDel =
   in BagEdit [BagOpDel bitIx]
 
 bagApplyEdit :: BagEdit c -> Bag c -> Bag c
-bagApplyEdit edit (Bag static steps) =
-  let step (stepsAcc, edits) op =
-        case op of
-          BagOpSet bitIx vAny ->
-            case stepsLookup bitIx stepsAcc of
-              Just (StepSlot vOld sAny) ->
-                if ptrEq vOld vAny
-                  then (stepsAcc, edits)
-                  else
-                    let steps' = stepsInsert bitIx (StepSlot vAny sAny) stepsAcc
-                        edits' = setStaticIfChanged static bitIx Nothing edits
-                    in (steps', edits')
-              Nothing ->
-                let edits' = setStaticIfChanged static bitIx (Just vAny) edits
-                in (stepsAcc, edits')
-          BagOpSetStep bitIx slot ->
-            let steps' = stepsInsert bitIx slot stepsAcc
-                edits' = setStaticIfChanged static bitIx Nothing edits
-            in (steps', edits')
-          BagOpUpdate bitIx fAny ->
-            case stepsLookup bitIx stepsAcc of
-              Just (StepSlot vAny sAny) ->
-                let vAny' = fAny vAny
-                in if ptrEq vAny vAny'
-                    then (stepsAcc, edits)
-                    else (stepsInsert bitIx (StepSlot vAny' sAny) stepsAcc, edits)
-              Nothing ->
-                case lookupStatic static edits bitIx of
-                  Nothing -> (stepsAcc, edits)
-                  Just vAny ->
-                    let vAny' = fAny vAny
-                    in if ptrEq vAny vAny'
-                        then (stepsAcc, edits)
-                        else (stepsAcc, setStaticIfChanged static bitIx (Just vAny') edits)
-          BagOpDel bitIx ->
-            let steps' = stepsDelete bitIx stepsAcc
-                edits' = setStaticIfChanged static bitIx Nothing edits
-            in (steps', edits')
-      (steps', staticEdits) = foldl' step (steps, []) (bagEditOps edit)
-      static' =
-        if null staticEdits
-          then static
-          else static V.// staticEdits
-  in Bag static' steps'
+bagApplyEdit edit bag0 =
+  foldl'
+    (\bag op ->
+      case op of
+        BagOpSet bitIx vAny -> bagSetByAny bitIx vAny bag
+        BagOpSetStep bitIx slot -> bagSetStepSlotBy bitIx slot bag
+        BagOpUpdate bitIx fAny -> bagUpdateByAny bitIx fAny bag
+        BagOpDel bitIx -> bagDelByBit bitIx bag
+    )
+    bag0
+    (bagEditOps edit)
 
 bagApplyEditUnsafe :: BagEdit c -> Bag c -> Bag c
 bagApplyEditUnsafe = bagApplyEdit
 
 bagSetDirect :: forall c a. (Component c a, ComponentBit c a) => a -> Bag c -> Bag c
 {-# INLINE bagSetDirect #-}
-bagSetDirect a (Bag static steps) =
+bagSetDirect a bag =
   let bitIx = componentBitOf @c @a
       vAny = unsafeCoerce a
-  in case stepsLookup bitIx steps of
-      Just (StepSlot vOld sAny) ->
-        let steps' =
-              if ptrEq vOld vAny
-                then steps
-                else stepsInsert bitIx (StepSlot vAny sAny) steps
-            static' = updateStatic static bitIx Nothing
-        in Bag static' steps'
-      Nothing ->
-        let static' = updateStatic static bitIx (Just vAny)
-        in Bag static' steps
-
-applySetStep :: Steps -> Int -> Any -> (Steps, Maybe Any)
-{-# INLINE applySetStep #-}
-applySetStep steps bitIx vAny =
-  case stepsLookup bitIx steps of
-    Just (StepSlot vOld sAny) ->
-      let steps' =
-            if ptrEq vOld vAny
-              then steps
-              else stepsInsert bitIx (StepSlot vAny sAny) steps
-      in (steps', Nothing)
-    Nothing ->
-      (steps, Just vAny)
-
-updateStatic2 :: V.Vector (Maybe Any) -> Int -> Maybe Any -> Int -> Maybe Any -> V.Vector (Maybe Any)
-{-# INLINE updateStatic2 #-}
-updateStatic2 static i vI j vJ =
-  let curI = V.unsafeIndex static i
-      curJ = V.unsafeIndex static j
-      edits =
-        case eqMaybe curI vI of
-          True ->
-            if eqMaybe curJ vJ
-              then []
-              else [(j, vJ)]
-          False ->
-            if eqMaybe curJ vJ
-              then [(i, vI)]
-              else [(i, vI), (j, vJ)]
-  in if null edits
-      then static
-      else static V.// edits
-
-addEdit3 :: (Int, Maybe Any) -> [(Int, Maybe Any)] -> [(Int, Maybe Any)]
-addEdit3 edit edits =
-  case edits of
-    [] -> [edit]
-    [a] -> [a, edit]
-    [a, b] -> [a, b, edit]
-    _ -> edits ++ [edit]
-
-updateStatic3 :: V.Vector (Maybe Any) -> Int -> Maybe Any -> Int -> Maybe Any -> Int -> Maybe Any
-              -> V.Vector (Maybe Any)
-{-# INLINE updateStatic3 #-}
-updateStatic3 static i vI j vJ k vK =
-  let curI = V.unsafeIndex static i
-      curJ = V.unsafeIndex static j
-      curK = V.unsafeIndex static k
-      edits2 =
-        case eqMaybe curI vI of
-          True ->
-            if eqMaybe curJ vJ
-              then []
-              else [(j, vJ)]
-          False ->
-            if eqMaybe curJ vJ
-              then [(i, vI)]
-              else [(i, vI), (j, vJ)]
-      edits =
-        if eqMaybe curK vK
-          then edits2
-          else addEdit3 (k, vK) edits2
-  in if null edits
-      then static
-      else static V.// edits
+  in bagSetByAny bitIx vAny bag
 
 bagSet2Direct :: forall c a b.
   (Component c a, ComponentBit c a, Component c b, ComponentBit c b)
   => a -> b -> Bag c -> Bag c
 {-# INLINE bagSet2Direct #-}
-bagSet2Direct a b (Bag static steps0) =
+bagSet2Direct a b bag0 =
   let bitA = componentBitOf @c @a
       bitB = componentBitOf @c @b
       vA = unsafeCoerce a
       vB = unsafeCoerce b
-      (steps1, staticA) = applySetStep steps0 bitA vA
-      (steps2, staticB) = applySetStep steps1 bitB vB
-      static' = updateStatic2 static bitA staticA bitB staticB
-  in Bag static' steps2
+  in bagSetByAny bitB vB (bagSetByAny bitA vA bag0)
 
 bagSet3Direct :: forall c a b d.
   (Component c a, ComponentBit c a
@@ -780,56 +1075,35 @@ bagSet3Direct :: forall c a b d.
   , Component c d, ComponentBit c d
   ) => a -> b -> d -> Bag c -> Bag c
 {-# INLINE bagSet3Direct #-}
-bagSet3Direct a b d (Bag static steps0) =
+bagSet3Direct a b d bag0 =
   let bitA = componentBitOf @c @a
       bitB = componentBitOf @c @b
       bitD = componentBitOf @c @d
       vA = unsafeCoerce a
       vB = unsafeCoerce b
       vD = unsafeCoerce d
-      (steps1, staticA) = applySetStep steps0 bitA vA
-      (steps2, staticB) = applySetStep steps1 bitB vB
-      (steps3, staticD) = applySetStep steps2 bitD vD
-      static' = updateStatic3 static bitA staticA bitB staticB bitD staticD
-  in Bag static' steps3
+  in bagSetByAny bitD vD (bagSetByAny bitB vB (bagSetByAny bitA vA bag0))
 
 bagSetStepDirect :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> Bag c -> Bag c
-bagSetStepDirect s0 (Bag static steps) =
+bagSetStepDirect s0 bag =
   let stepAny = unsafeCoerce s0 :: F.Step () Any
       (vAny, s1) = F.stepS stepAny 0 ()
       bitIx = componentBitOf @c @a
       slot = StepSlot vAny (unsafeCoerce s1)
-      steps' = stepsInsert bitIx slot steps
-      static' = updateStatic static bitIx Nothing
-  in Bag static' steps'
+  in bagSetStepSlotBy bitIx slot bag
 
 bagUpdateDirect :: forall c a. (Component c a, ComponentBit c a) => (a -> a) -> Bag c -> Bag c
 {-# INLINE bagUpdateDirect #-}
-bagUpdateDirect f (Bag static steps) =
+bagUpdateDirect f bag =
   let bitIx = componentBitOf @c @a
       fAny v = unsafeCoerce (f (unsafeCoerce v))
-  in case stepsLookup bitIx steps of
-      Just (StepSlot vAny sAny) ->
-        let vAny' = fAny vAny
-        in if ptrEq vAny vAny'
-            then Bag static steps
-            else Bag static (stepsInsert bitIx (StepSlot vAny' sAny) steps)
-      Nothing ->
-        case V.unsafeIndex static bitIx of
-          Nothing -> Bag static steps
-          Just vAny ->
-            let vAny' = fAny vAny
-            in if ptrEq vAny vAny'
-                then Bag static steps
-                else Bag (updateStatic static bitIx (Just vAny')) steps
+  in bagUpdateByAny bitIx fAny bag
 
 bagDelDirect :: forall c a. (Component c a, ComponentBit c a) => Bag c -> Bag c
 {-# INLINE bagDelDirect #-}
-bagDelDirect (Bag static steps) =
+bagDelDirect bag =
   let bitIx = componentBitOf @c @a
-      steps' = stepsDelete bitIx steps
-      static' = updateStatic static bitIx Nothing
-  in Bag static' steps'
+  in bagDelByBit bitIx bag
 
 bagSet :: forall a c. (Component c a, ComponentBit c a) => a -> Bag c -> Bag c
 bagSet = bagSetDirect
@@ -838,50 +1112,97 @@ bagSetStep :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> Ba
 bagSetStep = bagSetStepDirect
 
 bagDel :: forall a c. (Component c a, ComponentBit c a) => Bag c -> Bag c
-bagDel bag = bagDelDirect @c @a bag
+bagDel = bagDelDirect @c @a
 
 get :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Maybe a
 get e w =
-  case lookupRow (eid e) (entitiesW w) of
+  case lookupRow (eid e) w of
     Nothing -> Nothing
     Just (_, bag) -> bagGet bag
 
 set :: forall a c. (Component c a, ComponentBit c a) => Entity -> a -> World c -> World c
-set e a w =
-  let eid' = eid e
-      bitC = bit (componentBitOf @c @a)
-  in case lookupRow eid' (entitiesW w) of
-      Nothing -> w
-      Just (sig, bag) ->
-        let bag' = bagSet a bag
-            sig' = sig .|. bitC
-            ents' = replaceRow eid' sig' bag' (entitiesW w)
-        in w { entitiesW = ents' }
+set e a = updateEntityBag (bagSet a) e
 
 del :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> World c
-del e w =
+del = updateEntityBag (bagDel @a)
+
+updateEntityBag :: (Bag c -> Bag c) -> Entity -> World c -> World c
+{-# INLINE updateEntityBag #-}
+updateEntityBag updateBag e w =
   let eid' = eid e
-      bitC = bit (componentBitOf @c @a)
-  in case lookupRow eid' (entitiesW w) of
+  in case IntMap.lookup eid' (entityLocW w) of
       Nothing -> w
-      Just (sig, bag) ->
-        let bag' = bagDel @a bag
-            sig' = sig .&. complement bitC
-            ents' = replaceRow eid' sig' bag' (entitiesW w)
-        in w { entitiesW = ents' }
+      Just (Loc sig idx) ->
+        case IntMap.lookup (archKey sig) (archW w) of
+          Nothing -> w
+          Just rows ->
+            let EntityRow _ oldSig bag = rows RV.! idx
+                bag' = updateBag bag
+                sig' = sigFromBag bag'
+                row' = EntityRow eid' sig' bag'
+            in if sig' == oldSig
+                then
+                  let rows' = RV.update idx row' rows
+                      arch' = IntMap.insert (archKey sig) rows' (archW w)
+                  in w { archW = arch' }
+                else
+                  let (arch1, locs1) = removeFromRun sig idx (archW w) (entityLocW w)
+                      (arch2, locs2) = appendToRun sig' row' arch1 locs1
+                  in w
+                      { archW = arch2
+                      , entityLocW = locs2
+                      }
 
 has :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Bool
 has e w = isJust (get @a e w)
 
-lookupRow :: Int -> V.Vector (EntityRow c) -> Maybe (Sig, Bag c)
-lookupRow eid' rows =
-  (\(EntityRow _ sig bag) -> (sig, bag))
-    <$> V.find (\(EntityRow eid0 _ _) -> eid0 == eid') rows
+lookupRow :: Int -> World c -> Maybe (Sig, Bag c)
+lookupRow eid' w =
+  case IntMap.lookup eid' (entityLocW w) of
+    Nothing -> Nothing
+    Just (Loc sig idx) ->
+      case IntMap.lookup (archKey sig) (archW w) of
+        Nothing -> Nothing
+        Just rows ->
+          let EntityRow _ sig' bag = rows RV.! idx
+          in Just (sig', bag)
 
-replaceRow :: Int -> Sig -> Bag c -> V.Vector (EntityRow c) -> V.Vector (EntityRow c)
-replaceRow eid' sig' bag' =
-  V.map (\row@(EntityRow eid0 _ _) ->
-    if eid0 == eid' then EntityRow eid0 sig' bag' else row)
+removeFromRun :: Sig -> Int -> IntMap (RV.Vector (EntityRow c)) -> IntMap Loc
+              -> (IntMap (RV.Vector (EntityRow c)), IntMap Loc)
+removeFromRun sig idx arch0 locs0 =
+  let key = archKey sig
+      rows0 = IntMap.findWithDefault RV.empty key arch0
+      len = Foldable.length rows0
+      lastIdx = len - 1
+      rows1 =
+        if idx == lastIdx
+          then RV.take lastIdx rows0
+          else
+            let rowLast = rows0 RV.! lastIdx
+                rows' = RV.update idx rowLast rows0
+            in RV.take lastIdx rows'
+      arch1 =
+        if Foldable.null rows1
+          then IntMap.delete key arch0
+          else IntMap.insert key rows1 arch0
+      locs1 =
+        if idx == lastIdx
+          then locs0
+          else
+            let EntityRow eidLast _ _ = rows0 RV.! lastIdx
+            in locInsert eidLast (Loc sig idx) locs0
+  in (arch1, locs1)
+
+appendToRun :: Sig -> EntityRow c -> IntMap (RV.Vector (EntityRow c)) -> IntMap Loc
+            -> (IntMap (RV.Vector (EntityRow c)), IntMap Loc)
+appendToRun sig row@(EntityRow eid' _ _) arch0 locs0 =
+  let key = archKey sig
+      rows0 = IntMap.findWithDefault RV.empty key arch0
+      idx = Foldable.length rows0
+      rows1 = rows0 RV.|> row
+      arch1 = IntMap.insert key rows1 arch0
+      locs1 = locInsert eid' (Loc sig idx) locs0
+  in (arch1, locs1)
 
 data QueryInfo = QueryInfo
   { requireQ :: Sig
@@ -903,6 +1224,7 @@ data Plan c a = Plan
   { planReq :: !Sig
   , planForbid :: !Sig
   , planRun :: !(Bag c -> a)
+  , planForSig :: !(Maybe (Sig -> Bag c -> a))
   }
 
 queryInfo :: Query c a -> QueryInfo
@@ -949,26 +1271,35 @@ notQ =
 
 runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
-  let step (EntityRow eid' sig bag) acc =
-        if matchSig (queryInfoQ q) sig
-          then case runQuery q (Entity eid') bag of
-            Nothing -> acc
-            Just a -> (Entity eid', a) : acc
-          else acc
-  in V.foldr step [] (entitiesW w)
+  let info = queryInfoQ q
+      req = requireQ info
+      forb = forbidQ info
+      stepRow (EntityRow eid' _ bag) acc =
+        case runQuery q (Entity eid') bag of
+          Nothing -> acc
+          Just a -> (Entity eid', a) : acc
+      stepRun key rows acc =
+        let sig = sigFromKey key
+        in if (sig .&. req) == req && (sig .&. forb) == 0
+            then Foldable.foldr stepRow acc rows
+            else acc
+  in IntMap.foldrWithKey' stepRun [] (archW w)
 
 foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
-  V.foldl'
-    (\acc (EntityRow eid' sig bag) ->
-      if matchSig (queryInfoQ q) sig
-        then case runQuery q (Entity eid') bag of
+  let info = queryInfoQ q
+      req = requireQ info
+      forb = forbidQ info
+      stepRow acc (EntityRow eid' _ bag) =
+        case runQuery q (Entity eid') bag of
           Nothing -> acc
           Just a -> step (Entity eid') a acc
-        else acc
-    )
-    s0
-    (entitiesW w)
+      stepRun acc key rows =
+        let sig = sigFromKey key
+        in if (sig .&. req) == req && (sig .&. forb) == 0
+            then Foldable.foldl' stepRow acc rows
+            else acc
+  in IntMap.foldlWithKey' stepRun s0 (archW w)
 
 filterQ :: (a -> Bool) -> Query c a -> Query c a
 filterQ f (Query q qi) =
@@ -1008,12 +1339,12 @@ instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => PlanField c (M
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => PlanField c (Has a) where
   fieldPlan =
     let bitIx = componentBitOf @c @a
-    in (bit bitIx, 0, \_ -> Has)
+    in (bit bitIx, 0, const Has)
 
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => PlanField c (Not a) where
   fieldPlan =
     let bitIx = componentBitOf @c @a
-    in (0, bit bitIx, \_ -> Not)
+    in (0, bit bitIx, const Not)
 
 class Queryable c a where
   queryC :: Query c a
@@ -1028,13 +1359,28 @@ class QueryableSum c a where
 class Plannable c a where
   planC :: Plan c a
 
-instance {-# OVERLAPPING #-} (PlanField c a, PlanField c b) => Plannable c (a, b) where
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a, Component c b, ComponentBit c b) => Plannable c (a, b) where
+  planC =
+    let bitA = componentBitOf @c @a
+        bitB = componentBitOf @c @b
+        req = bit bitA .|. bit bitB
+    in Plan req 0 (bagGetByUnsafe2 bitA bitB) (Just (planRunForSig2 bitA bitB))
+
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a, Component c b, ComponentBit c b, Component c d, ComponentBit c d) => Plannable c (a, b, d) where
+  planC =
+    let bitA = componentBitOf @c @a
+        bitB = componentBitOf @c @b
+        bitD = componentBitOf @c @d
+        req = bit bitA .|. bit bitB .|. bit bitD
+    in Plan req 0 (bagGetByUnsafe3 bitA bitB bitD) (Just (planRunForSig3 bitA bitB bitD))
+
+instance {-# OVERLAPPABLE #-} (PlanField c a, PlanField c b) => Plannable c (a, b) where
   planC =
     let (reqA, forbA, runA) = fieldPlan @c @a
         (reqB, forbB, runB) = fieldPlan @c @b
-    in Plan (reqA .|. reqB) (forbA .|. forbB) (\bag -> (runA bag, runB bag))
+    in Plan (reqA .|. reqB) (forbA .|. forbB) (\bag -> (runA bag, runB bag)) Nothing
 
-instance {-# OVERLAPPING #-} (PlanField c a, PlanField c b, PlanField c d) => Plannable c (a, b, d) where
+instance {-# OVERLAPPABLE #-} (PlanField c a, PlanField c b, PlanField c d) => Plannable c (a, b, d) where
   planC =
     let (reqA, forbA, runA) = fieldPlan @c @a
         (reqB, forbB, runB) = fieldPlan @c @b
@@ -1043,11 +1389,18 @@ instance {-# OVERLAPPING #-} (PlanField c a, PlanField c b, PlanField c d) => Pl
       (reqA .|. reqB .|. reqD)
       (forbA .|. forbB .|. forbD)
       (\bag -> (runA bag, runB bag, runD bag))
+      Nothing
+
+instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => Plannable c a where
+  planC =
+    let bitA = componentBitOf @c @a
+        req = bit bitA
+    in Plan req 0 (bagGetByUnsafe bitA) (Just (planRunForSig1 bitA))
 
 instance {-# OVERLAPPABLE #-} PlanField c a => Plannable c a where
   planC =
     let (req, forb, runF) = fieldPlan @c @a
-    in Plan req forb runF
+    in Plan req forb runF Nothing
 
 query :: forall a c. Queryable c a => Query c a
 query = queryC @c @a
@@ -1063,11 +1416,12 @@ planRec :: forall a c. (Generic a, GPlan c (Rep a)) => Plan c a
 {-# NOINLINE planRec #-}
 planRec =
   let (req, forb, runF) = gplan @c @(Rep a)
-  in Plan req forb (to . runF)
+  in Plan req forb (to . runF) Nothing
 
 planMap :: (a -> b) -> Plan c a -> Plan c b
 {-# INLINE planMap #-}
-planMap f (Plan req forb runP) = Plan req forb (f . runP)
+planMap f (Plan req forb runP runSigP) =
+  Plan req forb (f . runP) (fmap (\runForSig sig -> f . runForSig sig) runSigP)
 
 class GQueryable c f where
   gquery :: Query c (f p)
@@ -1103,12 +1457,12 @@ class GPlan c f where
   gplan :: (Sig, Sig, Bag c -> f p)
 
 instance GPlan c U1 where
-  gplan = (0, 0, \_ -> U1)
+  gplan = (0, 0, const U1)
 
 instance GPlan c f => GPlan c (M1 i m f) where
   gplan =
     let (req, forb, runF) = gplan @c @f
-    in (req, forb, \bag -> M1 (runF bag))
+    in (req, forb, M1 . runF)
 
 instance (GPlan c a, GPlan c b) => GPlan c (a :*: b) where
   gplan =
@@ -1188,13 +1542,9 @@ stepWorld :: F.DTime -> World c -> World c
 stepWorld d w =
   let stepRow (EntityRow eid' sig bag) =
         if stepsNull (bagSteps bag)
-          then (False, EntityRow eid' sig bag)
-          else (True, EntityRow eid' sig (stepBag d bag))
-      (flags, ents') = V.unzip (V.map stepRow (entitiesW w))
-      hasSteps = V.any id flags
-  in if not hasSteps
-      then w
-      else w { entitiesW = ents' }
+          then EntityRow eid' sig bag
+          else EntityRow eid' sig (stepBag d bag)
+  in w { archW = IntMap.map (RV.map stepRow) (archW w) }
 
 stepBag :: F.DTime -> Bag c -> Bag c
 stepBag d bag = bag { bagSteps = stepsStepAll d (bagSteps bag) }

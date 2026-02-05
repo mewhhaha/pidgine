@@ -5,9 +5,15 @@
 module Main where
 
 import Criterion.Main
+import Data.Bits (bit, (.|.))
 import Data.List (foldl')
 import qualified Data.Vector as V
+import qualified Data.Foldable as Foldable
+import Data.Functor.Identity (Identity(runIdentity))
 import GHC.Generics (Generic)
+import qualified Aztecs.ECS as AZ
+import qualified Aztecs.ECS.Query as AZQ
+import qualified Aztecs.ECS.World as AZW
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
 import qualified Engine.Data.Program as S
@@ -38,13 +44,94 @@ type World = E.World C
 type Program msg a = S.Program C msg a
 type Graph msg = S.Graph C msg
 
+data AzPos = AzPos {-# UNPACK #-} !Double {-# UNPACK #-} !Double
+  deriving (Eq, Show)
+
+data AzVel = AzVel {-# UNPACK #-} !Double {-# UNPACK #-} !Double
+  deriving (Eq, Show)
+
+data AzAcc = AzAcc {-# UNPACK #-} !Double {-# UNPACK #-} !Double
+  deriving (Eq, Show)
+
+newtype AzHp = AzHp Int
+  deriving (Eq, Show)
+
+instance (Monad m) => AZ.Component m AzPos
+instance (Monad m) => AZ.Component m AzVel
+instance (Monad m) => AZ.Component m AzAcc
+instance (Monad m) => AZ.Component m AzHp
+
+type AzWorld = AZ.World Identity
+
+azMoveQ :: AZ.Query Identity AzPos
+azMoveQ =
+  AZ.queryMapWith
+    (\(AzVel vx vy) (AzPos x y) -> AzPos (x + vx) (y + vy))
+    (AZ.query @Identity @AzVel)
+
+runAzTickEachm :: AzWorld -> AzWorld
+runAzTickEachm w0 =
+  let (_, w1) =
+        runIdentity $
+          AZ.runAccess
+            (AZ.system (AZ.runQuery azMoveQ))
+            w0
+  in w1
+
+buildAzWorld :: Int -> AzWorld
+buildAzWorld n = snd (foldl' add (0 :: Int, AZW.empty) [1 .. n])
+  where
+    add (i, w) _ =
+      let (_, w1, _) =
+            AZW.spawn
+              ( AZ.bundle (AzPos (fromIntegral i) 0)
+                  <> AZ.bundle (AzVel 1 1)
+                  <> AZ.bundle (AzAcc 0.1 0.1)
+                  <> AZ.bundle (AzHp 100)
+              )
+              w
+      in (i + 1, w1)
+
+buildAzWorldPlayers :: Int -> Int -> AzWorld
+buildAzWorldPlayers unrelatedCount playerCount =
+  let addUnrelated w _ =
+        let (_, w1, _) = AZW.spawn (AZ.bundle (AzHp 100)) w
+        in w1
+      addPlayer (i, w) _ =
+        let (_, w1, _) =
+              AZW.spawn
+                (AZ.bundle (AzPos (fromIntegral i) 0) <> AZ.bundle (AzVel 1 1))
+                w
+        in (i + 1, w1)
+      w0 = foldl' addUnrelated AZW.empty [1 .. unrelatedCount]
+  in snd (foldl' addPlayer (0 :: Int, w0) [1 .. playerCount])
+
+forceAzEachm :: AzWorld -> Double
+forceAzEachm w =
+  let q =
+        (,)
+          <$> (AZQ.query @Identity @AzPos)
+          <*> (AZQ.query @Identity @AzVel)
+      (vals, _) = runIdentity (AZQ.readQuery q (AZW.entities w))
+  in V.foldl'
+      (\acc (AzPos x y, AzVel vx vy) -> acc + x + y + vx + vy)
+      0
+      vals
+
 computeS :: S.Batch C String a -> S.Batch C String a
 computeS = S.compute
 
+reqPV :: E.Sig
+reqPV =
+  bit (E.componentBitOf @C @Pos)
+    .|. bit (E.componentBitOf @C @Vel)
+
 forceEachm :: World -> Double
 forceEachm w =
-  V.foldl'
-    (\acc (E.EntityRow _ _ bag) ->
+  foldl'
+    (\acc (_, rows) ->
+      Foldable.foldl'
+        (\acc' (E.EntityRow _ _ bag) ->
       let sumPos =
             case E.bagGet @C @Pos bag of
               Just (Pos x y) -> x + y
@@ -53,10 +140,13 @@ forceEachm w =
             case E.bagGet @C @Vel bag of
               Just (Vel vx vy) -> vx + vy
               Nothing -> 0
-      in acc + sumPos + sumVel
+      in acc' + sumPos + sumVel
+        )
+        acc
+        rows
     )
     0
-    (E.entityRowsV w)
+    (E.matchingArchetypes reqPV 0 w)
 
 data MoveLoop
 data MoveLoop1
@@ -83,6 +173,17 @@ buildWorld n = snd (foldl' add (0 :: Int, E.emptyWorld) [1 .. n])
               )
               w
       in (i + 1, w1)
+
+buildWorldPlayers :: Int -> Int -> World
+buildWorldPlayers unrelatedCount playerCount =
+  let addUnrelated w _ =
+        let (_, w1) = E.spawn (Hp 100) w
+        in w1
+      addPlayer (i, w) _ =
+        let (_, w1) = E.spawn (Pos (fromIntegral i) 0, Vel 1 1) w
+        in (i + 1, w1)
+      w0 = foldl' addUnrelated E.emptyWorld [1 .. unrelatedCount]
+  in snd (foldl' addPlayer (0 :: Int, w0) [1 .. playerCount])
 
 pPV :: E.Plan C (Pos, Vel)
 pPV = E.plan @(Pos, Vel)
@@ -117,6 +218,12 @@ moveProgSmall = S.program (S.handle 0) $ do
     S.eachP pP $ \(Pos x y) ->
       let p = Pos (x + 1) y
       in S.set p
+  pure ()
+
+moveProgEachQ :: Program String ()
+moveProgEachQ = S.program (S.handle 0) $ do
+  _ <- S.await $ computeS $
+    S.each qPVQ movePatch
   pure ()
 
 moveProgJoin3 :: Program String ()
@@ -288,6 +395,9 @@ graphEachS = S.graph @String moveProgStep
 graphEachM :: Graph String
 graphEachM = S.graph @String moveProgM
 
+graphEachQ :: Graph String
+graphEachQ = S.graph @String moveProgEachQ
+
 graphEachSmall :: Graph String
 graphEachSmall = S.graph @String moveProgSmall
 
@@ -339,6 +449,10 @@ main = defaultMain
         in bench "query-10k" $ nf (length . E.runq qPVQ) w
       , let w = buildWorld 10000
         in bench "query-small-10k" $ nf (length . E.runq qPQ) w
+      , let w = buildWorldPlayers 10000 1
+        in bench "query-10k+1" $ nf (length . E.runq qPVQ) w
+      , let w = buildWorldPlayers 10000 2
+        in bench "query-10k+2" $ nf (length . E.runq qPVQ) w
       , bench "spawn-10k" $ nf (length . E.entities . buildWorld) 10000
       ]
   , bgroup "program"
@@ -346,6 +460,11 @@ main = defaultMain
           [ let w = buildWorld 10000
             in bench "each" $ nf (\w0 ->
                 let (w1, _, _) = S.run 0.016 w0 [] graphEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-query" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachQ
                 in length (E.entities w1)
               ) w
           , let w = buildWorld 10000
@@ -393,10 +512,15 @@ main = defaultMain
                 let (w1, _, _) = S.run 0.016 w0 [] graphEachM
                 in forceEachm w1
               ) w
+          , let w = buildAzWorld 10000
+            in bench "eachm-aztecs" $ nf (\w0 ->
+                let w1 = runAzTickEachm w0
+                in forceAzEachm w1
+              ) w
           , let w = buildWorld 10000
             in bench "eachm-pure" $ nf (\w0 ->
                 let (w1, _, _) = S.run 0.016 w0 [] graphEachMPure
-                in length (E.entities w1)
+                in forceEachm w1
               ) w
           , let w = buildWorld 10000
             in bench "eachm-small" $ nf (\w0 ->
@@ -419,10 +543,49 @@ main = defaultMain
                 in length (E.entities w1)
               ) w
           ]
+      , bgroup "10k+1"
+          [ let w = buildWorldPlayers 10000 1
+            in bench "eachm" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                in forceEachm w1
+              ) w
+          , let w = buildAzWorldPlayers 10000 1
+            in bench "eachm-aztecs" $ nf (\w0 ->
+                let w1 = runAzTickEachm w0
+                in forceAzEachm w1
+              ) w
+          , let w = buildWorldPlayers 10000 1
+            in bench "each-query" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachQ
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorldPlayers 10000 1
+            in bench "eachm-pure" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachMPure
+                in forceEachm w1
+              ) w
+          ]
+      , bgroup "10k+2"
+          [ let w = buildWorldPlayers 10000 2
+            in bench "eachm" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                in forceEachm w1
+              ) w
+          , let w = buildWorldPlayers 10000 2
+            in bench "eachm-pure" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachMPure
+                in forceEachm w1
+              ) w
+          ]
       , bgroup "10k-warm"
           [ let w = buildWorld 10000
             in bench "each" $ nf (\w0 ->
                 let w1 = runWarmTick 0.016 w0 graphEach
+                in length (E.entities w1)
+              ) w
+          , let w = buildWorld 10000
+            in bench "each-query" $ nf (\w0 ->
+                let w1 = runWarmTick 0.016 w0 graphEachQ
                 in length (E.entities w1)
               ) w
           , let w = buildWorld 10000
@@ -473,7 +636,7 @@ main = defaultMain
           , let w = buildWorld 10000
             in bench "eachm-pure" $ nf (\w0 ->
                 let w1 = runWarmTick 0.016 w0 graphEachMPure
-                in length (E.entities w1)
+                in forceEachm w1
               ) w
           , let w = buildWorld 10000
             in bench "eachm-small" $ nf (\w0 ->
