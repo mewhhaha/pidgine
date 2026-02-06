@@ -69,12 +69,70 @@ azMoveQ =
     (\(AzVel vx vy) (AzPos x y) -> AzPos (x + vx) (y + vy))
     (AZ.query @Identity @AzVel)
 
+azPosQ :: AZ.Query Identity AzPos
+azPosQ =
+  AZ.queryMapWith
+    (\(AzPos x y) _ -> AzPos (x + 1) y)
+    (AZ.query @Identity @AzPos)
+
+azVelQ :: AZ.Query Identity AzVel
+azVelQ =
+  AZ.queryMapWith
+    (\(AzVel vx vy) _ -> AzVel (vx + 1) vy)
+    (AZ.query @Identity @AzVel)
+
+azAccQ :: AZ.Query Identity AzAcc
+azAccQ =
+  AZ.queryMapWith
+    (\(AzAcc ax ay) _ -> AzAcc (ax + 1) ay)
+    (AZ.query @Identity @AzAcc)
+
+azHpQ :: AZ.Query Identity AzHp
+azHpQ =
+  AZ.queryMapWith
+    (\(AzHp hp) _ -> AzHp (hp + 1))
+    (AZ.query @Identity @AzHp)
+
 runAzTickEachm :: AzWorld -> AzWorld
 runAzTickEachm w0 =
   let (_, w1) =
         runIdentity $
           AZ.runAccess
             (AZ.system (AZ.runQuery azMoveQ))
+            w0
+  in w1
+
+runAzTickEachm4Progs :: AzWorld -> AzWorld
+runAzTickEachm4Progs w0 =
+  let sys = AZ.system (AZ.runQuery azMoveQ)
+      (_, w1) =
+        runIdentity $
+          AZ.runAccess
+            (sys *> sys *> sys *> sys)
+            w0
+  in w1
+
+runAzTickSplit :: AzWorld -> AzWorld
+runAzTickSplit w0 =
+  let (_, w1) =
+        runIdentity $
+          AZ.runAccess
+            ( AZ.system (AZ.runQuery azPosQ)
+                *> AZ.system (AZ.runQuery azVelQ)
+            )
+            w0
+  in w1
+
+runAzTickSplit4 :: AzWorld -> AzWorld
+runAzTickSplit4 w0 =
+  let (_, w1) =
+        runIdentity $
+          AZ.runAccess
+            ( AZ.system (AZ.runQuery azPosQ)
+                *> AZ.system (AZ.runQuery azVelQ)
+                *> AZ.system (AZ.runQuery azAccQ)
+                *> AZ.system (AZ.runQuery azHpQ)
+            )
             w0
   in w1
 
@@ -106,6 +164,42 @@ buildAzWorldPlayers unrelatedCount playerCount =
       w0 = foldl' addUnrelated AZW.empty [1 .. unrelatedCount]
   in snd (foldl' addPlayer (0 :: Int, w0) [1 .. playerCount])
 
+buildAzWorldSplit :: Int -> Int -> AzWorld
+buildAzWorldSplit posCount velCount =
+  let addPos (i, w) _ =
+        let (_, w1, _) =
+              AZW.spawn (AZ.bundle (AzPos (fromIntegral i) 0)) w
+        in (i + 1, w1)
+      addVel (i, w) _ =
+        let (_, w1, _) =
+              AZW.spawn (AZ.bundle (AzVel (fromIntegral i) 1)) w
+        in (i + 1, w1)
+      (_, w1) = foldl' addPos (0 :: Int, AZW.empty) [1 .. posCount]
+  in snd (foldl' addVel (0 :: Int, w1) [1 .. velCount])
+
+buildAzWorldSplit4 :: Int -> Int -> Int -> Int -> AzWorld
+buildAzWorldSplit4 posCount velCount accCount hpCount =
+  let addPos (i, w) _ =
+        let (_, w1, _) =
+              AZW.spawn (AZ.bundle (AzPos (fromIntegral i) 0)) w
+        in (i + 1, w1)
+      addVel (i, w) _ =
+        let (_, w1, _) =
+              AZW.spawn (AZ.bundle (AzVel (fromIntegral i) 1)) w
+        in (i + 1, w1)
+      addAcc (i, w) _ =
+        let (_, w1, _) =
+              AZW.spawn (AZ.bundle (AzAcc (fromIntegral i) 1)) w
+        in (i + 1, w1)
+      addHp (i, w) _ =
+        let (_, w1, _) =
+              AZW.spawn (AZ.bundle (AzHp (i + 100))) w
+        in (i + 1, w1)
+      (_, w1) = foldl' addPos (0 :: Int, AZW.empty) [1 .. posCount]
+      (_, w2) = foldl' addVel (0 :: Int, w1) [1 .. velCount]
+      (_, w3) = foldl' addAcc (0 :: Int, w2) [1 .. accCount]
+  in snd (foldl' addHp (0 :: Int, w3) [1 .. hpCount])
+
 forceAzEachm :: AzWorld -> Double
 forceAzEachm w =
   let q =
@@ -118,6 +212,50 @@ forceAzEachm w =
       0
       vals
 
+forceAzSplit :: AzWorld -> Double
+forceAzSplit w =
+  let (posVals, _) = runIdentity (AZQ.readQuery (AZQ.query @Identity @AzPos) (AZW.entities w))
+      (velVals, _) = runIdentity (AZQ.readQuery (AZQ.query @Identity @AzVel) (AZW.entities w))
+      sumPos =
+        V.foldl'
+          (\acc (AzPos x y) -> acc + x + y)
+          0
+          posVals
+      sumVel =
+        V.foldl'
+          (\acc (AzVel vx vy) -> acc + vx + vy)
+          0
+          velVals
+  in sumPos + sumVel
+
+forceAzSplit4 :: AzWorld -> Double
+forceAzSplit4 w =
+  let (posVals, _) = runIdentity (AZQ.readQuery (AZQ.query @Identity @AzPos) (AZW.entities w))
+      (velVals, _) = runIdentity (AZQ.readQuery (AZQ.query @Identity @AzVel) (AZW.entities w))
+      (accVals, _) = runIdentity (AZQ.readQuery (AZQ.query @Identity @AzAcc) (AZW.entities w))
+      (hpVals, _) = runIdentity (AZQ.readQuery (AZQ.query @Identity @AzHp) (AZW.entities w))
+      sumPos =
+        V.foldl'
+          (\acc (AzPos x y) -> acc + x + y)
+          0
+          posVals
+      sumVel =
+        V.foldl'
+          (\acc (AzVel vx vy) -> acc + vx + vy)
+          0
+          velVals
+      sumAcc =
+        V.foldl'
+          (\acc (AzAcc ax ay) -> acc + ax + ay)
+          0
+          accVals
+      sumHp =
+        V.foldl'
+          (\acc (AzHp hp) -> acc + fromIntegral hp)
+          0
+          hpVals
+  in sumPos + sumVel + sumAcc + sumHp
+
 computeS :: S.Batch C String a -> S.Batch C String a
 computeS = S.compute
 
@@ -125,6 +263,18 @@ reqPV :: E.Sig
 reqPV =
   bit (E.componentBitOf @C @Pos)
     .|. bit (E.componentBitOf @C @Vel)
+
+reqP :: E.Sig
+reqP = bit (E.componentBitOf @C @Pos)
+
+reqV :: E.Sig
+reqV = bit (E.componentBitOf @C @Vel)
+
+reqA :: E.Sig
+reqA = bit (E.componentBitOf @C @Acc)
+
+reqH :: E.Sig
+reqH = bit (E.componentBitOf @C @Hp)
 
 forceEachm :: World -> Double
 forceEachm w =
@@ -148,9 +298,127 @@ forceEachm w =
     0
     (E.matchingArchetypes reqPV 0 w)
 
+forceSplitMatched :: World -> Double
+forceSplitMatched w =
+  let sumPos =
+        foldl'
+          (\acc (_, rows) ->
+            Foldable.foldl'
+              (\acc' (E.EntityRow _ _ bag) ->
+                case E.bagGet @C @Pos bag of
+                  Just (Pos x y) -> acc' + x + y
+                  Nothing -> acc'
+              )
+              acc
+              rows
+          )
+          0
+          (E.matchingArchetypes reqP 0 w)
+      sumVel =
+        foldl'
+          (\acc (_, rows) ->
+            Foldable.foldl'
+              (\acc' (E.EntityRow _ _ bag) ->
+                case E.bagGet @C @Vel bag of
+                  Just (Vel vx vy) -> acc' + vx + vy
+                  Nothing -> acc'
+              )
+              acc
+              rows
+          )
+          0
+          (E.matchingArchetypes reqV 0 w)
+  in sumPos + sumVel
+
+forceSplit4Matched :: World -> Double
+forceSplit4Matched w =
+  let sumPos =
+        foldl'
+          (\acc (_, rows) ->
+            Foldable.foldl'
+              (\acc' (E.EntityRow _ _ bag) ->
+                case E.bagGet @C @Pos bag of
+                  Just (Pos x y) -> acc' + x + y
+                  Nothing -> acc'
+              )
+              acc
+              rows
+          )
+          0
+          (E.matchingArchetypes reqP 0 w)
+      sumVel =
+        foldl'
+          (\acc (_, rows) ->
+            Foldable.foldl'
+              (\acc' (E.EntityRow _ _ bag) ->
+                case E.bagGet @C @Vel bag of
+                  Just (Vel vx vy) -> acc' + vx + vy
+                  Nothing -> acc'
+              )
+              acc
+              rows
+          )
+          0
+          (E.matchingArchetypes reqV 0 w)
+      sumAcc =
+        foldl'
+          (\acc (_, rows) ->
+            Foldable.foldl'
+              (\acc' (E.EntityRow _ _ bag) ->
+                case E.bagGet @C @Acc bag of
+                  Just (Acc ax ay) -> acc' + ax + ay
+                  Nothing -> acc'
+              )
+              acc
+              rows
+          )
+          0
+          (E.matchingArchetypes reqA 0 w)
+      sumHp =
+        foldl'
+          (\acc (_, rows) ->
+            Foldable.foldl'
+              (\acc' (E.EntityRow _ _ bag) ->
+                case E.bagGet @C @Hp bag of
+                  Just (Hp hp) -> acc' + fromIntegral hp
+                  Nothing -> acc'
+              )
+              acc
+              rows
+          )
+          0
+          (E.matchingArchetypes reqH 0 w)
+  in sumPos + sumVel + sumAcc + sumHp
+
+forceSplitFullScan :: World -> Double
+forceSplitFullScan w =
+  let sumPos =
+        E.foldEntities
+          (\_ _ bag acc ->
+            case E.bagGet @C @Pos bag of
+              Just (Pos x y) -> acc + x + y
+              Nothing -> acc
+          )
+          0
+          w
+      sumVel =
+        E.foldEntities
+          (\_ _ bag acc ->
+            case E.bagGet @C @Vel bag of
+              Just (Vel vx vy) -> acc + vx + vy
+              Nothing -> acc
+          )
+          0
+          w
+  in sumPos + sumVel
+
 data MoveLoop
 data MoveLoop1
 data MoveLoop2
+data MoveLoopSplitP
+data MoveLoopSplitV
+data MoveLoopSplitA
+data MoveLoopSplitH
 
 data Move3 = Move3
   { pos3 :: Pos
@@ -185,14 +453,53 @@ buildWorldPlayers unrelatedCount playerCount =
       w0 = foldl' addUnrelated E.emptyWorld [1 .. unrelatedCount]
   in snd (foldl' addPlayer (0 :: Int, w0) [1 .. playerCount])
 
+buildWorldSplit :: Int -> Int -> World
+buildWorldSplit posCount velCount =
+  let addPos (i, w) _ =
+        let (_, w1) = E.spawn (Pos (fromIntegral i) 0) w
+        in (i + 1, w1)
+      addVel (i, w) _ =
+        let (_, w1) = E.spawn (Vel (fromIntegral i) 1) w
+        in (i + 1, w1)
+      (_, w1) = foldl' addPos (0 :: Int, E.emptyWorld) [1 .. posCount]
+  in snd (foldl' addVel (0 :: Int, w1) [1 .. velCount])
+
+buildWorldSplit4 :: Int -> Int -> Int -> Int -> World
+buildWorldSplit4 posCount velCount accCount hpCount =
+  let addPos (i, w) _ =
+        let (_, w1) = E.spawn (Pos (fromIntegral i) 0) w
+        in (i + 1, w1)
+      addVel (i, w) _ =
+        let (_, w1) = E.spawn (Vel (fromIntegral i) 1) w
+        in (i + 1, w1)
+      addAcc (i, w) _ =
+        let (_, w1) = E.spawn (Acc (fromIntegral i) 1) w
+        in (i + 1, w1)
+      addHp (i, w) _ =
+        let (_, w1) = E.spawn (Hp (i + 100)) w
+        in (i + 1, w1)
+      (_, w1) = foldl' addPos (0 :: Int, E.emptyWorld) [1 .. posCount]
+      (_, w2) = foldl' addVel (0 :: Int, w1) [1 .. velCount]
+      (_, w3) = foldl' addAcc (0 :: Int, w2) [1 .. accCount]
+  in snd (foldl' addHp (0 :: Int, w3) [1 .. hpCount])
+
 pPV :: E.Plan C (Pos, Vel)
 pPV = E.plan @(Pos, Vel)
 
 pP :: E.Plan C Pos
 pP = E.plan @Pos
 
+pV :: E.Plan C Vel
+pV = E.plan @Vel
+
 pVA :: E.Plan C (Vel, Acc)
 pVA = E.plan @(Vel, Acc)
+
+pA :: E.Plan C Acc
+pA = E.plan @Acc
+
+pH :: E.Plan C Hp
+pH = E.plan @Hp
 
 pMove3 :: E.Plan C Move3
 pMove3 = E.planMap (\(p, v, a) -> Move3 p v a) (E.plan @(Pos, Vel, Acc))
@@ -335,7 +642,21 @@ moveSet2 (Pos x y, Vel vx vy) =
 moveProgM :: Program String ()
 moveProgM = S.program (S.handle 0) $ do
   _ <- S.await $ computeS $
-    S.eachPSet2 pPV moveSet2
+    S.eachSet2 @C @Pos @Vel moveSet2
+  pure ()
+
+moveProgMStateful :: Program String ()
+moveProgMStateful = S.program (S.handle 0) $ do
+  _ <- S.await $ computeS $
+    S.eachMP @MoveLoop pPV $ \(Pos x y, Vel vx vy) -> do
+      let p = Pos (x + vx) (y + vy)
+      S.edit (S.set2 p (Vel vx vy))
+  pure ()
+
+mkMoveProgM :: Int -> Program String ()
+mkMoveProgM n = S.program (S.handle n) $ do
+  _ <- S.await $ computeS $
+    S.eachSet2 @C @Pos @Vel moveSet2
   pure ()
 
 moveProgMPure :: Program String ()
@@ -386,6 +707,69 @@ moveProgMLogic = S.program (S.handle 0) $ do
       S.edit (S.set2 p' v')
   pure ()
 
+moveProgMSplit :: Program String ()
+moveProgMSplit = S.program (S.handle 0) $ do
+  _ <- S.await $ computeS $
+    (S.eachMP @MoveLoopSplitP pP $ \(Pos x y) -> do
+      let p = Pos (x + 1) y
+      S.edit (S.set p))
+    *>
+    (S.eachMP @MoveLoopSplitV pV $ \(Vel vx vy) -> do
+      let v = Vel (vx + 1) vy
+      S.edit (S.set v))
+  pure ()
+
+-- Four eachMP loops in one compute block: compiled to one fused kernel pass.
+moveProgMSplit4 :: Program String ()
+moveProgMSplit4 = S.program (S.handle 0) $ do
+  _ <- S.await $ computeS $
+    (S.eachMP @MoveLoopSplitP pP $ \(Pos x y) -> do
+      let p = Pos (x + 1) y
+      S.edit (S.set p))
+    *>
+    (S.eachMP @MoveLoopSplitV pV $ \(Vel vx vy) -> do
+      let v = Vel (vx + 1) vy
+      S.edit (S.set v))
+    *>
+    (S.eachMP @MoveLoopSplitA pA $ \(Acc ax ay) -> do
+      let a = Acc (ax + 1) ay
+      S.edit (S.set a))
+    *>
+    (S.eachMP @MoveLoopSplitH pH $ \(Hp hp) -> do
+      S.edit (S.set (Hp (hp + 1))))
+  pure ()
+
+moveProgMSplit4P :: Program String ()
+moveProgMSplit4P = S.program (S.handle 0) $ do
+  _ <- S.await $ computeS $
+    S.eachMP @MoveLoopSplitP pP $ \(Pos x y) -> do
+      let p = Pos (x + 1) y
+      S.edit (S.set p)
+  pure ()
+
+moveProgMSplit4V :: Program String ()
+moveProgMSplit4V = S.program (S.handle 1) $ do
+  _ <- S.await $ computeS $
+    S.eachMP @MoveLoopSplitV pV $ \(Vel vx vy) -> do
+      let v = Vel (vx + 1) vy
+      S.edit (S.set v)
+  pure ()
+
+moveProgMSplit4A :: Program String ()
+moveProgMSplit4A = S.program (S.handle 2) $ do
+  _ <- S.await $ computeS $
+    S.eachMP @MoveLoopSplitA pA $ \(Acc ax ay) -> do
+      let a = Acc (ax + 1) ay
+      S.edit (S.set a)
+  pure ()
+
+moveProgMSplit4H :: Program String ()
+moveProgMSplit4H = S.program (S.handle 3) $ do
+  _ <- S.await $ computeS $
+    S.eachMP @MoveLoopSplitH pH $ \(Hp hp) -> do
+      S.edit (S.set (Hp (hp + 1)))
+  pure ()
+
 graphEach :: Graph String
 graphEach = S.graph @String moveProg
 
@@ -394,6 +778,12 @@ graphEachS = S.graph @String moveProgStep
 
 graphEachM :: Graph String
 graphEachM = S.graph @String moveProgM
+
+graphEachMStateful :: Graph String
+graphEachMStateful = S.graph @String moveProgMStateful
+
+graphEachM4Programs :: Graph String
+graphEachM4Programs = S.graphList (map mkMoveProgM [0 .. 3])
 
 graphEachQ :: Graph String
 graphEachQ = S.graph @String moveProgEachQ
@@ -431,8 +821,57 @@ graphEachMTwoEach = S.graph @String moveProgMTwoEach
 graphEachMLogic :: Graph String
 graphEachMLogic = S.graph @String moveProgMLogic
 
+graphEachMSplit :: Graph String
+graphEachMSplit = S.graph @String moveProgMSplit
+
+graphEachMSplit4 :: Graph String
+graphEachMSplit4 = S.graph @String moveProgMSplit4
+
+graphEachMSplit4Programs :: Graph String
+graphEachMSplit4Programs =
+  S.graph @String moveProgMSplit4P moveProgMSplit4V moveProgMSplit4A moveProgMSplit4H
+
+runTickSplitFullScan :: World -> World
+runTickSplitFullScan w0 =
+  let stepPos _ _ bag =
+        case E.bagGet @C @Pos bag of
+          Just (Pos x y) -> E.bagSetDirect @C @Pos (Pos (x + 1) y) bag
+          Nothing -> bag
+      stepVel _ _ bag =
+        case E.bagGet @C @Vel bag of
+          Just (Vel vx vy) -> E.bagSetDirect @C @Vel (Vel (vx + 1) vy) bag
+          Nothing -> bag
+      w1 = E.mapEntities stepPos w0
+  in E.mapEntities stepVel w1
+
+runTickSplit4FullScan :: World -> World
+runTickSplit4FullScan w0 =
+  let stepPos _ _ bag =
+        case E.bagGet @C @Pos bag of
+          Just (Pos x y) -> E.bagSetDirect @C @Pos (Pos (x + 1) y) bag
+          Nothing -> bag
+      stepVel _ _ bag =
+        case E.bagGet @C @Vel bag of
+          Just (Vel vx vy) -> E.bagSetDirect @C @Vel (Vel (vx + 1) vy) bag
+          Nothing -> bag
+      stepAcc _ _ bag =
+        case E.bagGet @C @Acc bag of
+          Just (Acc ax ay) -> E.bagSetDirect @C @Acc (Acc (ax + 1) ay) bag
+          Nothing -> bag
+      stepHp _ _ bag =
+        case E.bagGet @C @Hp bag of
+          Just (Hp hp) -> E.bagSetDirect @C @Hp (Hp (hp + 1)) bag
+          Nothing -> bag
+      w1 = E.mapEntities stepPos w0
+      w2 = E.mapEntities stepVel w1
+      w3 = E.mapEntities stepAcc w2
+  in E.mapEntities stepHp w3
+
 graphEachMPure :: Graph String
 graphEachMPure = S.graph @String moveProgMPure
+
+crossoverSizes :: [Int]
+crossoverSizes = [10000, 20000, 40000, 80000, 120000]
 
 runWarmTick :: Double -> World -> Graph String -> World
 runWarmTick dt w0 g0 =
@@ -512,6 +951,11 @@ main = defaultMain
                 let (w1, _, _) = S.run 0.016 w0 [] graphEachM
                 in forceEachm w1
               ) w
+          , let w = buildWorld 10000
+            in bench "eachm-stateful" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachMStateful
+                in forceEachm w1
+              ) w
           , let w = buildAzWorld 10000
             in bench "eachm-aztecs" $ nf (\w0 ->
                 let w1 = runAzTickEachm w0
@@ -577,6 +1021,52 @@ main = defaultMain
                 in forceEachm w1
               ) w
           ]
+      , bgroup "5k+5k+5k+5k"
+          [ let w = buildWorldSplit4 5000 5000 5000 5000
+            in bench "eachm" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachMSplit4
+                in forceSplit4Matched w1
+              ) w
+          , let w = buildWorldSplit4 5000 5000 5000 5000
+            in bench "eachm-fullscan" $ nf (\w0 ->
+                let w1 = runTickSplit4FullScan w0
+                in forceSplit4Matched w1
+              ) w
+          , let w = buildAzWorldSplit4 5000 5000 5000 5000
+            in bench "eachm-aztecs" $ nf (\w0 ->
+                let w1 = runAzTickSplit4 w0
+                in forceAzSplit4 w1
+              ) w
+          ]
+      , bgroup "5k/5k/5k/5k"
+          [ let w = buildWorldSplit4 5000 5000 5000 5000
+            in bench "eachm" $ nf (\w0 ->
+                let (w1, _, _) = S.run 0.016 w0 [] graphEachMSplit4Programs
+                in forceSplit4Matched w1
+              ) w
+          , let w = buildAzWorldSplit4 5000 5000 5000 5000
+            in bench "eachm-aztecs" $ nf (\w0 ->
+                let w1 = runAzTickSplit4 w0
+                in forceAzSplit4 w1
+              ) w
+          ]
+      , bgroup "crossover"
+          ( concatMap
+              (\n ->
+                [ let w = buildWorld n
+                  in bench (show n <> "/eachm") $ nf (\w0 ->
+                      let (w1, _, _) = S.run 0.016 w0 [] graphEachM
+                      in forceEachm w1
+                    ) w
+                , let w = buildAzWorld n
+                  in bench (show n <> "/eachm-aztecs") $ nf (\w0 ->
+                      let w1 = runAzTickEachm w0
+                      in forceAzEachm w1
+                    ) w
+                ]
+              )
+              crossoverSizes
+          )
       , bgroup "10k-warm"
           [ let w = buildWorld 10000
             in bench "each" $ nf (\w0 ->

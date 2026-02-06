@@ -32,11 +32,13 @@ module Engine.Data.ECS
   , applyEntityRowUpdates
   , applyArchetypeRunUpdates
   , stepWorld
+  , worldHasSteps
   , foldEntities
   , foldEntitiesFrom
   , mapEntities
   , setEntityRows
   , setEntityRowsV
+  , setEntityRowsVSameShape
   , nextId
   , spawn
   , kill
@@ -69,6 +71,9 @@ module Engine.Data.ECS
   , bagApplyEdit
   , bagApplyEditUnsafe
   , bagSetDirect
+  , bagGetByAny2
+  , bagSet2ByAnyForSig
+  , bagSet2DirectForSig
   , bagSet2Direct
   , bagSet3Direct
   , bagSetStepDirect
@@ -111,7 +116,7 @@ import Data.Maybe (isJust)
 import Data.Proxy (Proxy(..))
 import Data.Typeable (Typeable, cast, typeRep, typeRepFingerprint)
 import qualified Data.Vector as V
-import qualified Data.RRBVector as RV
+import qualified Data.Vector.Mutable as MV
 import Data.Word (Word64)
 import GHC.TypeLits (TypeError, ErrorMessage(..))
 import GHC.Exts (Any, isTrue#, reallyUnsafePtrEquality#)
@@ -298,13 +303,15 @@ instance ComponentId c => Semigroup (Bag c) where
 instance ComponentId c => Monoid (Bag c) where
   mempty = emptyBag
 
-data Loc = Loc !Sig !Int
+data Loc = Loc !Int
+
+type LocTable = V.Vector (Maybe Loc)
 
 data World c = World
   { nextIdW :: !Int
   , entityCountW :: !Int
-  , archW :: !(IntMap (RV.Vector (EntityRow c)))
-  , entityLocW :: !(IntMap Loc)
+  , rowsW :: !(V.Vector (EntityRow c))
+  , entityLocW :: !LocTable
   , resourcesW :: !(IntMap Any)
   , relOutW :: !(IntMap (IntMap IntSet))
   , relInW :: !(IntMap (IntMap IntSet))
@@ -315,35 +322,62 @@ emptyWorld =
   World
     { nextIdW = 0
     , entityCountW = 0
-    , archW = IntMap.empty
-    , entityLocW = IntMap.empty
+    , rowsW = V.empty
+    , entityLocW = locInit 0
     , resourcesW = IntMap.empty
     , relOutW = IntMap.empty
     , relInW = IntMap.empty
-    }
+  }
 
-locInsert :: Int -> Loc -> IntMap Loc -> IntMap Loc
-locInsert = IntMap.insert
+locInit :: Int -> LocTable
+locInit n
+  | n <= 0 = V.empty
+  | otherwise = V.replicate n Nothing
 
-locDelete :: Int -> IntMap Loc -> IntMap Loc
-locDelete = IntMap.delete
+locLookupWorld :: Int -> World c -> Maybe Loc
+locLookupWorld eid' w
+  | eid' < 0 || eid' >= nextIdW w = Nothing
+  | otherwise = entityLocW w V.! eid'
+
+vecUpdate :: Int -> a -> V.Vector a -> V.Vector a
+vecUpdate i x vec = V.modify (\mv -> MV.unsafeWrite mv i x) vec
+{-# INLINE vecUpdate #-}
+
+locInsertKnown :: Int -> Loc -> LocTable -> LocTable
+locInsertKnown i loc locs = vecUpdate i (Just loc) locs
+
+locDeleteKnown :: Int -> LocTable -> LocTable
+locDeleteKnown i locs = vecUpdate i Nothing locs
+
+locAppend :: Loc -> LocTable -> LocTable
+locAppend loc locs = V.snoc locs (Just loc)
+
+locSetGrow :: Int -> Loc -> LocTable -> Int -> (LocTable, Int)
+locSetGrow eid' loc locs locLen
+  | eid' < 0 = (locs, locLen)
+  | eid' < locLen = (locInsertKnown eid' loc locs, locLen)
+  | eid' == locLen = (locAppend loc locs, locLen + 1)
+  | otherwise =
+      let fillCount = eid' - locLen
+          tailCells =
+            if fillCount == 0
+              then [Just loc]
+              else replicate fillCount Nothing <> [Just loc]
+          locs' = locs V.++ V.fromList tailCells
+      in (locs', eid' + 1)
 
 entities :: World c -> [Entity]
 entities w =
-  foldr
+  Foldable.foldr
     (\(EntityRow eid' _ _) acc -> Entity eid' : acc)
     []
-    (entityRows w)
+    (rowsW w)
 
 entityRows :: World c -> [EntityRow c]
-entityRows w =
-  IntMap.foldr
-    (\rows acc -> Foldable.toList rows <> acc)
-    []
-    (archW w)
+entityRows = Foldable.toList . rowsW
 
-entityRowsV :: World c -> RV.Vector (EntityRow c)
-entityRowsV w = RV.fromList (entityRows w)
+entityRowsV :: World c -> V.Vector (EntityRow c)
+entityRowsV = rowsW
 
 nextId :: World c -> Int
 nextId = nextIdW
@@ -357,197 +391,103 @@ foldEntitiesFrom rows f s0 _ =
 
 foldEntities :: (Entity -> Sig -> Bag c -> s -> s) -> s -> World c -> s
 foldEntities f s0 w =
-  IntMap.foldl'
-    (Foldable.foldl'
-      (\acc' (EntityRow eid' sig bag) -> f (Entity eid') sig bag acc')
-    )
+  Foldable.foldl'
+    (\acc' (EntityRow eid' sig bag) -> f (Entity eid') sig bag acc')
     s0
-    (archW w)
+    (rowsW w)
 
 mapEntities :: (Entity -> Sig -> Bag c -> Bag c) -> World c -> World c
 mapEntities f w =
-  let stepRow (archAcc, locAcc, n) (EntityRow eid' sig bag) =
-        let e = Entity eid'
-            bag' = f e sig bag
-            sig' = sigFromBag bag'
-            row' = EntityRow eid' sig' bag'
-            (archAcc', locAcc') = insertRowArchLoc row' archAcc locAcc
-        in (archAcc', locAcc', n + 1)
-      stepRun = Foldable.foldl' stepRow
-      (archTmp, locs', nRows) =
-        IntMap.foldl'
-          stepRun
-          (IntMap.empty, IntMap.empty, 0)
-          (archW w)
-      arch' = finalizeArchRuns archTmp
-  in w
-      { archW = arch'
-      , entityLocW = locs'
-      , entityCountW = nRows
-      }
+  let rows' =
+        V.map
+          (\(EntityRow eid' sig bag) ->
+            let e = Entity eid'
+                bag' = f e sig bag
+                sig' = sigFromBag bag'
+            in EntityRow eid' sig' bag'
+          )
+          (rowsW w)
+  in setEntityRowsVSameShape rows' w
 
 setEntityRows :: [EntityRow c] -> World c -> World c
-setEntityRows rows = setEntityRowsV (RV.fromList rows)
+setEntityRows rows = setEntityRowsV (V.fromList rows)
 
-setEntityRowsV :: RV.Vector (EntityRow c) -> World c -> World c
+setEntityRowsV :: V.Vector (EntityRow c) -> World c -> World c
 setEntityRowsV rows w =
-  let (arch', locs') = buildArchAndLocsV rows
+  let (locs', locLen') = buildLocsV (nextIdW w) rows
   in w
-      { archW = arch'
+      { rowsW = rows
       , entityLocW = locs'
+      , nextIdW = max (nextIdW w) locLen'
       , entityCountW = Foldable.length rows
       }
 
-buildArchAndLocsV :: RV.Vector (EntityRow c) -> (IntMap (RV.Vector (EntityRow c)), IntMap Loc)
-buildArchAndLocsV rows =
-  let step _ (archAcc, locAcc) row =
-        insertRowArchLoc row archAcc locAcc
-      (archTmp, locs) = RV.ifoldl' step (IntMap.empty, IntMap.empty) rows
-      arch = finalizeArchRuns archTmp
-  in (arch, locs)
+-- | Fast replacement for row updates that preserve entity ids and row count.
+-- The location table remains valid and is intentionally reused.
+setEntityRowsVSameShape :: V.Vector (EntityRow c) -> World c -> World c
+setEntityRowsVSameShape rows w =
+  w
+    { rowsW = rows
+    , entityCountW = entityCountW w
+    }
 
-insertRowArchLoc
-  :: EntityRow c
-  -> IntMap (Int, [EntityRow c])
-  -> IntMap Loc
-  -> (IntMap (Int, [EntityRow c]), IntMap Loc)
-insertRowArchLoc row@(EntityRow eid' sig _) archAcc locAcc =
-  let key = archKey sig
-  in case IntMap.lookup key archAcc of
-      Nothing ->
-        let archAcc' = IntMap.insert key (1 :: Int, [row]) archAcc
-            locAcc' = locInsert eid' (Loc sig 0) locAcc
-        in (archAcc', locAcc')
-      Just (n, rs) ->
-        let archAcc' = IntMap.insert key (n + 1, row : rs) archAcc
-            locAcc' = locInsert eid' (Loc sig n) locAcc
-        in (archAcc', locAcc')
-
-finalizeArchRuns :: IntMap (Int, [EntityRow c]) -> IntMap (RV.Vector (EntityRow c))
-finalizeArchRuns =
-  IntMap.foldlWithKey'
-    (\archAcc key (_, rs) ->
-      IntMap.insert key (RV.fromList (reverse rs)) archAcc
+buildLocsV :: Int -> V.Vector (EntityRow c) -> (LocTable, Int)
+buildLocsV locLen0 rows =
+  V.ifoldl'
+    (\(locs, locLen) i (EntityRow eid' _ _) ->
+      locSetGrow eid' (Loc i) locs locLen
     )
-    IntMap.empty
+    (locInit locLen0, locLen0)
+    rows
 
 applyEntityRowUpdates :: [(Sig, Int, EntityRow c)] -> World c -> World c
 applyEntityRowUpdates updates w =
   case updates of
     [] -> w
     _ ->
-      let updatesBySig =
-            foldl'
-              (\acc (sig, idx, row) ->
-                IntMap.insertWith IntMap.union (archKey sig) (IntMap.singleton idx row) acc
-              )
-              IntMap.empty
-              updates
-          arch0 = archW w
-          locs0 = entityLocW w
-          (arch1, locs1, moved) =
-            IntMap.foldlWithKey'
-              (\(archAcc, locAcc, movedAcc) key updMap ->
-                let sig = sigFromKey key
-                in case IntMap.lookup key archAcc of
-                  Nothing -> (archAcc, locAcc, movedAcc)
-                  Just rows0 ->
-                    let anyMoved =
-                          IntMap.foldr
-                            (\(EntityRow _ newSig _) acc -> newSig /= sig || acc)
-                            False
-                            updMap
-                    in
-                      if not anyMoved
-                        then
-                          let rows' = RV.imap (\i row -> IntMap.findWithDefault row i updMap) rows0
-                              archAcc' = IntMap.insert key rows' archAcc
-                          in (archAcc', locAcc, movedAcc)
-                        else
-                          let step i (rowsAcc, movedRowsAcc) row =
-                                case IntMap.lookup i updMap of
-                                  Nothing -> (row : rowsAcc, movedRowsAcc)
-                                  Just row' ->
-                                    let EntityRow _ newSig _ = row'
-                                    in
-                                      if newSig == sig
-                                        then (row' : rowsAcc, movedRowsAcc)
-                                        else (rowsAcc, IntMap.insertWith (++) (archKey newSig) [row'] movedRowsAcc)
-                              (rowsRev, movedAcc') = RV.ifoldl' step ([], movedAcc) rows0
-                              rows' = RV.fromList (reverse rowsRev)
-                              archAcc' =
-                                if Foldable.null rows'
-                                  then IntMap.delete key archAcc
-                                  else IntMap.insert key rows' archAcc
-                              locAcc' = setLocsForRun locAcc sig rows'
-                          in (archAcc', locAcc', movedAcc')
-              )
-              (arch0, locs0, IntMap.empty)
-              updatesBySig
-          (arch2, locs2) =
-            IntMap.foldlWithKey'
-              (\(archAcc, locAcc) key rowsToAdd ->
-                let sig = sigFromKey key
-                    rows0 = IntMap.findWithDefault RV.empty key archAcc
-                    start = Foldable.length rows0
-                    rows1 = rows0 RV.>< RV.fromList rowsToAdd
-                    locAcc' =
-                      foldl'
-                        (\acc (i, EntityRow eid' _ _) ->
-                          locInsert eid' (Loc sig (start + i)) acc
-                        )
-                        locAcc
-                        (zip [0 ..] rowsToAdd)
-                in
-                  (IntMap.insert key rows1 archAcc, locAcc')
-              )
-              (arch1, locs1)
-              moved
-      in w
-          { archW = arch2
-          , entityLocW = locs2
-          }
+      let rows0 = rowsW w
+          stepOne rowsAcc (_, _, row@(EntityRow eid' _ _)) =
+            case locLookupWorld eid' w of
+              Nothing -> rowsAcc
+              Just (Loc idx) -> vecUpdate idx row rowsAcc
+          rows1 = foldl' stepOne rows0 updates
+      in setEntityRowsVSameShape rows1 w
 
--- | Replace whole archetype runs without touching the entity->loc table.
---
--- This is safe / only valid when:
--- - Every row in the run keeps the same archetype signature.
--- - Entity ordering and run lengths are unchanged (so indices remain valid).
---
--- It exists to support fast "update all rows in-place" style operations (e.g. program stepping)
--- without constructing per-row update lists.
-applyArchetypeRunUpdates :: [(Sig, RV.Vector (EntityRow c))] -> World c -> World c
+applyArchetypeRunUpdates :: [(Sig, V.Vector (EntityRow c))] -> World c -> World c
 applyArchetypeRunUpdates runs w =
   case runs of
     [] -> w
     _ ->
-      let arch1 =
+      let byEid =
             foldl'
-              (\archAcc (sig, rows) ->
-                IntMap.insert (archKey sig) rows archAcc
+              (\acc (_, rows) ->
+                Foldable.foldl'
+                  (\acc' row@(EntityRow eid' _ _) -> IntMap.insert eid' row acc')
+                  acc
+                  rows
               )
-              (archW w)
+              IntMap.empty
               runs
-      in w
-          { archW = arch1 }
+          rows1 =
+            V.map
+              (\row@(EntityRow eid' _ _) -> IntMap.findWithDefault row eid' byEid)
+              (rowsW w)
+      in setEntityRowsVSameShape rows1 w
 
-setLocsForRun :: IntMap Loc -> Sig -> RV.Vector (EntityRow c) -> IntMap Loc
-setLocsForRun locs sig =
-  RV.ifoldl'
-    (\i acc (EntityRow eid' _ _) -> locInsert eid' (Loc sig i) acc)
-    locs
-
-matchingArchetypes :: Sig -> Sig -> World c -> [(Sig, RV.Vector (EntityRow c))]
+matchingArchetypes :: Sig -> Sig -> World c -> [(Sig, V.Vector (EntityRow c))]
 matchingArchetypes req forb w =
-  IntMap.foldrWithKey'
-    (\key rows acc ->
-      let sig = sigFromKey key
-      in if (sig .&. req) == req && (sig .&. forb) == 0
-          then (sig, rows) : acc
-          else acc
-    )
-    []
-    (archW w)
+  let rows =
+        Foldable.foldr
+          (\row@(EntityRow _ sig _) acc ->
+            if (sig .&. req) == req && (sig .&. forb) == 0
+              then row : acc
+              else acc
+          )
+          []
+          (rowsW w)
+  in if null rows
+      then []
+      else [(0, V.fromList rows)]
 
 matchingIndices :: Sig -> Sig -> World c -> [Int]
 matchingIndices req forb w =
@@ -765,17 +705,15 @@ spawn a w =
       bag = bundle a
       sig = sigFromBag bag
       eid' = eid e
-      key = archKey sig
-      rows0 = IntMap.findWithDefault RV.empty (archKey sig) (archW w)
+      rows0 = rowsW w
       idx = Foldable.length rows0
-      rows' = rows0 RV.|> EntityRow eid' sig bag
-      arch' = IntMap.insert key rows' (archW w)
-      locs' = locInsert eid' (Loc sig idx) (entityLocW w)
+      rows' = V.snoc rows0 (EntityRow eid' sig bag)
+      locs' = locAppend (Loc idx) (entityLocW w)
       w' =
         w
           { nextIdW = nextIdW w + 1
           , entityCountW = entityCountW w + 1
-          , archW = arch'
+          , rowsW = rows'
           , entityLocW = locs'
           }
   in (e, w')
@@ -785,35 +723,29 @@ kill e w =
   let eid' = eid e
       out' = dropRelEntity eid' (relOutW w)
       in' = dropRelEntity eid' (relInW w)
-  in case IntMap.lookup eid' (entityLocW w) of
+  in case locLookupWorld eid' w of
       Nothing ->
         w { relOutW = out', relInW = in' }
-      Just (Loc sig idx) ->
-        let arch0 = archW w
-            key = archKey sig
-            rows0 = IntMap.findWithDefault RV.empty key arch0
+      Just (Loc idx) ->
+        let rows0 = rowsW w
             len = Foldable.length rows0
             lastIdx = len - 1
             rows1 =
               if idx == lastIdx
-                then RV.take lastIdx rows0
+                then V.take lastIdx rows0
                 else
-                  let rowLast = rows0 RV.! lastIdx
-                      rows' = RV.update idx rowLast rows0
-                  in RV.take lastIdx rows'
-            arch1 =
-              if Foldable.null rows1
-                then IntMap.delete key arch0
-                else IntMap.insert key rows1 arch0
+                  let rowLast = rows0 V.! lastIdx
+                      rows' = vecUpdate idx rowLast rows0
+                  in V.take lastIdx rows'
             locs1 =
               if idx == lastIdx
-                then locDelete eid' (entityLocW w)
+                then locDeleteKnown eid' (entityLocW w)
                 else
-                  let EntityRow eidLast _ _ = rows0 RV.! lastIdx
-                      acc1 = locDelete eid' (entityLocW w)
-                  in locInsert eidLast (Loc sig idx) acc1
+                  let EntityRow eidLast _ _ = rows0 V.! lastIdx
+                      acc1 = locDeleteKnown eid' (entityLocW w)
+                  in locInsertKnown eidLast (Loc idx) acc1
         in w
-            { archW = arch1
+            { rowsW = rows1
             , entityLocW = locs1
             , entityCountW = entityCountW w - 1
             , relOutW = out'
@@ -884,6 +816,10 @@ bagGetByUnsafe2 bitA bitB (Bag mask vals steps) =
                 Just slot -> stepVal slot
                 Nothing -> unsafeStatic bitIx
         in (unsafeCoerce (getAny bitA), unsafeCoerce (getAny bitB))
+
+bagGetByAny2 :: Int -> Int -> Bag c -> (Any, Any)
+{-# INLINE bagGetByAny2 #-}
+bagGetByAny2 bitA bitB bag = bagGetByUnsafe2 @Any @Any bitA bitB bag
 
 bagGetByUnsafe3 :: forall a b d c. Int -> Int -> Int -> Bag c -> (a, b, d)
 {-# INLINE bagGetByUnsafe3 #-}
@@ -1058,16 +994,102 @@ bagSetDirect a bag =
       vAny = unsafeCoerce a
   in bagSetByAny bitIx vAny bag
 
+bagSet2DirectForSig :: forall c a b.
+  (Component c a, ComponentBit c a, Component c b, ComponentBit c b)
+  => Sig
+  -> a -> b -> Bag c -> Bag c
+{-# INLINE bagSet2DirectForSig #-}
+bagSet2DirectForSig sig =
+  let bitA = componentBitOf @c @a
+      bitB = componentBitOf @c @b
+  in
+    if bitA == bitB || not (maskHas sig bitA) || not (maskHas sig bitB)
+      then bagSet2Direct @c @a @b
+      else
+        let idxA = staticIndex sig bitA
+            idxB = staticIndex sig bitB
+        in \a b bag0@(Bag staticMask vals steps) ->
+            if stepsNull steps && staticMask == sig
+              then
+                let vA = unsafeCoerce a
+                    vB = unsafeCoerce b
+                    oldA = V.unsafeIndex vals idxA
+                    oldB = V.unsafeIndex vals idxB
+                in
+                  if ptrEq oldA vA && ptrEq oldB vB
+                    then bag0
+                    else
+                      let vals' =
+                            V.modify
+                              (\mv -> do
+                                if ptrEq oldA vA then pure () else MV.unsafeWrite mv idxA vA
+                                if ptrEq oldB vB then pure () else MV.unsafeWrite mv idxB vB
+                              )
+                              vals
+                      in Bag staticMask vals' steps
+              else bagSet2Direct @c @a @b a b bag0
+
+bagSet2ByAnyForSig :: Sig -> Int -> Int -> Any -> Any -> Bag c -> Bag c
+{-# INLINE bagSet2ByAnyForSig #-}
+bagSet2ByAnyForSig sig bitA bitB vA vB =
+  if bitA == bitB || not (maskHas sig bitA) || not (maskHas sig bitB)
+    then bagSetByAny bitB vB . bagSetByAny bitA vA
+    else
+      let idxA = staticIndex sig bitA
+          idxB = staticIndex sig bitB
+      in \bag0@(Bag staticMask vals steps) ->
+          if stepsNull steps && staticMask == sig
+            then
+              let oldA = V.unsafeIndex vals idxA
+                  oldB = V.unsafeIndex vals idxB
+              in
+                if ptrEq oldA vA && ptrEq oldB vB
+                  then bag0
+                  else
+                    let vals' =
+                          V.modify
+                            (\mv -> do
+                              if ptrEq oldA vA then pure () else MV.unsafeWrite mv idxA vA
+                              if ptrEq oldB vB then pure () else MV.unsafeWrite mv idxB vB
+                            )
+                            vals
+                    in Bag staticMask vals' steps
+            else
+              bagSetByAny bitB vB (bagSetByAny bitA vA bag0)
+
 bagSet2Direct :: forall c a b.
   (Component c a, ComponentBit c a, Component c b, ComponentBit c b)
   => a -> b -> Bag c -> Bag c
 {-# INLINE bagSet2Direct #-}
-bagSet2Direct a b bag0 =
+bagSet2Direct a b bag0@(Bag mask vals steps) =
   let bitA = componentBitOf @c @a
       bitB = componentBitOf @c @b
       vA = unsafeCoerce a
       vB = unsafeCoerce b
-  in bagSetByAny bitB vB (bagSetByAny bitA vA bag0)
+      fallback = bagSetByAny bitB vB (bagSetByAny bitA vA bag0)
+  in
+    if bitA == bitB
+      then bagSetByAny bitB vB bag0
+      else
+        if not (stepsNull steps) || not (maskHas mask bitA) || not (maskHas mask bitB)
+          then fallback
+          else
+            let iA = staticIndex mask bitA
+                iB = staticIndex mask bitB
+                oldA = V.unsafeIndex vals iA
+                oldB = V.unsafeIndex vals iB
+            in
+              if ptrEq oldA vA && ptrEq oldB vB
+                then bag0
+                else
+                  let vals' =
+                        V.modify
+                          (\mv -> do
+                            if ptrEq oldA vA then pure () else MV.unsafeWrite mv iA vA
+                            if ptrEq oldB vB then pure () else MV.unsafeWrite mv iB vB
+                          )
+                          vals
+                  in Bag mask vals' steps
 
 bagSet3Direct :: forall c a b d.
   (Component c a, ComponentBit c a
@@ -1075,14 +1097,41 @@ bagSet3Direct :: forall c a b d.
   , Component c d, ComponentBit c d
   ) => a -> b -> d -> Bag c -> Bag c
 {-# INLINE bagSet3Direct #-}
-bagSet3Direct a b d bag0 =
+bagSet3Direct a b d bag0@(Bag mask vals steps) =
   let bitA = componentBitOf @c @a
       bitB = componentBitOf @c @b
       bitD = componentBitOf @c @d
       vA = unsafeCoerce a
       vB = unsafeCoerce b
       vD = unsafeCoerce d
-  in bagSetByAny bitD vD (bagSetByAny bitB vB (bagSetByAny bitA vA bag0))
+      fallback = bagSetByAny bitD vD (bagSetByAny bitB vB (bagSetByAny bitA vA bag0))
+      distinct = bitA /= bitB && bitA /= bitD && bitB /= bitD
+  in
+    if not distinct
+      then fallback
+      else
+        if not (stepsNull steps) || not (maskHas mask bitA) || not (maskHas mask bitB) || not (maskHas mask bitD)
+          then fallback
+          else
+            let iA = staticIndex mask bitA
+                iB = staticIndex mask bitB
+                iD = staticIndex mask bitD
+                oldA = V.unsafeIndex vals iA
+                oldB = V.unsafeIndex vals iB
+                oldD = V.unsafeIndex vals iD
+            in
+              if ptrEq oldA vA && ptrEq oldB vB && ptrEq oldD vD
+                then bag0
+                else
+                  let vals' =
+                        V.modify
+                          (\mv -> do
+                            if ptrEq oldA vA then pure () else MV.unsafeWrite mv iA vA
+                            if ptrEq oldB vB then pure () else MV.unsafeWrite mv iB vB
+                            if ptrEq oldD vD then pure () else MV.unsafeWrite mv iD vD
+                          )
+                          vals
+                  in Bag mask vals' steps
 
 bagSetStepDirect :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> Bag c -> Bag c
 bagSetStepDirect s0 bag =
@@ -1130,79 +1179,28 @@ updateEntityBag :: (Bag c -> Bag c) -> Entity -> World c -> World c
 {-# INLINE updateEntityBag #-}
 updateEntityBag updateBag e w =
   let eid' = eid e
-  in case IntMap.lookup eid' (entityLocW w) of
+  in case locLookupWorld eid' w of
       Nothing -> w
-      Just (Loc sig idx) ->
-        case IntMap.lookup (archKey sig) (archW w) of
-          Nothing -> w
-          Just rows ->
-            let EntityRow _ oldSig bag = rows RV.! idx
-                bag' = updateBag bag
-                sig' = sigFromBag bag'
-                row' = EntityRow eid' sig' bag'
-            in if sig' == oldSig
-                then
-                  let rows' = RV.update idx row' rows
-                      arch' = IntMap.insert (archKey sig) rows' (archW w)
-                  in w { archW = arch' }
-                else
-                  let (arch1, locs1) = removeFromRun sig idx (archW w) (entityLocW w)
-                      (arch2, locs2) = appendToRun sig' row' arch1 locs1
-                  in w
-                      { archW = arch2
-                      , entityLocW = locs2
-                      }
+      Just (Loc idx) ->
+        let rows = rowsW w
+            EntityRow _ _ bag = rows V.! idx
+            bag' = updateBag bag
+            sig' = sigFromBag bag'
+            row' = EntityRow eid' sig' bag'
+            rows' = vecUpdate idx row' rows
+        in w { rowsW = rows' }
 
 has :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> Bool
 has e w = isJust (get @a e w)
 
 lookupRow :: Int -> World c -> Maybe (Sig, Bag c)
 lookupRow eid' w =
-  case IntMap.lookup eid' (entityLocW w) of
+  case locLookupWorld eid' w of
     Nothing -> Nothing
-    Just (Loc sig idx) ->
-      case IntMap.lookup (archKey sig) (archW w) of
-        Nothing -> Nothing
-        Just rows ->
-          let EntityRow _ sig' bag = rows RV.! idx
-          in Just (sig', bag)
-
-removeFromRun :: Sig -> Int -> IntMap (RV.Vector (EntityRow c)) -> IntMap Loc
-              -> (IntMap (RV.Vector (EntityRow c)), IntMap Loc)
-removeFromRun sig idx arch0 locs0 =
-  let key = archKey sig
-      rows0 = IntMap.findWithDefault RV.empty key arch0
-      len = Foldable.length rows0
-      lastIdx = len - 1
-      rows1 =
-        if idx == lastIdx
-          then RV.take lastIdx rows0
-          else
-            let rowLast = rows0 RV.! lastIdx
-                rows' = RV.update idx rowLast rows0
-            in RV.take lastIdx rows'
-      arch1 =
-        if Foldable.null rows1
-          then IntMap.delete key arch0
-          else IntMap.insert key rows1 arch0
-      locs1 =
-        if idx == lastIdx
-          then locs0
-          else
-            let EntityRow eidLast _ _ = rows0 RV.! lastIdx
-            in locInsert eidLast (Loc sig idx) locs0
-  in (arch1, locs1)
-
-appendToRun :: Sig -> EntityRow c -> IntMap (RV.Vector (EntityRow c)) -> IntMap Loc
-            -> (IntMap (RV.Vector (EntityRow c)), IntMap Loc)
-appendToRun sig row@(EntityRow eid' _ _) arch0 locs0 =
-  let key = archKey sig
-      rows0 = IntMap.findWithDefault RV.empty key arch0
-      idx = Foldable.length rows0
-      rows1 = rows0 RV.|> row
-      arch1 = IntMap.insert key rows1 arch0
-      locs1 = locInsert eid' (Loc sig idx) locs0
-  in (arch1, locs1)
+    Just (Loc idx) ->
+      let rows = rowsW w
+          EntityRow _ sig' bag = rows V.! idx
+      in Just (sig', bag)
 
 data QueryInfo = QueryInfo
   { requireQ :: Sig
@@ -1278,12 +1276,11 @@ runq q w =
         case runQuery q (Entity eid') bag of
           Nothing -> acc
           Just a -> (Entity eid', a) : acc
-      stepRun key rows acc =
-        let sig = sigFromKey key
-        in if (sig .&. req) == req && (sig .&. forb) == 0
-            then Foldable.foldr stepRow acc rows
-            else acc
-  in IntMap.foldrWithKey' stepRun [] (archW w)
+      stepRun (EntityRow eid' sig bag) acc =
+        if (sig .&. req) == req && (sig .&. forb) == 0
+          then stepRow (EntityRow eid' sig bag) acc
+          else acc
+  in Foldable.foldr stepRun [] (rowsW w)
 
 foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
@@ -1294,12 +1291,11 @@ foldq q step s0 w =
         case runQuery q (Entity eid') bag of
           Nothing -> acc
           Just a -> step (Entity eid') a acc
-      stepRun acc key rows =
-        let sig = sigFromKey key
-        in if (sig .&. req) == req && (sig .&. forb) == 0
-            then Foldable.foldl' stepRow acc rows
-            else acc
-  in IntMap.foldlWithKey' stepRun s0 (archW w)
+      stepRun acc (EntityRow eid' sig bag) =
+        if (sig .&. req) == req && (sig .&. forb) == 0
+          then stepRow acc (EntityRow eid' sig bag)
+          else acc
+  in Foldable.foldl' stepRun s0 (rowsW w)
 
 filterQ :: (a -> Bool) -> Query c a -> Query c a
 filterQ f (Query q qi) =
@@ -1544,7 +1540,13 @@ stepWorld d w =
         if stepsNull (bagSteps bag)
           then EntityRow eid' sig bag
           else EntityRow eid' sig (stepBag d bag)
-  in w { archW = IntMap.map (RV.map stepRow) (archW w) }
+  in w { rowsW = V.map stepRow (rowsW w) }
+
+worldHasSteps :: World c -> Bool
+worldHasSteps w =
+  Foldable.any
+    (\(EntityRow _ _ bag) -> not (stepsNull (bagSteps bag)))
+    (rowsW w)
 
 stepBag :: F.DTime -> Bag c -> Bag c
 stepBag d bag = bag { bagSteps = stepsStepAll d (bagSteps bag) }
