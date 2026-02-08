@@ -12,6 +12,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE OverlappingInstances #-}
 
 module Engine.Data.ECS
   ( Entity(..)
@@ -153,7 +154,7 @@ newtype Steps = Steps
 
 data Bag c = Bag
   { bagStaticMask :: !Sig
-  , bagStaticVals :: !(V.Vector Any)
+  , bagStaticVals :: !(V.Vector c)
   , bagSteps :: !Steps
   }
 
@@ -172,14 +173,14 @@ data EntityRow c = EntityRow
   {-# UNPACK #-} !Sig
   !(Bag c)
 
-data BagOp
-  = BagOpSet !Int !Any
+data BagOp c
+  = BagOpSet !Int !c
   | BagOpSetStep !Int !StepSlot
-  | BagOpUpdate !Int (Any -> Any)
+  | BagOpUpdate !Int (c -> c)
   | BagOpDel !Int
 
 newtype BagEdit c = BagEdit
-  { bagEditOps :: [BagOp]
+  { bagEditOps :: [BagOp c]
   }
 
 instance Semigroup (BagEdit c) where
@@ -237,44 +238,44 @@ staticIndex :: Sig -> Int -> Int
 {-# INLINE staticIndex #-}
 staticIndex mask bitIx = popCount (mask .&. lowerBitsMask bitIx)
 
-vectorInsertAt :: Int -> Any -> V.Vector Any -> V.Vector Any
+vectorInsertAt :: Int -> c -> V.Vector c -> V.Vector c
 {-# INLINE vectorInsertAt #-}
 vectorInsertAt i x vec =
   let (l, r) = V.splitAt i vec
   in l V.++ V.singleton x V.++ r
 
-vectorDeleteAt :: Int -> V.Vector Any -> V.Vector Any
+vectorDeleteAt :: Int -> V.Vector c -> V.Vector c
 {-# INLINE vectorDeleteAt #-}
 vectorDeleteAt i vec =
   let (l, r0) = V.splitAt i vec
       r = V.drop 1 r0
   in l V.++ r
 
-staticLookup :: Sig -> V.Vector Any -> Int -> Maybe Any
+staticLookup :: Sig -> V.Vector c -> Int -> Maybe c
 {-# INLINE staticLookup #-}
 staticLookup mask vals bitIx =
   if maskHas mask bitIx
     then Just (V.unsafeIndex vals (staticIndex mask bitIx))
     else Nothing
 
-staticSetAny :: Sig -> V.Vector Any -> Int -> Any -> (Sig, V.Vector Any)
-{-# INLINE staticSetAny #-}
-staticSetAny mask vals bitIx vAny =
+staticSet :: Sig -> V.Vector c -> Int -> c -> (Sig, V.Vector c)
+{-# INLINE staticSet #-}
+staticSet mask vals bitIx v =
   if maskHas mask bitIx
     then
       let i = staticIndex mask bitIx
           old = V.unsafeIndex vals i
-      in if ptrEq old vAny
+      in if ptrEq (unsafeCoerce old) (unsafeCoerce v)
           then (mask, vals)
-          else (mask, vals V.// [(i, vAny)])
+          else (mask, vals V.// [(i, v)])
     else
       let i = staticIndex mask bitIx
           mask' = mask .|. bit bitIx
-      in (mask', vectorInsertAt i vAny vals)
+      in (mask', vectorInsertAt i v vals)
 
-staticDelAny :: Sig -> V.Vector Any -> Int -> (Sig, V.Vector Any)
-{-# INLINE staticDelAny #-}
-staticDelAny mask vals bitIx =
+staticDel :: Sig -> V.Vector c -> Int -> (Sig, V.Vector c)
+{-# INLINE staticDel #-}
+staticDel mask vals bitIx =
   if maskHas mask bitIx
     then
       let i = staticIndex mask bitIx
@@ -282,7 +283,7 @@ staticDelAny mask vals bitIx =
       in (mask', vectorDeleteAt i vals)
     else (mask, vals)
 
-mergeStatic :: Sig -> V.Vector Any -> Sig -> V.Vector Any -> (Sig, V.Vector Any)
+mergeStatic :: Sig -> V.Vector c -> Sig -> V.Vector c -> (Sig, V.Vector c)
 mergeStatic mask0 vals0 maskExtra valsExtra =
   let go !mask !vals !i !sigBits =
         if sigBits == 0
@@ -290,8 +291,8 @@ mergeStatic mask0 vals0 maskExtra valsExtra =
           else
             let bitIx = countTrailingZeros sigBits
                 sigBits' = sigBits .&. (sigBits - 1)
-                vAny = V.unsafeIndex valsExtra i
-                (mask', vals') = staticSetAny mask vals bitIx vAny
+                v = V.unsafeIndex valsExtra i
+                (mask', vals') = staticSet mask vals bitIx v
             in go mask' vals' (i + 1) sigBits'
   in go mask0 vals0 0 maskExtra
 
@@ -780,72 +781,53 @@ runQuerySig q sig e bag =
 keyOfType :: forall c a. (Component c a, ComponentBit c a) => Key c
 keyOfType = Key (componentBitOf @c @a)
 
-bagGetBy :: Int -> Bag c -> Maybe Any
-bagGetBy bitIx (Bag mask vals steps) =
+bagGetByTyped :: forall a c. (Component c a) => Int -> Bag c -> Maybe a
+bagGetByTyped bitIx (Bag mask vals steps) =
   if stepsNull steps
-    then staticLookup mask vals bitIx
+    then
+      case staticLookup mask vals bitIx of
+        Nothing -> Nothing
+        Just v -> prj v
     else
       case stepsLookup bitIx steps of
-        Just slot -> Just (stepVal slot)
-        Nothing -> staticLookup mask vals bitIx
+        Just slot -> Just (unsafeCoerce (stepVal slot))
+        Nothing ->
+          case staticLookup mask vals bitIx of
+            Nothing -> Nothing
+            Just v -> prj v
 
-bagGetByTyped :: forall a c. Int -> Bag c -> Maybe a
-bagGetByTyped bitIx bag = unsafeCoerce <$> bagGetBy bitIx bag
-
-bagGetByUnsafe :: forall a c. Int -> Bag c -> a
+bagGetByUnsafe :: forall a c. (Component c a) => Int -> Bag c -> a
 bagGetByUnsafe bitIx bag =
-  case bagGetBy bitIx bag of
-    Just v -> unsafeCoerce v
+  case bagGetByTyped @a bitIx bag of
+    Just v -> v
     Nothing -> error "bagGetByUnsafe: missing component (signature mismatch?)"
 
-bagGetByUnsafe2 :: forall a b c. Int -> Int -> Bag c -> (a, b)
+bagGetByUnsafe2 :: forall a b c. (Component c a, Component c b) => Int -> Int -> Bag c -> (a, b)
 {-# INLINE bagGetByUnsafe2 #-}
-bagGetByUnsafe2 bitA bitB (Bag mask vals steps) =
-  let unsafeStatic bitIx =
-        case staticLookup mask vals bitIx of
-          Just v -> v
-          Nothing -> error "bagGetByUnsafe2: missing component (signature mismatch?)"
-  in if stepsNull steps
-      then
-        ( unsafeCoerce (unsafeStatic bitA)
-        , unsafeCoerce (unsafeStatic bitB)
-        )
-      else
-        let getAny bitIx =
-              case stepsLookup bitIx steps of
-                Just slot -> stepVal slot
-                Nothing -> unsafeStatic bitIx
-        in (unsafeCoerce (getAny bitA), unsafeCoerce (getAny bitB))
+bagGetByUnsafe2 bitA bitB bag =
+  (bagGetByUnsafe @a bitA bag, bagGetByUnsafe @b bitB bag)
 
 bagGetByAny2 :: Int -> Int -> Bag c -> (Any, Any)
 {-# INLINE bagGetByAny2 #-}
-bagGetByAny2 bitA bitB bag = bagGetByUnsafe2 @Any @Any bitA bitB bag
+bagGetByAny2 bitA bitB (Bag mask vals steps) =
+  let getAny bitIx =
+        case stepsLookup bitIx steps of
+          Just slot -> stepVal slot
+          Nothing ->
+            case staticLookup mask vals bitIx of
+              Just v -> unsafeCoerce v
+              Nothing -> error "bagGetByAny2: missing component (signature mismatch?)"
+  in (getAny bitA, getAny bitB)
 
-bagGetByUnsafe3 :: forall a b d c. Int -> Int -> Int -> Bag c -> (a, b, d)
+bagGetByUnsafe3 :: forall a b d c. (Component c a, Component c b, Component c d) => Int -> Int -> Int -> Bag c -> (a, b, d)
 {-# INLINE bagGetByUnsafe3 #-}
-bagGetByUnsafe3 bitA bitB bitD (Bag mask vals steps) =
-  let unsafeStatic bitIx =
-        case staticLookup mask vals bitIx of
-          Just v -> v
-          Nothing -> error "bagGetByUnsafe3: missing component (signature mismatch?)"
-  in if stepsNull steps
-      then
-        ( unsafeCoerce (unsafeStatic bitA)
-        , unsafeCoerce (unsafeStatic bitB)
-        , unsafeCoerce (unsafeStatic bitD)
-        )
-      else
-        let getAny bitIx =
-              case stepsLookup bitIx steps of
-                Just slot -> stepVal slot
-                Nothing -> unsafeStatic bitIx
-        in
-          ( unsafeCoerce (getAny bitA)
-          , unsafeCoerce (getAny bitB)
-          , unsafeCoerce (getAny bitD)
-          )
+bagGetByUnsafe3 bitA bitB bitD bag =
+  ( bagGetByUnsafe @a bitA bag
+  , bagGetByUnsafe @b bitB bag
+  , bagGetByUnsafe @d bitD bag
+  )
 
-planRunForSig1 :: forall a c. Int -> Sig -> Bag c -> a
+planRunForSig1 :: forall a c. (Component c a) => Int -> Sig -> Bag c -> a
 {-# INLINE planRunForSig1 #-}
 planRunForSig1 bitA sig =
   if maskHas sig bitA
@@ -853,11 +835,14 @@ planRunForSig1 bitA sig =
       let idxA = staticIndex sig bitA
       in \bag@(Bag staticMask vals steps) ->
           if stepsNull steps && staticMask == sig
-            then unsafeCoerce (V.unsafeIndex vals idxA)
+            then
+              case prj (V.unsafeIndex vals idxA) of
+                Just v -> v
+                Nothing -> error "planRunForSig1: missing component (signature mismatch?)"
             else bagGetByUnsafe bitA bag
     else bagGetByUnsafe bitA
 
-planRunForSig2 :: forall a b c. Int -> Int -> Sig -> Bag c -> (a, b)
+planRunForSig2 :: forall a b c. (Component c a, Component c b) => Int -> Int -> Sig -> Bag c -> (a, b)
 {-# INLINE planRunForSig2 #-}
 planRunForSig2 bitA bitB sig =
   if maskHas sig bitA && maskHas sig bitB
@@ -867,13 +852,17 @@ planRunForSig2 bitA bitB sig =
       in \bag@(Bag staticMask vals steps) ->
           if stepsNull steps && staticMask == sig
             then
-              ( unsafeCoerce (V.unsafeIndex vals idxA)
-              , unsafeCoerce (V.unsafeIndex vals idxB)
+              ( case prj (V.unsafeIndex vals idxA) of
+                  Just v -> v
+                  Nothing -> error "planRunForSig2: missing component (signature mismatch?)"
+              , case prj (V.unsafeIndex vals idxB) of
+                  Just v -> v
+                  Nothing -> error "planRunForSig2: missing component (signature mismatch?)"
               )
             else bagGetByUnsafe2 bitA bitB bag
     else bagGetByUnsafe2 bitA bitB
 
-planRunForSig3 :: forall a b d c. Int -> Int -> Int -> Sig -> Bag c -> (a, b, d)
+planRunForSig3 :: forall a b d c. (Component c a, Component c b, Component c d) => Int -> Int -> Int -> Sig -> Bag c -> (a, b, d)
 {-# INLINE planRunForSig3 #-}
 planRunForSig3 bitA bitB bitD sig =
   if maskHas sig bitA && maskHas sig bitB && maskHas sig bitD
@@ -884,9 +873,15 @@ planRunForSig3 bitA bitB bitD sig =
       in \bag@(Bag staticMask vals steps) ->
           if stepsNull steps && staticMask == sig
             then
-              ( unsafeCoerce (V.unsafeIndex vals idxA)
-              , unsafeCoerce (V.unsafeIndex vals idxB)
-              , unsafeCoerce (V.unsafeIndex vals idxD)
+              ( case prj (V.unsafeIndex vals idxA) of
+                  Just v -> v
+                  Nothing -> error "planRunForSig3: missing component (signature mismatch?)"
+              , case prj (V.unsafeIndex vals idxB) of
+                  Just v -> v
+                  Nothing -> error "planRunForSig3: missing component (signature mismatch?)"
+              , case prj (V.unsafeIndex vals idxD) of
+                  Just v -> v
+                  Nothing -> error "planRunForSig3: missing component (signature mismatch?)"
               )
             else bagGetByUnsafe3 bitA bitB bitD bag
     else bagGetByUnsafe3 bitA bitB bitD
@@ -897,60 +892,60 @@ bagGet = bagGetByTyped (componentBitOf @c @a)
 ptrEq :: Any -> Any -> Bool
 ptrEq a b = isTrue# (reallyUnsafePtrEquality# a b)
 
-bagSetByAny :: Int -> Any -> Bag c -> Bag c
-{-# INLINE bagSetByAny #-}
-bagSetByAny bitIx vAny (Bag mask vals steps) =
+bagSetBy :: Int -> c -> Bag c -> Bag c
+{-# INLINE bagSetBy #-}
+bagSetBy bitIx v (Bag mask vals steps) =
   case stepsLookup bitIx steps of
     Just (StepSlot vOld sAny) ->
       let steps' =
-            if ptrEq vOld vAny
+            if ptrEq vOld (unsafeCoerce v)
               then steps
-              else stepsInsert bitIx (StepSlot vAny sAny) steps
-          (mask', vals') = staticDelAny mask vals bitIx
+              else stepsInsert bitIx (StepSlot (unsafeCoerce v) sAny) steps
+          (mask', vals') = staticDel mask vals bitIx
       in Bag mask' vals' steps'
     Nothing ->
-      let (mask', vals') = staticSetAny mask vals bitIx vAny
+      let (mask', vals') = staticSet mask vals bitIx v
       in Bag mask' vals' steps
 
 bagSetStepSlotBy :: Int -> StepSlot -> Bag c -> Bag c
 {-# INLINE bagSetStepSlotBy #-}
 bagSetStepSlotBy bitIx slot (Bag mask vals steps) =
   let steps' = stepsInsert bitIx slot steps
-      (mask', vals') = staticDelAny mask vals bitIx
+      (mask', vals') = staticDel mask vals bitIx
   in Bag mask' vals' steps'
 
-bagUpdateByAny :: Int -> (Any -> Any) -> Bag c -> Bag c
-{-# INLINE bagUpdateByAny #-}
-bagUpdateByAny bitIx fAny (Bag mask vals steps) =
+bagUpdateBy :: Int -> (c -> c) -> Bag c -> Bag c
+{-# INLINE bagUpdateBy #-}
+bagUpdateBy bitIx f (Bag mask vals steps) =
   case stepsLookup bitIx steps of
     Just (StepSlot vAny sAny) ->
-      let vAny' = fAny vAny
+      let vAny' = unsafeCoerce (f (unsafeCoerce vAny))
       in if ptrEq vAny vAny'
           then Bag mask vals steps
           else Bag mask vals (stepsInsert bitIx (StepSlot vAny' sAny) steps)
     Nothing ->
       case staticLookup mask vals bitIx of
         Nothing -> Bag mask vals steps
-        Just vAny ->
-          let vAny' = fAny vAny
-          in if ptrEq vAny vAny'
+        Just v ->
+          let v' = f v
+          in if ptrEq (unsafeCoerce v) (unsafeCoerce v')
               then Bag mask vals steps
               else
-                let (mask', vals') = staticSetAny mask vals bitIx vAny'
+                let (mask', vals') = staticSet mask vals bitIx v'
                 in Bag mask' vals' steps
 
 bagDelByBit :: Int -> Bag c -> Bag c
 {-# INLINE bagDelByBit #-}
 bagDelByBit bitIx (Bag mask vals steps) =
   let steps' = stepsDelete bitIx steps
-      (mask', vals') = staticDelAny mask vals bitIx
+      (mask', vals') = staticDel mask vals bitIx
   in Bag mask' vals' steps'
 
 bagEditSet :: forall c a. (Component c a, ComponentBit c a) => a -> BagEdit c
 bagEditSet a =
   let bitIx = componentBitOf @c @a
-      vAny = unsafeCoerce a
-  in BagEdit [BagOpSet bitIx vAny]
+      vC = inj a
+  in BagEdit [BagOpSet bitIx vC]
 
 bagEditSetStep :: forall c a. (Component c a, ComponentBit c a) => F.Step () a -> BagEdit c
 bagEditSetStep s0 =
@@ -963,8 +958,11 @@ bagEditSetStep s0 =
 bagEditUpdate :: forall c a. (Component c a, ComponentBit c a) => (a -> a) -> BagEdit c
 bagEditUpdate f =
   let bitIx = componentBitOf @c @a
-      fAny v = unsafeCoerce (f (unsafeCoerce v))
-  in BagEdit [BagOpUpdate bitIx fAny]
+      fC c =
+        case prj c of
+          Just a -> inj (f a)
+          Nothing -> c
+  in BagEdit [BagOpUpdate bitIx fC]
 
 bagEditDel :: forall c a. (Component c a, ComponentBit c a) => BagEdit c
 bagEditDel =
@@ -976,9 +974,9 @@ bagApplyEdit edit bag0 =
   foldl'
     (\bag op ->
       case op of
-        BagOpSet bitIx vAny -> bagSetByAny bitIx vAny bag
+        BagOpSet bitIx v -> bagSetBy bitIx v bag
         BagOpSetStep bitIx slot -> bagSetStepSlotBy bitIx slot bag
-        BagOpUpdate bitIx fAny -> bagUpdateByAny bitIx fAny bag
+        BagOpUpdate bitIx f -> bagUpdateBy bitIx f bag
         BagOpDel bitIx -> bagDelByBit bitIx bag
     )
     bag0
@@ -991,8 +989,8 @@ bagSetDirect :: forall c a. (Component c a, ComponentBit c a) => a -> Bag c -> B
 {-# INLINE bagSetDirect #-}
 bagSetDirect a bag =
   let bitIx = componentBitOf @c @a
-      vAny = unsafeCoerce a
-  in bagSetByAny bitIx vAny bag
+      vC = inj a
+  in bagSetBy bitIx vC bag
 
 bagSet2DirectForSig :: forall c a b.
   (Component c a, ComponentBit c a, Component c b, ComponentBit c b)
@@ -1011,19 +1009,19 @@ bagSet2DirectForSig sig =
         in \a b bag0@(Bag staticMask vals steps) ->
             if stepsNull steps && staticMask == sig
               then
-                let vA = unsafeCoerce a
-                    vB = unsafeCoerce b
+                let vA = inj a
+                    vB = inj b
                     oldA = V.unsafeIndex vals idxA
                     oldB = V.unsafeIndex vals idxB
                 in
-                  if ptrEq oldA vA && ptrEq oldB vB
+                  if ptrEq (unsafeCoerce oldA) (unsafeCoerce vA) && ptrEq (unsafeCoerce oldB) (unsafeCoerce vB)
                     then bag0
                     else
                       let vals' =
                             V.modify
                               (\mv -> do
-                                if ptrEq oldA vA then pure () else MV.unsafeWrite mv idxA vA
-                                if ptrEq oldB vB then pure () else MV.unsafeWrite mv idxB vB
+                                if ptrEq (unsafeCoerce oldA) (unsafeCoerce vA) then pure () else MV.unsafeWrite mv idxA vA
+                                if ptrEq (unsafeCoerce oldB) (unsafeCoerce vB) then pure () else MV.unsafeWrite mv idxB vB
                               )
                               vals
                       in Bag staticMask vals' steps
@@ -1033,29 +1031,34 @@ bagSet2ByAnyForSig :: Sig -> Int -> Int -> Any -> Any -> Bag c -> Bag c
 {-# INLINE bagSet2ByAnyForSig #-}
 bagSet2ByAnyForSig sig bitA bitB vA vB =
   if bitA == bitB || not (maskHas sig bitA) || not (maskHas sig bitB)
-    then bagSetByAny bitB vB . bagSetByAny bitA vA
+    then
+      let cA = unsafeCoerce vA
+          cB = unsafeCoerce vB
+      in bagSetBy bitB cB . bagSetBy bitA cA
     else
       let idxA = staticIndex sig bitA
           idxB = staticIndex sig bitB
+          cA = unsafeCoerce vA
+          cB = unsafeCoerce vB
       in \bag0@(Bag staticMask vals steps) ->
           if stepsNull steps && staticMask == sig
             then
               let oldA = V.unsafeIndex vals idxA
                   oldB = V.unsafeIndex vals idxB
               in
-                if ptrEq oldA vA && ptrEq oldB vB
+                if ptrEq (unsafeCoerce oldA) (unsafeCoerce cA) && ptrEq (unsafeCoerce oldB) (unsafeCoerce cB)
                   then bag0
                   else
                     let vals' =
                           V.modify
                             (\mv -> do
-                              if ptrEq oldA vA then pure () else MV.unsafeWrite mv idxA vA
-                              if ptrEq oldB vB then pure () else MV.unsafeWrite mv idxB vB
+                              if ptrEq (unsafeCoerce oldA) (unsafeCoerce cA) then pure () else MV.unsafeWrite mv idxA cA
+                              if ptrEq (unsafeCoerce oldB) (unsafeCoerce cB) then pure () else MV.unsafeWrite mv idxB cB
                             )
                             vals
                     in Bag staticMask vals' steps
             else
-              bagSetByAny bitB vB (bagSetByAny bitA vA bag0)
+              bagSetBy bitB cB (bagSetBy bitA cA bag0)
 
 bagSet2Direct :: forall c a b.
   (Component c a, ComponentBit c a, Component c b, ComponentBit c b)
@@ -1064,12 +1067,12 @@ bagSet2Direct :: forall c a b.
 bagSet2Direct a b bag0@(Bag mask vals steps) =
   let bitA = componentBitOf @c @a
       bitB = componentBitOf @c @b
-      vA = unsafeCoerce a
-      vB = unsafeCoerce b
-      fallback = bagSetByAny bitB vB (bagSetByAny bitA vA bag0)
+      vA = inj a
+      vB = inj b
+      fallback = bagSetBy bitB vB (bagSetBy bitA vA bag0)
   in
     if bitA == bitB
-      then bagSetByAny bitB vB bag0
+      then bagSetBy bitB vB bag0
       else
         if not (stepsNull steps) || not (maskHas mask bitA) || not (maskHas mask bitB)
           then fallback
@@ -1079,14 +1082,14 @@ bagSet2Direct a b bag0@(Bag mask vals steps) =
                 oldA = V.unsafeIndex vals iA
                 oldB = V.unsafeIndex vals iB
             in
-              if ptrEq oldA vA && ptrEq oldB vB
+              if ptrEq (unsafeCoerce oldA) (unsafeCoerce vA) && ptrEq (unsafeCoerce oldB) (unsafeCoerce vB)
                 then bag0
                 else
                   let vals' =
                         V.modify
                           (\mv -> do
-                            if ptrEq oldA vA then pure () else MV.unsafeWrite mv iA vA
-                            if ptrEq oldB vB then pure () else MV.unsafeWrite mv iB vB
+                            if ptrEq (unsafeCoerce oldA) (unsafeCoerce vA) then pure () else MV.unsafeWrite mv iA vA
+                            if ptrEq (unsafeCoerce oldB) (unsafeCoerce vB) then pure () else MV.unsafeWrite mv iB vB
                           )
                           vals
                   in Bag mask vals' steps
@@ -1101,10 +1104,10 @@ bagSet3Direct a b d bag0@(Bag mask vals steps) =
   let bitA = componentBitOf @c @a
       bitB = componentBitOf @c @b
       bitD = componentBitOf @c @d
-      vA = unsafeCoerce a
-      vB = unsafeCoerce b
-      vD = unsafeCoerce d
-      fallback = bagSetByAny bitD vD (bagSetByAny bitB vB (bagSetByAny bitA vA bag0))
+      vA = inj a
+      vB = inj b
+      vD = inj d
+      fallback = bagSetBy bitD vD (bagSetBy bitB vB (bagSetBy bitA vA bag0))
       distinct = bitA /= bitB && bitA /= bitD && bitB /= bitD
   in
     if not distinct
@@ -1120,15 +1123,15 @@ bagSet3Direct a b d bag0@(Bag mask vals steps) =
                 oldB = V.unsafeIndex vals iB
                 oldD = V.unsafeIndex vals iD
             in
-              if ptrEq oldA vA && ptrEq oldB vB && ptrEq oldD vD
+              if ptrEq (unsafeCoerce oldA) (unsafeCoerce vA) && ptrEq (unsafeCoerce oldB) (unsafeCoerce vB) && ptrEq (unsafeCoerce oldD) (unsafeCoerce vD)
                 then bag0
                 else
                   let vals' =
                         V.modify
                           (\mv -> do
-                            if ptrEq oldA vA then pure () else MV.unsafeWrite mv iA vA
-                            if ptrEq oldB vB then pure () else MV.unsafeWrite mv iB vB
-                            if ptrEq oldD vD then pure () else MV.unsafeWrite mv iD vD
+                            if ptrEq (unsafeCoerce oldA) (unsafeCoerce vA) then pure () else MV.unsafeWrite mv iA vA
+                            if ptrEq (unsafeCoerce oldB) (unsafeCoerce vB) then pure () else MV.unsafeWrite mv iB vB
+                            if ptrEq (unsafeCoerce oldD) (unsafeCoerce vD) then pure () else MV.unsafeWrite mv iD vD
                           )
                           vals
                   in Bag mask vals' steps
@@ -1145,8 +1148,11 @@ bagUpdateDirect :: forall c a. (Component c a, ComponentBit c a) => (a -> a) -> 
 {-# INLINE bagUpdateDirect #-}
 bagUpdateDirect f bag =
   let bitIx = componentBitOf @c @a
-      fAny v = unsafeCoerce (f (unsafeCoerce v))
-  in bagUpdateByAny bitIx fAny bag
+      fC c =
+        case prj c of
+          Just a -> inj (f a)
+          Nothing -> c
+  in bagUpdateBy bitIx fC bag
 
 bagDelDirect :: forall c a. (Component c a, ComponentBit c a) => Bag c -> Bag c
 {-# INLINE bagDelDirect #-}
@@ -1370,33 +1376,11 @@ instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a, Component c b, Co
         req = bit bitA .|. bit bitB .|. bit bitD
     in Plan req 0 (bagGetByUnsafe3 bitA bitB bitD) (Just (planRunForSig3 bitA bitB bitD))
 
-instance {-# OVERLAPPABLE #-} (PlanField c a, PlanField c b) => Plannable c (a, b) where
-  planC =
-    let (reqA, forbA, runA) = fieldPlan @c @a
-        (reqB, forbB, runB) = fieldPlan @c @b
-    in Plan (reqA .|. reqB) (forbA .|. forbB) (\bag -> (runA bag, runB bag)) Nothing
-
-instance {-# OVERLAPPABLE #-} (PlanField c a, PlanField c b, PlanField c d) => Plannable c (a, b, d) where
-  planC =
-    let (reqA, forbA, runA) = fieldPlan @c @a
-        (reqB, forbB, runB) = fieldPlan @c @b
-        (reqD, forbD, runD) = fieldPlan @c @d
-    in Plan
-      (reqA .|. reqB .|. reqD)
-      (forbA .|. forbB .|. forbD)
-      (\bag -> (runA bag, runB bag, runD bag))
-      Nothing
-
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => Plannable c a where
   planC =
     let bitA = componentBitOf @c @a
         req = bit bitA
     in Plan req 0 (bagGetByUnsafe bitA) (Just (planRunForSig1 bitA))
-
-instance {-# OVERLAPPABLE #-} PlanField c a => Plannable c a where
-  planC =
-    let (req, forb, runF) = fieldPlan @c @a
-    in Plan req forb runF Nothing
 
 query :: forall a c. Queryable c a => Query c a
 query = queryC @c @a
