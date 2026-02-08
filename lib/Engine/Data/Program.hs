@@ -1137,20 +1137,15 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                       let grp = cbGroup c
                       in IntMap.insert (bgPid grp) grp acc
                    ) IntMap.empty compiled
-          parOk = all pendingPar pendingSorted
           hasStateful = V.any (not . isStatelessStep) steps
           state0 = PendingState steps hasStateful
           (w', state') =
-            if parOk
-              then runPendingStepsPar state0 wStep
-              else runPendingSteps state0 wStep
+            runPendingStepsPar state0 wStep
           (updates, out) = finalizePendingState state' groups
           programs' = applyProgramUpdates programs0 updates
           runFlags' = updateRunFlags programs' runFlags (IntMap.keysSet updates)
           progressed = not (IntMap.null updates) || not (null out)
       in (w', outFrom out, programs', runFlags', progressed, stepped1)
-
-    pendingPar (PendingBatch _ _ _ (Batch _ parOk) _) = parOk
 
     compilePending dTime (PendingBatch pid locals inbox b cont) =
       let Batch runBatch _ = b
@@ -1188,7 +1183,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
     parRowsPerChunk = 1024
 
     parWorkPerChunk :: Int
-    parWorkPerChunk = 1200
+    parWorkPerChunk = 600
 
     chooseParallelChunks rowCount stepCount =
       let caps = max 1 numCapabilities
