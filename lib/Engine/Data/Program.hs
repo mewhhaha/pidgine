@@ -538,6 +538,7 @@ data KernelStepST s c msg where
 
 data PendingState c msg = PendingState
   !(V.Vector (KernelStep c msg))
+  !Bool
 
 data CompiledBatch c msg = CompiledBatch
   { cbSteps :: !(V.Vector (KernelStep c msg))
@@ -861,10 +862,7 @@ eachSet2 :: forall c a b msg.
   Batch c msg ()
 {-# INLINE eachSet2 #-}
 eachSet2 f =
-  eachP (E.plan @(a, b) @c) (\ab ->
-    let (a', b') = f ab
-    in set2 @a @b @c a' b'
-  )
+  eachPSet2 (E.plan @(a, b) @c) f
 
 
 data EachAcc c msg = EachAcc
@@ -1434,7 +1432,8 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                       in IntMap.insert (bgPid grp) grp acc
                    ) IntMap.empty compiled
           parOk = all pendingPar pendingSorted
-          state0 = PendingState steps
+          hasStateful = V.any (not . isStatelessStep) steps
+          state0 = PendingState steps hasStateful
           (w', state') =
             if parOk
               then runPendingStepsPar state0 wStep
@@ -1566,7 +1565,35 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
             st0
             rest
 
-    runKernelRows steps0 rows0 =
+    isStatelessStep step =
+      case step of
+        KernelStepStateless {} -> True
+        KernelStepStateful {} -> False
+
+    runKernelRowsStateless steps0 rows0 =
+      let len = V.length steps0
+          matchesSig req forb sig = (sig .&. req) == req && (sig .&. forb) == 0
+          runRow (E.EntityRow eid' sig0 bag0) =
+            let e = E.Entity eid'
+                runStep !i !sig !bag =
+                  if i >= len
+                    then (sig, bag)
+                    else
+                      case V.unsafeIndex steps0 i of
+                        KernelStepStateless _ req forb stepFn _ ->
+                          if matchesSig req forb sig
+                            then
+                              let (sig', bag') = stepFn e sig bag
+                              in runStep (i + 1) sig' bag'
+                            else runStep (i + 1) sig bag
+                        KernelStepStateful {} ->
+                          error "runKernelRowsStateless: stateful step"
+            in
+              let (sig1, bag1) = runStep 0 sig0 bag0
+              in E.EntityRow eid' sig1 bag1
+      in (V.map runRow rows0, steps0)
+
+    runKernelRowsStateful steps0 rows0 =
       let len = V.length steps0
           rowCount = V.length rows0
       in runST $ do
@@ -1622,24 +1649,31 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
 
     runPendingSteps state0 wStep =
       case state0 of
-        PendingState steps0 ->
+        PendingState steps0 hasStateful ->
           if V.null steps0
             then (wStep, state0)
             else
               let rows0 = E.entityRowsV wStep
-                  (rows', steps') = runKernelRows steps0 rows0
+                  (rows', steps') =
+                    if hasStateful
+                      then runKernelRowsStateful steps0 rows0
+                      else runKernelRowsStateless steps0 rows0
                   w' = E.setEntityRowsVSameShape rows' wStep
-              in (w', PendingState steps')
+              in (w', PendingState steps' hasStateful)
 
     runPendingStepsPar state0 wStep =
       case state0 of
-        PendingState steps0 ->
+        PendingState steps0 hasStateful ->
           if V.null steps0
             then (wStep, state0)
             else
               let rows0 = E.entityRowsV wStep
                   rowCount = V.length rows0
                   chunkCount = chooseParallelChunks rowCount (V.length steps0)
+                  runChunk =
+                    if hasStateful
+                      then runKernelRowsStateful
+                      else runKernelRowsStateless
               in
                 if chunkCount <= 1
                   then runPendingSteps state0 wStep
@@ -1649,7 +1683,10 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                       if length rowChunks <= 1
                         then runPendingSteps state0 wStep
                         else
-                          let stepChunks = splitStepsForChunks steps0 rowChunks
+                          let stepChunks =
+                                if hasStateful
+                                  then splitStepsForChunks steps0 rowChunks
+                                  else replicate (length rowChunks) steps0
                               (headRows, tailRows) =
                                 case rowChunks of
                                   r : rs -> (r, rs)
@@ -1659,17 +1696,20 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                                   s : ss -> (s, ss)
                                   [] -> error "runPendingStepsPar: empty step chunks"
                               -- Keep one chunk on the current capability and spark the rest.
-                              headResult = runKernelRows headSteps headRows
+                              headResult = runChunk headSteps headRows
                               tailResults =
                                 withStrategy (parList rseq) $
-                                  zipWith runKernelRows tailSteps tailRows
+                                  zipWith runChunk tailSteps tailRows
                               chunkResults = headResult : tailResults
                               rows' = V.concat (map fst chunkResults)
-                              steps' = mergeChunkSteps (map snd chunkResults)
+                              steps' =
+                                if hasStateful
+                                  then mergeChunkSteps (map snd chunkResults)
+                                  else steps0
                               w' = E.setEntityRowsVSameShape rows' wStep
-                          in (w', PendingState steps')
+                          in (w', PendingState steps' hasStateful)
 
-    finalizePendingState (PendingState steps0) groups =
+    finalizePendingState (PendingState steps0 _) groups =
       let len = V.length steps0
           -- IntMap.insertWith passes (new, old). Preserve original op order as old <> new.
           combine new old =
