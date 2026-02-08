@@ -64,6 +64,5 @@ benchmark redatared-bench
                       , vector ^>=0.13
                       , rrb-vector
                       , criterion
-                      , aztecs
                       , redatared
     default-language: GHC2024

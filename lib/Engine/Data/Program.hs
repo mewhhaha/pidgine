@@ -28,15 +28,7 @@ module Engine.Data.Program
   , Batch
   , compute
   , each
-  , eachP
-  , eachPDirect
-  , eachSet2
-  , eachPSet2
   , eachM
-  , eachMP
-  , eachMPEdit
-  , eachMPDirect
-  , eachMPure
   , collect
   , GraphM
   , graphM
@@ -69,11 +61,7 @@ module Engine.Data.Program
   , tick
   , wait
   , set
-  , set2
-  , set3
   , setDirect
-  , set2Direct
-  , set3Direct
   , update
   , del
   , at
@@ -121,7 +109,7 @@ type Machines = IntMap.IntMap Any
 patch :: (World c -> World c) -> Patch c
 patch = Patch
 
-newtype EntityPatch c = EntityPatch (Sig -> E.Bag c -> (Sig, E.Bag c))
+newtype EntityPatch c = EntityPatch (E.BagEdit c)
 
 type DirectPatch c = Sig -> E.Bag c -> (Sig, E.Bag c)
 
@@ -135,13 +123,10 @@ instance Monoid (Patch c) where
   mempty = Patch id
 
 instance Semigroup (EntityPatch c) where
-  EntityPatch f <> EntityPatch g =
-    EntityPatch (\sig bag ->
-      let (sig', bag') = f sig bag
-      in g sig' bag')
+  EntityPatch a <> EntityPatch b = EntityPatch (b <> a)
 
 instance Monoid (EntityPatch c) where
-  mempty = EntityPatch (,)
+  mempty = EntityPatch mempty
 
 apply :: Patch c -> World c -> World c
 apply (Patch f) = f
@@ -151,61 +136,28 @@ componentBitOfType = E.componentBitOf @c @a
 
 runEntityPatch :: EntityPatch c -> Sig -> E.Bag c -> (Sig, E.Bag c)
 {-# INLINE runEntityPatch #-}
-runEntityPatch (EntityPatch f) = f
+runEntityPatch (EntityPatch patchEdit) sig bag =
+  let bag' = E.bagApplyEditPacked patchEdit bag
+      staticOld = E.sigFromBag bag
+      stepBits = sig .&. complement staticOld
+      sig' = E.sigFromBag bag' .|. stepBits
+  in (sig', bag')
 
 -- Unsafe: only use when the Bag is uniquely owned by the caller.
 runEntityPatchUnsafe :: EntityPatch c -> Sig -> E.Bag c -> (Sig, E.Bag c)
 {-# INLINE runEntityPatchUnsafe #-}
-runEntityPatchUnsafe (EntityPatch f) = f
+runEntityPatchUnsafe (EntityPatch patchEdit) sig bag =
+  let bag' = E.bagApplyEditPackedUnsafe patchEdit bag
+      staticOld = E.sigFromBag bag
+      stepBits = sig .&. complement staticOld
+      sig' = E.sigFromBag bag' .|. stepBits
+  in (sig', bag')
 
-type PlanCache c a = IntMap.IntMap (E.Bag c -> a)
-
-cachedPlanRunner ::
-  (E.Bag c -> a) ->
-  Maybe (E.Sig -> E.Bag c -> a) ->
-  E.Sig ->
-  PlanCache c a ->
-  (E.Bag c -> a, PlanCache c a)
-{-# INLINE cachedPlanRunner #-}
-cachedPlanRunner runP runForSig sig cache =
-  let key = fromIntegral sig
-  in case IntMap.lookup key cache of
-      Just runPSig -> (runPSig, cache)
-      Nothing ->
-        let runPSig =
-              case runForSig of
-                Just compileForSig -> compileForSig sig
-                Nothing -> runP
-        in (runPSig, IntMap.insert key runPSig cache)
 
 set :: forall a c. (E.Component c a, E.ComponentBit c a) => a -> EntityPatch c
 {-# INLINE set #-}
 set a =
-  let bitC = bit (componentBitOfType @c @a)
-  in EntityPatch (\sig bag -> (sig .|. bitC, E.bagSetDirect @c @a a bag))
-
-set2 :: forall a b c.
-  (E.Component c a, E.ComponentBit c a, E.Component c b, E.ComponentBit c b)
-  => a -> b -> EntityPatch c
-{-# INLINE set2 #-}
-set2 a b =
-  let bitA = bit (componentBitOfType @c @a)
-      bitB = bit (componentBitOfType @c @b)
-  in EntityPatch (\sig bag ->
-        (sig .|. bitA .|. bitB, E.bagSet2Direct @c @a @b a b bag))
-
-set3 :: forall a b d c.
-  (E.Component c a, E.ComponentBit c a
-  ,E.Component c b, E.ComponentBit c b
-  ,E.Component c d, E.ComponentBit c d
-  ) => a -> b -> d -> EntityPatch c
-{-# INLINE set3 #-}
-set3 a b d =
-  let bitA = bit (componentBitOfType @c @a)
-      bitB = bit (componentBitOfType @c @b)
-      bitD = bit (componentBitOfType @c @d)
-  in EntityPatch (\sig bag ->
-        (sig .|. bitA .|. bitB .|. bitD, E.bagSet3Direct @c @a @b @d a b d bag))
+  EntityPatch (E.bagEditSet @c @a a)
 
 setDirect :: forall a c. (E.Component c a, E.ComponentBit c a) => a -> DirectPatch c
 {-# INLINE setDirect #-}
@@ -213,40 +165,16 @@ setDirect a sig bag =
   let bitC = bit (componentBitOfType @c @a)
   in (sig .|. bitC, E.bagSetDirect @c @a a bag)
 
-set2Direct :: forall a b c.
-  (E.Component c a, E.ComponentBit c a, E.Component c b, E.ComponentBit c b)
-  => a -> b -> DirectPatch c
-{-# INLINE set2Direct #-}
-set2Direct a b sig bag =
-  let bitA = bit (componentBitOfType @c @a)
-      bitB = bit (componentBitOfType @c @b)
-  in (sig .|. bitA .|. bitB, E.bagSet2Direct @c @a @b a b bag)
-
-set3Direct :: forall a b d c.
-  (E.Component c a, E.ComponentBit c a
-  ,E.Component c b, E.ComponentBit c b
-  ,E.Component c d, E.ComponentBit c d
-  ) => a -> b -> d -> DirectPatch c
-{-# INLINE set3Direct #-}
-set3Direct a b d sig bag =
-  let bitA = bit (componentBitOfType @c @a)
-      bitB = bit (componentBitOfType @c @b)
-      bitD = bit (componentBitOfType @c @d)
-  in (sig .|. bitA .|. bitB .|. bitD, E.bagSet3Direct @c @a @b @d a b d bag)
-
-drive :: forall a c. (E.Component c a, E.ComponentBit c a) => F.Step () a -> EntityPatch c
-drive s0 =
-  let bitC = bit (componentBitOfType @c @a)
-  in EntityPatch (\sig bag -> (sig .|. bitC, E.bagSetStepDirect @c @a s0 bag))
+drive :: forall a c. (E.Component c a, E.ComponentBit c a) => Entity -> F.Step () a -> Patch c
+drive e s0 = Patch (E.driveStep @a @c e s0)
 
 update :: forall a c. (E.Component c a, E.ComponentBit c a) => (a -> a) -> EntityPatch c
 update f =
-  EntityPatch (\sig bag -> (sig, E.bagUpdateDirect @c @a f bag))
+  EntityPatch (E.bagEditUpdate @c @a f)
 
 del :: forall a c. (E.Component c a, E.ComponentBit c a) => EntityPatch c
 del =
-  let bitC = bit (componentBitOfType @c @a)
-  in EntityPatch (\sig bag -> (sig .&. complement bitC, E.bagDelDirect @c @a bag))
+  EntityPatch (E.bagEditDel @c @a)
 
 at :: Entity -> EntityPatch c -> Patch c
 at e p = patch (E.mapEntities updateEntity)
@@ -752,23 +680,6 @@ batchRun1With req forb g runArchetype =
 batchRun1 :: E.Sig -> E.Sig -> Gather c msg (a, BatchOut c msg) -> BatchRun c msg a
 batchRun1 req forb g = batchRun1With req forb g Nothing
 
-batchRun1Stateless ::
-  E.Sig ->
-  E.Sig ->
-  (Entity -> E.Sig -> E.Bag c -> (E.Sig, E.Bag c)) ->
-  (a, BatchOut c msg) ->
-  BatchRun c msg a
-batchRun1Stateless req forb stepFn (a, bout) =
-  let k xs i =
-        if i < V.length xs
-          then (unsafeCoerce (V.unsafeIndex xs i), i + 1)
-          else error "compute: missing batch result"
-  in
-    BatchRun
-      (V.singleton (BatchOpStateless req forb stepFn (unsafeCoerce a, bout)))
-      1
-      k
-
 each :: E.Query c a -> (a -> EntityPatch c) -> Batch c msg ()
 each q f =
   let E.Query runQ info = q
@@ -783,130 +694,26 @@ each q f =
       doneQ () = ((), mempty)
   in Batch (\_ _ _ -> batchRun1 req forb (Gather () stepQ doneQ (\_ _ -> ()) (\_ s -> (s, s)))) True
 
-eachP :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
-eachP (E.Plan req forb runP runForSig) f =
-  let stepP _ sig bag cache =
-        let (runPSig, cache') = cachedPlanRunner runP runForSig sig cache
-            a = runPSig bag
-            (sig', bag') = runEntityPatchUnsafe (f a) sig bag
-        in (sig', bag', cache')
-      runArchetype sig rows stAny =
-        let cache0 = unsafeCoerce stAny :: PlanCache c a
-            (runPSig, cache1) = cachedPlanRunner runP runForSig sig cache0
-            stepRow (!moved, !rowsRevAcc) (E.EntityRow eid' rowSig bag) =
-              let a = runPSig bag
-                  (sig', bag') = runEntityPatchUnsafe (f a) rowSig bag
-                  movedNext = moved || sig' /= sig
-                  rowsRev' = E.EntityRow eid' sig' bag' : rowsRevAcc
-              in movedNext `seq` rowsRev' `seq` (movedNext, rowsRev')
-            (movedAny, rowsRevFinal) = V.ifoldl' (\acc _ row -> stepRow acc row) (False, []) rows
-            rows' = V.fromList (reverse rowsRevFinal)
-        in (unsafeCoerce cache1, movedAny, rows')
-      doneP _ = ((), mempty)
-      mergeP = IntMap.union
-      splitP _ cache = (cache, cache)
-      gather = Gather IntMap.empty stepP doneP mergeP splitP
-  in Batch (\_ _ _ -> batchRun1With req forb gather (Just runArchetype)) True
-
-eachPDirect :: E.Plan c a -> (a -> DirectPatch c) -> Batch c msg ()
-eachPDirect (E.Plan req forb runP runForSig) f =
-  let stepP _ sig bag cache =
-        let (runPSig, cache') = cachedPlanRunner runP runForSig sig cache
-            a = runPSig bag
-            (sig', bag') = f a sig bag
-        in (sig', bag', cache')
-      runArchetype sig rows stAny =
-        let cache0 = unsafeCoerce stAny :: PlanCache c a
-            (runPSig, cache1) = cachedPlanRunner runP runForSig sig cache0
-            stepRow (!moved, !rowsRevAcc) (E.EntityRow eid' rowSig bag) =
-              let a = runPSig bag
-                  (sig', bag') = f a rowSig bag
-                  movedNext = moved || sig' /= sig
-                  rowsRev' = E.EntityRow eid' sig' bag' : rowsRevAcc
-              in movedNext `seq` rowsRev' `seq` (movedNext, rowsRev')
-            (movedAny, rowsRevFinal) = V.ifoldl' (\acc _ row -> stepRow acc row) (False, []) rows
-            rows' = V.fromList (reverse rowsRevFinal)
-        in (unsafeCoerce cache1, movedAny, rows')
-      doneP _ = ((), mempty)
-      mergeP = IntMap.union
-      splitP _ cache = (cache, cache)
-      gather = Gather IntMap.empty stepP doneP mergeP splitP
-  in Batch (\_ _ _ -> batchRun1With req forb gather (Just runArchetype)) True
-
-eachPSet2 :: forall c a b msg.
-  (E.Component c a, E.ComponentBit c a, E.Component c b, E.ComponentBit c b) =>
-  E.Plan c (a, b) ->
-  ((a, b) -> (a, b)) ->
-  Batch c msg ()
-{-# INLINE eachPSet2 #-}
-eachPSet2 (E.Plan req forb runP runForSig) f =
-  let bitA = bit (componentBitOfType @c @a)
-      bitB = bit (componentBitOfType @c @b)
-      runPSigFor sig =
-        case runForSig of
-          Just compileForSig -> compileForSig sig
-          Nothing -> runP
-      stepP _ sig bag =
-        let runPSig = runPSigFor sig
-            (a0, b0) = runPSig bag
-            (a', b') = f (a0, b0)
-            sig' = sig .|. bitA .|. bitB
-            runSet2Sig = E.bagSet2DirectForSig @c @a @b sig
-            bag' = runSet2Sig a' b' bag
-        in (sig', bag')
-  in Batch (\_ _ _ -> batchRun1Stateless req forb stepP ((), mempty)) True
-
-eachSet2 :: forall c a b msg.
-  (E.Component c a, E.ComponentBit c a, E.Component c b, E.ComponentBit c b) =>
-  ((a, b) -> (a, b)) ->
-  Batch c msg ()
-{-# INLINE eachSet2 #-}
-eachSet2 f =
-  eachPSet2 (E.plan @(a, b) @c) f
-
 
 data EachAcc c msg = EachAcc
   { eaOut :: !(Out msg)
   , eaOld :: !(IntMap.IntMap (ProgState c msg))
-  , eaNew :: ![(Int, ProgState c msg)]
+  , eaNew :: !(IntMap.IntMap (ProgState c msg))
   , eaDt :: !DTime
   , eaInbox :: !(Inbox msg)
   }
 
 emptyEachAcc :: DTime -> Inbox msg -> IntMap.IntMap (ProgState c msg) -> EachAcc c msg
-emptyEachAcc d inbox prog = EachAcc mempty prog [] d inbox
+emptyEachAcc d inbox prog = EachAcc mempty prog IntMap.empty d inbox
 
 mergeEachAcc :: EachAcc c msg -> EachAcc c msg -> EachAcc c msg
 mergeEachAcc a b =
   EachAcc
     { eaOut = eaOut a <> eaOut b
     , eaOld = IntMap.empty
-    , eaNew = eaNew a <> eaNew b
+    , eaNew = IntMap.union (eaNew b) (eaNew a)
     , eaDt = eaDt a
     , eaInbox = eaInbox a
-    }
-
-data EachAccPlan c msg a = EachAccPlan
-  { eapOut :: !(Out msg)
-  , eapOld :: !(IntMap.IntMap (ProgState c msg))
-  , eapNew :: ![(Int, ProgState c msg)]
-  , eapDt :: !DTime
-  , eapInbox :: !(Inbox msg)
-  , eapPlanCache :: !(PlanCache c a)
-  }
-
-emptyEachAccPlan :: (E.Bag c -> a) -> DTime -> Inbox msg -> IntMap.IntMap (ProgState c msg) -> EachAccPlan c msg a
-emptyEachAccPlan _ d inbox prog = EachAccPlan mempty prog [] d inbox IntMap.empty
-
-mergeEachAccPlan :: EachAccPlan c msg a -> EachAccPlan c msg a -> EachAccPlan c msg a
-mergeEachAccPlan a b =
-  EachAccPlan
-    { eapOut = eapOut a <> eapOut b
-    , eapOld = IntMap.empty
-    , eapNew = eapNew a <> eapNew b
-    , eapDt = eapDt a
-    , eapInbox = eapInbox a
-    , eapPlanCache = IntMap.union (eapPlanCache a) (eapPlanCache b)
     }
 
 eachM :: forall (key :: Type) c msg a.
@@ -961,7 +768,7 @@ eachMWith req forb runMatch f =
               progState = ProgState (if waitE then Just prog' else Nothing) machines'
               !newMap' =
                 if progKeep
-                  then (eid', progState) : eaNew acc
+                  then IntMap.insert eid' progState (eaNew acc)
                   else eaNew acc
               !outAcc' = eaOut acc <> out'
               acc' = acc { eaOut = outAcc', eaNew = newMap' }
@@ -969,10 +776,7 @@ eachMWith req forb runMatch f =
     doneEntity acc =
       let updateLocals locals0 =
               let globals0 = localsGlobal locals0
-                  progMap =
-                    case eaNew acc of
-                      [] -> IntMap.empty
-                      xs -> IntMap.fromList xs
+                  progMap = eaNew acc
                   globals' =
                     if IntMap.null progMap
                       then IntMap.delete progKey globals0
@@ -985,104 +789,6 @@ eachMWith req forb runMatch f =
           d = eaDt acc
           inbox = eaInbox acc
       in (emptyEachAcc d inbox prog, emptyEachAcc d inbox prog)
-
-eachMP :: forall (key :: Type) c msg a.
-  (Typeable key, Typeable msg) =>
-  E.Plan c a ->
-  (a -> EntityM c msg ()) ->
-  Batch c msg ()
-{-# INLINE eachMP #-}
-eachMP (E.Plan req forb runP runForSig) f =
-  Batch batch0 True
-  where
-    progKey = E.typeIdOf @(ProgramKey key)
-    stepEntityWithA :: Entity -> E.Sig -> E.Bag c -> a -> EachAccPlan c msg a -> (E.Sig, E.Bag c, EachAccPlan c msg a)
-    stepEntityWithA e sig bag a acc =
-      let d = eapDt acc
-          inbox = eapInbox acc
-          eid' = E.eid e
-          mState = IntMap.lookup eid' (eapOld acc)
-          (prog0, machines0) =
-            case mState of
-              Just (ProgState mProg machinesStored) ->
-                let prog0' = fromMaybe (f a) mProg
-                in (prog0', machinesStored)
-              Nothing -> (f a, IntMap.empty)
-          (bag', sig', machines', out', waitE, prog', _) =
-            runEntityM d inbox sig bag machines0 prog0
-          progKeep = waitE || not (IntMap.null machines')
-          progState = ProgState (if waitE then Just prog' else Nothing) machines'
-          !newMap' =
-            if progKeep
-              then (eid', progState) : eapNew acc
-              else eapNew acc
-          !outAcc' = eapOut acc <> out'
-          acc' =
-            acc
-              { eapOut = outAcc'
-              , eapNew = newMap'
-              }
-      in (sig', bag', acc')
-    stepEntity e sig bag acc =
-      let (runPSig, planCache') = cachedPlanRunner runP runForSig sig (eapPlanCache acc)
-          a = runPSig bag
-          (sig', bag', accNoCache) = stepEntityWithA e sig bag a acc
-          acc' = accNoCache { eapPlanCache = planCache' }
-      in (sig', bag', acc')
-    runArchetype sig rows stAny =
-      let acc0 = unsafeCoerce stAny :: EachAccPlan c msg a
-          (runPSig, planCache') = cachedPlanRunner runP runForSig sig (eapPlanCache acc0)
-          acc1 = acc0 { eapPlanCache = planCache' }
-          stepRow (!acc, !moved, !rowsRevAcc) (E.EntityRow eid' rowSig bag) =
-            let e = E.Entity eid'
-                a = runPSig bag
-                (sig', bag', acc') = stepEntityWithA e rowSig bag a acc
-                moved' = moved || sig' /= sig
-                rowsRev' = E.EntityRow eid' sig' bag' : rowsRevAcc
-            in moved' `seq` rowsRev' `seq` acc' `seq` (acc', moved', rowsRev')
-          (acc2, moved2, rowsRevFinal) = V.ifoldl' (\acc _ row -> stepRow acc row) (acc1, False, []) rows
-          rows2 = V.fromList (reverse rowsRevFinal)
-      in (unsafeCoerce acc2, moved2, rows2)
-    doneAcc acc =
-      let updateLocals locals0 =
-            let globals0 = localsGlobal locals0
-                progMap =
-                  case eapNew acc of
-                    [] -> IntMap.empty
-                    xs -> IntMap.fromList xs
-                globals' =
-                  if IntMap.null progMap
-                    then IntMap.delete progKey globals0
-                    else IntMap.insert progKey (unsafeCoerce progMap) globals0
-            in locals0 { localsGlobal = globals' }
-      in ((), BatchOut updateLocals (eapOut acc))
-    merge = mergeEachAccPlan
-    split _ acc =
-      let prog = eapOld acc
-          d = eapDt acc
-          inbox = eapInbox acc
-          cache = eapPlanCache acc
-          mk = (emptyEachAccPlan runP d inbox prog) { eapPlanCache = cache }
-      in (mk, mk)
-    batch0 d inbox locals =
-      let progMap0 :: IntMap.IntMap (ProgState c msg)
-          progMap0 =
-            maybe IntMap.empty unsafeCoerce (IntMap.lookup progKey (localsGlobal locals))
-          acc0 = emptyEachAccPlan runP d inbox progMap0
-          gather = Gather acc0 stepEntity doneAcc merge split
-      in batchRun1With req forb gather (Just runArchetype)
-
-eachMPure :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
-{-# INLINE eachMPure #-}
-eachMPure = eachP
-
-eachMPDirect :: E.Plan c a -> (a -> DirectPatch c) -> Batch c msg ()
-{-# INLINE eachMPDirect #-}
-eachMPDirect = eachPDirect
-
-eachMPEdit :: E.Plan c a -> (a -> EntityPatch c) -> Batch c msg ()
-{-# INLINE eachMPEdit #-}
-eachMPEdit = eachP
 
 collect :: E.Query c a -> Batch c msg [(Entity, a)]
 collect q =
@@ -1527,13 +1233,13 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
           _ ->
             let perStep =
                   V.map
-                    (\step ->
-                      case step of
+                    (\kstep ->
+                      case kstep of
                         KernelStepStateful pid req forb st stepFn doneFn mergeFn splitFn ->
                           let states = splitStateAcross splitFn st chunks
                           in map (\s -> KernelStepStateful pid req forb s stepFn doneFn mergeFn splitFn) states
                         KernelStepStateless {} ->
-                          replicate chunkCount step
+                          replicate chunkCount kstep
                     )
                     steps
                 chunkSteps i =
@@ -1565,8 +1271,8 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
             st0
             rest
 
-    isStatelessStep step =
-      case step of
+    isStatelessStep kstep =
+      case kstep of
         KernelStepStateless {} -> True
         KernelStepStateful {} -> False
 
@@ -1722,18 +1428,18 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
             if i >= len
               then (pendingUpdates, outToList accOut)
               else
-                let step = V.unsafeIndex steps0 i
-                    (pid, aAny, bout) =
-                      case step of
+                let kstep = V.unsafeIndex steps0 i
+                    (pidKey, aAny, boutAny) =
+                      case kstep of
                         KernelStepStateful pid _ _ st _ doneFn _ _ ->
                           let (a, bout) = doneFn st
                           in (pid, a, bout)
                         KernelStepStateless pid _ _ _ doneConst ->
                           let (a, bout) = doneConst
                           in (pid, a, bout)
-                    delta = Acc (buildOne aAny) bout 1
-                    !accOut' = accOut <> boOut bout
-                in go (i + 1) ((pid, delta) : pendingUpdates) accOut'
+                    delta = Acc (buildOne aAny) boutAny 1
+                    !accOut' = accOut <> boOut boutAny
+                in go (i + 1) ((pidKey, delta) : pendingUpdates) accOut'
           (accUpdatesRev, outList) = go 0 [] mempty
           accUpdates = reverse accUpdatesRev
           accMap =
@@ -1741,10 +1447,10 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
               (\acc (pid, delta) -> IntMap.insertWith combine pid delta acc)
               IntMap.empty
               accUpdates
-          applyUpdate acc pid accVal =
+          applyUpdate acc pidKey accVal =
             if accCount accVal == 0
               then acc
-              else case IntMap.lookup pid groups of
+              else case IntMap.lookup pidKey groups of
                 Nothing -> acc
                 Just grp ->
                   let results = V.fromList (buildToList (accRes accVal))
@@ -1752,7 +1458,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
                       progAny = bgCont grp aAny
                       locals0 = bgLocals grp
                       locals' = boLocals (accOut accVal) locals0
-                  in IntMap.insert pid (ProgramUpdate locals' progAny) acc
+                  in IntMap.insert pidKey (ProgramUpdate locals' progAny) acc
           updates = IntMap.foldlWithKey' applyUpdate IntMap.empty accMap
       in (updates, outList)
 
