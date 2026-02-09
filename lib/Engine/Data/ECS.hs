@@ -158,15 +158,31 @@ data BagOp
   | BagOpUpdate !Int (Any -> Any)
   | BagOpDel !Int
 
-newtype BagEdit c = BagEdit
-  { bagEditOps :: [BagOp]
-  }
+data BagEdit c
+  = BagEdit0
+  | BagEdit1 !BagOp
+  | BagEdit2 !BagOp !BagOp
+  | BagEditN ![BagOp]
 
 instance Semigroup (BagEdit c) where
-  BagEdit xs <> BagEdit ys = BagEdit (ys <> xs)
+  BagEdit0 <> b = b
+  a <> BagEdit0 = a
+  BagEdit1 a <> BagEdit1 b = BagEdit2 b a
+  BagEdit1 a <> BagEdit2 b c = BagEditN [b, c, a]
+  BagEdit2 a b <> BagEdit1 c = BagEditN [c, a, b]
+  BagEdit2 a b <> BagEdit2 c d = BagEditN [c, d, a, b]
+  a <> b = BagEditN (bagEditToList b <> bagEditToList a)
 
 instance Monoid (BagEdit c) where
-  mempty = BagEdit []
+  mempty = BagEdit0
+
+bagEditToList :: BagEdit c -> [BagOp]
+bagEditToList edit =
+  case edit of
+    BagEdit0 -> []
+    BagEdit1 a -> [a]
+    BagEdit2 a b -> [a, b]
+    BagEditN ops -> ops
 
 stepStoreEmpty :: StepStore
 stepStoreEmpty = StepStore IntMap.empty
@@ -772,41 +788,63 @@ bagEditSet :: forall c a. (Component c a, ComponentBit c a) => a -> BagEdit c
 bagEditSet a =
   let bitIx = componentBitOf @c @a
       vAny = unsafeCoerce a
-  in BagEdit [BagOpSet bitIx vAny]
+  in BagEdit1 (BagOpSet bitIx vAny)
 
 bagEditUpdate :: forall c a. (Component c a, ComponentBit c a) => (a -> a) -> BagEdit c
 bagEditUpdate f =
   let bitIx = componentBitOf @c @a
       fAny v = unsafeCoerce (f (unsafeCoerce v))
-  in BagEdit [BagOpUpdate bitIx fAny]
+  in BagEdit1 (BagOpUpdate bitIx fAny)
 
 bagEditDel :: forall c a. (Component c a, ComponentBit c a) => BagEdit c
 bagEditDel =
   let bitIx = componentBitOf @c @a
-  in BagEdit [BagOpDel bitIx]
+  in BagEdit1 (BagOpDel bitIx)
 
 bagApplyEdit :: BagEdit c -> Bag c -> Bag c
 bagApplyEdit edit bag0 =
-  foldl'
-    (\bag op ->
-      case op of
-        BagOpSet bitIx vAny -> bagSetByAny bitIx vAny bag
-        BagOpUpdate bitIx fAny -> bagUpdateByAny bitIx fAny bag
-        BagOpDel bitIx -> bagDelByBit bitIx bag
-    )
-    bag0
-    (bagEditOps edit)
+  let runOp bag op =
+        case op of
+          BagOpSet bitIx vAny -> bagSetByAny bitIx vAny bag
+          BagOpUpdate bitIx fAny -> bagUpdateByAny bitIx fAny bag
+          BagOpDel bitIx -> bagDelByBit bitIx bag
+  in case edit of
+      BagEdit0 -> bag0
+      BagEdit1 a -> runOp bag0 a
+      BagEdit2 a b -> runOp (runOp bag0 a) b
+      BagEditN ops -> foldl' runOp bag0 ops
 
 bagApplyEditUnsafe :: BagEdit c -> Bag c -> Bag c
 bagApplyEditUnsafe = bagApplyEdit
 
+hasStructuralEdit :: Sig -> [BagOp] -> Bool
+{-# INLINE hasStructuralEdit #-}
+hasStructuralEdit mask0 =
+  go mask0
+  where
+    go !_ [] = False
+    go !mask (op : ops) =
+      case op of
+        BagOpSet bitIx _ ->
+          if maskHas mask bitIx
+            then go mask ops
+            else True
+        BagOpUpdate _ _ -> go mask ops
+        BagOpDel bitIx ->
+          if maskHas mask bitIx
+            then True
+            else go mask ops
+
 bagApplyEditPacked :: BagEdit c -> Bag c -> Bag c
-bagApplyEditPacked edit@(BagEdit ops) bag0@(Bag mask0 vals0) =
-  case ops of
-    [] -> bag0
-    [_] -> bagApplyEdit edit bag0
-    [_, _] -> bagApplyEdit edit bag0
-    _ ->
+bagApplyEditPacked edit bag0@(Bag mask0 vals0) =
+  case edit of
+    BagEdit0 -> bag0
+    BagEdit1 _ -> bagApplyEdit edit bag0
+    BagEdit2 _ _ -> bagApplyEdit edit bag0
+    BagEditN ops
+      | not (hasStructuralEdit mask0 ops) ->
+          bagApplyEdit edit bag0
+      | otherwise ->
       runST $ do
         let maxBits = finiteBitSize (0 :: Sig)
         mv <- MV.replicate maxBits Nothing
