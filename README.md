@@ -651,8 +651,7 @@ them to `await (compute ...)` and `eachM` when you need monadic actions.
 If you need fresh data or cross‑entity effects, split into another program and communicate
 via events, then `await` the sync point you need.
 
-Graph construction is via `graph`. Use `graphM` only when you want to return
-handles/values from the builder.
+Graph construction is via `graph`.
 
 Within a single `compute`, `each`/`collect` calls are sequenced left‑to‑right;
 later calls can see earlier edits for the same entity. If you need a full “tick
@@ -660,24 +659,21 @@ boundary,” split it into another program and `await x`, then `await (compute .
 
 ### Graph builder (default handles)
 
-Use `graph` + `program` for the common case. Use `graphM` when you need to return
-handles/values from the builder:
+Use `graph` + `program`:
 
 ```haskell
-build :: (S.Handle Double, Graph ())
-build =
-  S.graphM $ do
+g0 :: Graph ()
+g0 =
+  S.graph $ do
     speedH <- S.program (pure 2.5)
-    _moveH <- S.program $ do
+    _ <- S.program $ do
       speed <- S.await speedH
       dt <- S.dt
       _ <- S.await $ S.compute $ do
         S.each @Pos $ \(Pos x y) ->
           S.set (Pos (x + speed * dt) y)
       pure ()
-    pure speedH
-
-(speedH, g0) = build
+    pure ()
 ```
 
 ```haskell

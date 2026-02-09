@@ -32,9 +32,7 @@ module Engine.Data.Program
   , collect
   , GraphM
   , graph
-  , graphM
   , program
-  , programM
   , addProgram
   , newHandleM
   , Events
@@ -460,21 +458,15 @@ addProgram sys = GraphM $ \s ->
   in (s', handleOf sys)
 
 program :: ProgramM c msg a -> GraphM c msg (Handle a)
-program = programM
-
-programM :: ProgramM c msg a -> GraphM c msg (Handle a)
-programM m = do
+program m = do
   h <- newHandleM
   _ <- addProgram (ProgramDef h emptyLocals m m)
   pure h
 
-graphM :: GraphM c msg a -> (a, Graph c msg)
-graphM m =
-  let (s, a) = runGraphM m (GraphState 0 [])
-  in (a, Graph (reverse (gsPrograms s)))
-
 graph :: GraphM c msg () -> Graph c msg
-graph = snd . graphM
+graph m =
+  let (s, ()) = runGraphM m (GraphState 0 [])
+  in Graph (reverse (gsPrograms s))
 
 data BatchOut c msg = BatchOut
   { boLocals :: Locals c msg -> Locals c msg
