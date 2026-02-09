@@ -983,11 +983,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
         in (w2, out1 <> out2, programs2, run2, done1, seen1, values1, progressed1 || progressed2, stepped1)
   where
     runProgramsPhase inb doneSet seenSet valuesSet w pairs =
-      let stepRun acc pair =
-            applyOne acc (runOne inb doneSet seenSet valuesSet w pair)
-          (w', out', progs', runs', dSet', sSet', vSet', progressed', pending') =
-            foldl' stepRun (w, mempty, [], [], doneSet, seenSet, valuesSet, False, []) pairs
-      in (w', out', reverse progs', reverse runs', dSet', sSet', vSet', progressed', reverse pending')
+      go w mempty doneSet seenSet valuesSet False pairs
       where
         runOne inbox0 dSet sSet vSet worldRun (slot0@(ProgramSlot (h :: Handle a) locals0 prog0 base0), runNow) =
           if runNow
@@ -999,40 +995,51 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
             else
               Skipped slot0
 
-        applyOne (wAcc, accOut, accProg, accRun, dSet, sSet, vSet, progressed, pending) res =
-          case res of
-            Skipped slot0 ->
-              (wAcc, accOut, slot0 : accProg, False : accRun, dSet, sSet, vSet, progressed, pending)
-            Ran (h :: Handle a) base0 inbox0 t locals' resStep ->
-              let sid = handleId h
-                  out = outT t
-                  !accOut' = accOut <> outFrom out
-                  w' = apply (patchT t) wAcc
-                  sSet' = progSetInsert sid sSet
-                  progressedSeen = not (progSetMember sid sSet)
-              in case resStep of
-                  ProgDone _ ->
-                    let slot1 = ProgramSlot h locals' base0 base0
-                        accProg' = slot1 : accProg
-                        accRun' = False : accRun
-                        dSet' = progSetInsert sid dSet
-                        progressedDone = not (progSetMember sid dSet)
-                        vSet' = case valueT t of
-                          Nothing -> vSet
-                          Just v -> valuesInsert sid v vSet
-                        progressed' = progressed || progressedDone || progressedSeen || not (null out)
-                    in (w', accOut', accProg', accRun', dSet', sSet', vSet', progressed', pending)
-                  ProgAwait waitOn cont ->
-                    let progWait = await waitOn >>= cont
-                        slot1 = ProgramSlot h locals' progWait base0
-                        accProg' = slot1 : accProg
-                        (pending', runFlag) =
-                          case waitOn of
-                            BatchWait b -> (PendingBatch sid locals' inbox0 b cont : pending, False)
-                            _ -> (pending, True)
-                        accRun' = runFlag : accRun
-                        progressed' = progressed || progressedSeen || not (null out)
-                    in (w', accOut', accProg', accRun', dSet, sSet', vSet, progressed', pending')
+        go wAcc accOut dSet sSet vSet progressed remaining =
+          case remaining of
+            [] ->
+              (wAcc, accOut, [], [], dSet, sSet, vSet, progressed, [])
+            (pair : rest) ->
+              case runOne inb doneSet seenSet valuesSet wAcc pair of
+                Skipped slot0 ->
+                  let (w', out', progs', runs', dSet', sSet', vSet', progressed', pending') =
+                        go wAcc accOut dSet sSet vSet progressed rest
+                  in (w', out', slot0 : progs', False : runs', dSet', sSet', vSet', progressed', pending')
+                Ran (h :: Handle a) base0 inbox0 t locals' resStep ->
+                  let sid = handleId h
+                      out = outT t
+                      !accOut' = accOut <> outFrom out
+                      w1 = apply (patchT t) wAcc
+                      sSet1 = progSetInsert sid sSet
+                      progressedSeen = not (progSetMember sid sSet)
+                  in case resStep of
+                      ProgDone _ ->
+                        let slot1 = ProgramSlot h locals' base0 base0
+                            dSet1 = progSetInsert sid dSet
+                            progressedDone = not (progSetMember sid dSet)
+                            vSet1 =
+                              case valueT t of
+                                Nothing -> vSet
+                                Just v -> valuesInsert sid v vSet
+                            progressed1 = progressed || progressedDone || progressedSeen || not (null out)
+                            (w2, out2, progs2, runs2, dSet2, sSet2, vSet2, progressed2, pending2) =
+                              go w1 accOut' dSet1 sSet1 vSet1 progressed1 rest
+                        in (w2, out2, slot1 : progs2, False : runs2, dSet2, sSet2, vSet2, progressed2, pending2)
+                      ProgAwait waitOn cont ->
+                        let progWait = await waitOn >>= cont
+                            slot1 = ProgramSlot h locals' progWait base0
+                            (pendingHead, runFlag) =
+                              case waitOn of
+                                BatchWait b -> (Just (PendingBatch sid locals' inbox0 b cont), False)
+                                _ -> (Nothing, True)
+                            progressed1 = progressed || progressedSeen || not (null out)
+                            (w2, out2, progs2, runs2, dSet2, sSet2, vSet2, progressed2, pending2) =
+                              go w1 accOut' dSet sSet1 vSet progressed1 rest
+                            pendingFinal =
+                              case pendingHead of
+                                Nothing -> pending2
+                                Just p -> p : pending2
+                        in (w2, out2, slot1 : progs2, runFlag : runs2, dSet2, sSet2, vSet2, progressed2, pendingFinal)
 
     runBatchesPhase dTime w pending programs0 runFlags steppedAlready =
       let pendingSorted = pending
