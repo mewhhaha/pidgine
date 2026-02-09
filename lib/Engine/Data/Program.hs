@@ -14,7 +14,6 @@
 module Engine.Data.Program
   ( Patch
   , EntityPatch
-  , DirectPatch
   , patch
   , emptyPatch
   , ProgramId
@@ -46,7 +45,6 @@ module Engine.Data.Program
   , allIds
   , selfId
   , edit
-  , editDirect
   , world
   , send
   , dt
@@ -63,7 +61,6 @@ module Engine.Data.Program
   , tick
   , wait
   , set
-  , setDirect
   , update
   , del
   , at
@@ -80,7 +77,7 @@ import Control.Monad ((>=>), ap, forM_)
 import Control.Monad.ST (runST)
 import Control.Parallel.Strategies (parList, rseq, withStrategy)
 import Data.Bifunctor (first)
-import Data.Bits (bit, complement, (.&.), (.|.))
+import Data.Bits (complement, (.&.), (.|.))
 import Data.Kind (Type)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
@@ -108,8 +105,6 @@ patch = Patch
 
 newtype EntityPatch c = EntityPatch (E.BagEdit c)
 
-type DirectPatch c = Sig -> E.Bag c -> (Sig, E.Bag c)
-
 emptyPatch :: Patch c
 emptyPatch = mempty
 
@@ -127,9 +122,6 @@ instance Monoid (EntityPatch c) where
 
 apply :: Patch c -> World c -> World c
 apply (Patch f) = f
-
-componentBitOfType :: forall c a. (E.Component c a, E.ComponentBit c a) => Int
-componentBitOfType = E.componentBitOf @c @a
 
 runEntityPatch :: EntityPatch c -> Sig -> E.Bag c -> (Sig, E.Bag c)
 {-# INLINE runEntityPatch #-}
@@ -155,12 +147,6 @@ set :: forall a c. (E.Component c a, E.ComponentBit c a) => a -> EntityPatch c
 {-# INLINE set #-}
 set a =
   EntityPatch (E.bagEditSet @c @a a)
-
-setDirect :: forall a c. (E.Component c a, E.ComponentBit c a) => a -> DirectPatch c
-{-# INLINE setDirect #-}
-setDirect a sig bag =
-  let bitC = bit (componentBitOfType @c @a)
-  in (sig .|. bitC, E.bagSetDirect @c @a a bag)
 
 drive :: forall a c. (E.Component c a, E.ComponentBit c a) => Entity -> F.Step () a -> Patch c
 drive e s0 = Patch (E.driveStep @a @c e s0)
@@ -869,12 +855,6 @@ edit :: EntityPatch c -> EntityM c msg ()
 {-# INLINE edit #-}
 edit p = EntityM $ \ctx ->
   let (sig', bag') = runEntityPatchUnsafe p (ctxSig ctx) (ctxBag ctx)
-  in (ctx { ctxSig = sig', ctxBag = bag' }, Done ())
-
-editDirect :: DirectPatch c -> EntityM c msg ()
-{-# INLINE editDirect #-}
-editDirect f = EntityM $ \ctx ->
-  let (sig', bag') = f (ctxSig ctx) (ctxBag ctx)
   in (ctx { ctxSig = sig', ctxBag = bag' }, Done ())
 
 world :: Patch c -> ProgramM c msg ()
