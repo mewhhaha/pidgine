@@ -1,4 +1,4 @@
-# redatared
+# Pidgine
 
 Small, pure data layer for game engines with a minimal FRP core and a tiny ECS.
 Pattern name: **ECP** (Entity‑Component‑Program). The API is intentionally simple and favors short, single‑word names.
@@ -33,13 +33,13 @@ enable `DeriveGeneric` and `TypeApplications` where needed.
 
 Benchmarks focus on quick, game‑like scenarios so iteration stays fast.
 
-- `game/pong`: 1 ball + 2 paddles (collisions and steering).
-- `game/vampire-10k`: 1 player + 10k mobs (simple chase + damage).
+- `game/rooftop-duel`: 1 bird + 2 perches (collisions and steering).
+- `game/flock-10k`: 1 lead pigeon + 10k flock birds (simple chase + damage).
 
 Run:
 
 ```sh
-cabal bench redatared-bench --ghc-options=-O2 --benchmark-options='+RTS -N -s -RTS'
+cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='+RTS -N -s -RTS'
 ```
 
 ## FRP: Practical examples
@@ -118,7 +118,7 @@ moveOut :: [Double]
 moveOut = F.run (F.sample moveTween) [(0.5,()), (0.5,()), (0.5,())]
 -- [5.0,10.0,10.0]
 
--- Platform ping-pong tween (back and forth)
+-- Platform wing-flap tween (back and forth)
 pingPong :: Double -> Double
 pingPong x =
   let u = x - fromIntegral (floor x :: Int)
@@ -1290,8 +1290,8 @@ bounceProg moveH = do
       in S.set (Vel vx (if y > 9 || y < (-9) then -vy else vy))
   pure ()
 
-pongGraph0 :: Graph ()
-pongGraph0 =
+pigeonLoftGraph0 :: Graph ()
+pigeonLoftGraph0 =
   S.graph $ do
     moveH <- S.program moveProg
     _ <- S.program (bounceProg moveH)

@@ -1,4 +1,4 @@
-# redatared: First-Principles Outline
+# Pidgine: First-Principles Outline
 
 ## Goal
 Small, pure data layer for games. FRP is the core model of time and behavior.

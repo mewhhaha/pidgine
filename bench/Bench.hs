@@ -299,12 +299,12 @@ main :: IO ()
 main = defaultMain
   [ bgroup "game"
       [ let w = buildWorldPong
-        in bench "pong" $ nf (\w0 ->
+        in bench "rooftop-duel" $ nf (\w0 ->
             let (w1, _, _) = S.run 0.016 w0 [] graphPong
             in forceEachm w1
           ) w
       , let w = buildWorldVampire 10000
-        in bench "vampire-10k" $ nf (\w0 ->
+        in bench "flock-10k" $ nf (\w0 ->
             let (w1, _, _) = S.run 0.016 w0 [] graphVampire
             in forceEachm w1
           ) w

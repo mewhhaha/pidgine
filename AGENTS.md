@@ -12,13 +12,13 @@ Use `cabal bench` directly (no `CABAL_DIR` override).
 Time runs:
 
 ```sh
-cabal bench redatared-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> +RTS -N -s -RTS'
+cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> +RTS -N -s -RTS'
 ```
 
 Allocation comparisons:
 
 ```sh
-cabal bench redatared-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> --iters 1000 +RTS -N -s -RTS'
+cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> --iters 1000 +RTS -N -s -RTS'
 ```
 
 Notes:

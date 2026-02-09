@@ -1,5 +1,5 @@
 cabal-version:      3.14
-name:               redatared
+name:               pidgine
 version:            0.1.0.0
 -- synopsis:
 -- description:
@@ -35,7 +35,7 @@ library
     hs-source-dirs:   lib
     default-language: GHC2024
 
-test-suite redatared-tests
+test-suite pidgine-tests
     type:             exitcode-stdio-1.0
     hs-source-dirs:   tests
     main-is:          Main.hs
@@ -49,10 +49,10 @@ test-suite redatared-tests
                       , vector ^>=0.13
                       , rrb-vector
                       , QuickCheck
-                      , redatared
+                      , pidgine
     default-language: GHC2024
 
-benchmark redatared-bench
+benchmark pidgine-bench
     type:             exitcode-stdio-1.0
     hs-source-dirs:   bench
     main-is:          Bench.hs
@@ -64,5 +64,5 @@ benchmark redatared-bench
                       , vector ^>=0.13
                       , rrb-vector
                       , criterion
-                      , redatared
+                      , pidgine
     default-language: GHC2024

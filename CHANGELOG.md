@@ -1,4 +1,4 @@
-# Revision history for redatared
+# Revision history for Pidgine
 
 ## 0.1.0.0 -- YYYY-mm-dd
 
