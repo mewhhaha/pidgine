@@ -71,8 +71,6 @@ data QB = QB
   , qbMaybe :: Maybe Bool
   } deriving (Eq, Show, Generic)
 
-instance E.Queryable C QB
-
 prop_query_queryable :: Int -> Bool -> Bool
 prop_query_queryable x b =
   let (e, w) = E.spawn (x, b) (E.emptyWorld :: World)

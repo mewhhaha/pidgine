@@ -1049,8 +1049,18 @@ instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (
 
 class Queryable c a where
   queryC :: Query c a
-  default queryC :: (Generic a, GQueryable c (Rep a)) => Query c a
-  queryC = to <$> gquery
+
+class QueryableAuto (isComp :: Bool) c a where
+  queryAuto :: Query c a
+
+instance (Component c a, ComponentBit c a) => QueryableAuto 'True c a where
+  queryAuto = comp
+
+instance (Generic a, GQueryable c (Rep a)) => QueryableAuto 'False c a where
+  queryAuto = to <$> gquery
+
+instance (Generic c, QueryableAuto (HasType (Rep c) a) c a) => Queryable c a where
+  queryC = queryAuto @(HasType (Rep c) a) @c @a
 
 class QueryableSum c a where
   querySumC :: Query c a

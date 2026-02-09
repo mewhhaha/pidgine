@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -31,8 +32,9 @@ module Engine.Data.Program
   , eachM
   , collect
   , GraphM
+  , graph
   , graphM
-  , graphM_
+  , program
   , programM
   , addProgram
   , newHandleM
@@ -69,10 +71,6 @@ module Engine.Data.Program
   , relate
   , unrelate
   , Graph(..)
-  , program
-  , graphAny
-  , graphList
-  , graph
   , run
   ) where
 
@@ -496,29 +494,6 @@ data RunRes c msg where
 
 newtype Graph c a = Graph [ProgramSlot c a]
 
-class GraphArgs c msg r | r -> c msg where
-  graphWith :: [ProgramSlot c msg] -> r
-
-instance GraphArgs c msg (Graph c msg) where
-  graphWith acc = Graph (reverse acc)
-
-instance GraphArgs c msg r => GraphArgs c msg (Program c msg a -> r) where
-  graphWith acc s =
-    graphWith (ProgramSlot (programHandle s) (programLocals s) (programProg s) (programBase s) : acc)
-
-program :: Handle a -> ProgramM c msg a -> Program c msg a
-program h prog = ProgramDef h emptyLocals prog prog
-
-graph :: forall msg c r. GraphArgs c msg r => r
-graph = graphWith @c @msg []
-
-graphList :: [Program c msg a] -> Graph c msg
-graphList =
-  Graph . map (\s -> ProgramSlot (programHandle s) (programLocals s) (programProg s) (programBase s))
-
-graphAny :: [ProgramSlot c msg] -> Graph c msg
-graphAny = Graph
-
 data GraphState c msg = GraphState
   { gsNext :: !Int
   , gsPrograms :: ![ProgramSlot c msg]
@@ -561,10 +536,13 @@ addProgram sys = GraphM $ \s ->
           }
   in (s', handleOf sys)
 
+program :: ProgramM c msg a -> GraphM c msg (Handle a)
+program = programM
+
 programM :: ProgramM c msg a -> GraphM c msg (Handle a)
 programM m = do
   h <- newHandleM
-  _ <- addProgram (program h m)
+  _ <- addProgram (ProgramDef h emptyLocals m m)
   pure h
 
 graphM :: GraphM c msg a -> (a, Graph c msg)
@@ -572,10 +550,8 @@ graphM m =
   let (s, a) = runGraphM m (GraphState 0 [])
   in (a, Graph (reverse (gsPrograms s)))
 
-graphM_ :: GraphM c msg () -> Graph c msg
-graphM_ = snd . graphM
-
-data ProgramKey (key :: Type)
+graph :: GraphM c msg () -> Graph c msg
+graph = snd . graphM
 
 data BatchOut c msg = BatchOut
   { boLocals :: Locals c msg -> Locals c msg
@@ -680,9 +656,10 @@ batchRun1With req forb g runArchetype =
 batchRun1 :: E.Sig -> E.Sig -> Gather c msg (a, BatchOut c msg) -> BatchRun c msg a
 batchRun1 req forb g = batchRun1With req forb g Nothing
 
-each :: E.Query c a -> (a -> EntityPatch c) -> Batch c msg ()
-each q f =
-  let E.Query runQ info = q
+each :: forall a c msg. E.Queryable c a => (a -> EntityPatch c) -> Batch c msg ()
+each f =
+  let q = E.query @a
+      E.Query runQ info = q
       req = E.requireQ info
       forb = E.forbidQ info
       stepQ e sig bag () =
@@ -716,21 +693,21 @@ mergeEachAcc a b =
     , eaInbox = eaInbox a
     }
 
-eachM :: forall (key :: Type) c msg a.
-  (Typeable key, Typeable msg) =>
-  E.Query c a ->
+eachM :: forall a c msg.
+  (Typeable a, Typeable msg, E.Queryable c a) =>
   (a -> EntityM c msg ()) ->
   Batch c msg ()
 {-# INLINE eachM #-}
-eachM q f =
-  let E.Query runQ info = q
+eachM f =
+  let q = E.query @a
+      E.Query runQ info = q
       req = E.requireQ info
       forb = E.forbidQ info
       runMatch e _ = runQ e
-  in eachMWith @key req forb runMatch f
+  in eachMWith req forb runMatch f
 
-eachMWith :: forall (key :: Type) c msg a.
-  (Typeable key, Typeable msg) =>
+eachMWith :: forall c msg a.
+  (Typeable a, Typeable msg) =>
   E.Sig ->
   E.Sig ->
   (Entity -> E.Sig -> E.Bag c -> Maybe a) ->
@@ -746,7 +723,7 @@ eachMWith req forb runMatch f =
       in batchRun1 req forb (Gather acc0 stepEntity doneEntity mergeEntity splitEntity)
     ) True
   where
-    progKey = E.typeIdOf @(ProgramKey key)
+    progKey = E.typeIdOf @a
     stepEntity e sig bag acc =
       case runMatch e sig bag of
         Nothing ->
@@ -901,7 +878,7 @@ class Monad m => MonadProgram c msg m | m -> c msg where
   send :: Events msg -> m ()
   dt :: m DTime
   awaitM :: Await c msg a -> m a
-  stepId :: (Typeable a, Typeable b) => E.TypeId -> F.Step a b -> a -> m b
+  stepM :: (Typeable a, Typeable b) => F.Step a b -> a -> m b
 
 await :: (MonadProgram c msg m, Awaitable c msg a b) => a -> m b
 await = awaitM . toAwait
@@ -919,9 +896,11 @@ instance MonadProgram c msg (ProgramM c msg) where
         case awaitGate waitOn (sysInbox ctx) of
           Nothing -> (ctx, ProgAwait waitOn pure)
           Just a -> (ctx, ProgDone a)
-  stepId key s0 a = ProgramM $ \ctx ->
+  stepM :: forall a b. (Typeable a, Typeable b) => F.Step a b -> a -> ProgramM c msg b
+  stepM s0 a = ProgramM $ \ctx ->
     let locals0 = sysLocals ctx
         globals0 = localsGlobal locals0
+        key = E.typeIdOf @(F.Step a b)
         s = maybe s0 unsafeCoerce (IntMap.lookup key globals0)
         (b, s') = stepS s (sysDt ctx) a
         globals' = IntMap.insert key (unsafeCoerce s') globals0
@@ -940,8 +919,10 @@ instance MonadProgram c msg (EntityM c msg) where
         case awaitGate waitOn (ctxInbox ctx) of
           Nothing -> (ctx, Wait (awaitM waitOn))
           Just a -> (ctx, Done a)
-  stepId key s0 a = EntityM $ \ctx ->
+  stepM :: forall a b. (Typeable a, Typeable b) => F.Step a b -> a -> EntityM c msg b
+  stepM s0 a = EntityM $ \ctx ->
     let machines0 = ctxMachines ctx
+        key = E.typeIdOf @(F.Step a b)
         s = maybe s0 unsafeCoerce (IntMap.lookup key machines0)
         (b, s') = stepS s (ctxDt ctx) a
         machines' = IntMap.insert key (unsafeCoerce s') machines0
@@ -966,16 +947,14 @@ world p = ProgramM $ \ctx ->
   in (ctx { sysWorld = w', sysPatch = patch' }, ProgDone ())
 
 
-data TimeKey
-
 time :: MonadProgram c msg m => m F.Time
-time = step @TimeKey F.time ()
+time = step F.time ()
 
 sample :: MonadProgram c msg m => F.Tween a -> m a
 sample tw = F.at tw <$> time
 
-step :: forall key a b c msg m. (MonadProgram c msg m, Typeable key, Typeable a, Typeable b) => F.Step a b -> a -> m b
-step = stepId (E.typeIdOf @key)
+step :: forall a b c msg m. (MonadProgram c msg m, Typeable a, Typeable b) => F.Step a b -> a -> m b
+step = stepM
 
 compute :: Batch c msg a -> Batch c msg a
 compute = id

@@ -43,3 +43,7 @@ Optimization principles:
 - Prefer simpler code when performance is within target budgets.
 - Use `program/10k/eachm` as the primary optimization benchmark.
 - Use `program/10k+1/eachm` as a secondary regression check only.
+
+# API Cleanup
+
+- Remove `programWith` (aim to keep only the auto-handle `program` path).
