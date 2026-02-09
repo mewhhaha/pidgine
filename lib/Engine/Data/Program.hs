@@ -80,7 +80,7 @@ import Control.Monad ((>=>), ap, forM_)
 import Control.Monad.ST (runST)
 import Control.Parallel.Strategies (parList, rseq, withStrategy)
 import Data.Bifunctor (first)
-import Data.Bits (bit, complement, setBit, testBit, (.&.), (.|.))
+import Data.Bits (bit, complement, (.&.), (.|.))
 import Data.Kind (Type)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
@@ -88,7 +88,6 @@ import qualified Data.IntSet as IntSet
 import Data.Maybe (fromMaybe)
 import qualified Data.Vector as V
 import qualified Data.Vector.Mutable as MV
-import Data.Word (Word64)
 import GHC.Exts (Any)
 import GHC.Conc (numCapabilities)
 import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef)
@@ -203,98 +202,36 @@ newtype Handle (a :: Type) = Handle
   { handleId :: ProgramId
   } deriving (Eq, Ord, Show)
 
-data ProgSet
-  = ProgSetSmall !Word64
-  | ProgSetBig !IntSet
+type ProgSet = IntSet
 
 type Done = ProgSet
 type Seen = ProgSet
 
 progSetEmpty :: IntSet -> ProgSet
-progSetEmpty allSet =
-  if IntSet.null allSet
-    then ProgSetSmall 0
-    else
-      let maxId = IntSet.findMax allSet
-      in if maxId < 64
-          then ProgSetSmall 0
-          else ProgSetBig IntSet.empty
+progSetEmpty _ = IntSet.empty
 
 progSetMember :: Int -> ProgSet -> Bool
-progSetMember i progSet =
-  case progSet of
-    ProgSetSmall bits ->
-      (i >= 0 && i < 64) && testBit bits i
-    ProgSetBig s -> IntSet.member i s
+progSetMember = IntSet.member
 
 progSetInsert :: Int -> ProgSet -> ProgSet
-progSetInsert i progSet =
-  case progSet of
-    ProgSetSmall bits ->
-      if i >= 0 && i < 64
-        then ProgSetSmall (setBit bits i)
-        else ProgSetBig (IntSet.insert i IntSet.empty)
-    ProgSetBig s -> ProgSetBig (IntSet.insert i s)
+progSetInsert = IntSet.insert
 
 progSetToIntSet :: ProgSet -> IntSet
-progSetToIntSet progSet =
-  case progSet of
-    ProgSetBig s -> s
-    ProgSetSmall bits ->
-      let go i acc =
-            if i >= 64
-              then acc
-              else
-                let acc' = if testBit bits i then IntSet.insert i acc else acc
-                in go (i + 1) acc'
-      in go 0 IntSet.empty
+progSetToIntSet = id
 
 intSetSubsetOfProgSet :: IntSet -> ProgSet -> Bool
-intSetSubsetOfProgSet xs progSet =
-  IntSet.foldl' (\ok i -> ok && progSetMember i progSet) True xs
+intSetSubsetOfProgSet = IntSet.isSubsetOf
 
-data Values
-  = ValuesMap !(IntMap.IntMap Any)
-  | ValuesVec !(V.Vector (Maybe Any))
+newtype Values = Values (IntMap.IntMap Any)
 
 valuesEmpty :: IntSet -> Values
-valuesEmpty allSet =
-  if IntSet.null allSet
-    then ValuesVec V.empty
-    else
-      let maxId = IntSet.findMax allSet
-          size = maxId + 1
-          dense = size <= 2048
-      in if dense
-          then ValuesVec (V.replicate size Nothing)
-          else ValuesMap IntMap.empty
+valuesEmpty _ = Values IntMap.empty
 
 valuesLookup :: ProgramId -> Values -> Maybe Any
-valuesLookup sid values =
-  case values of
-    ValuesMap m -> IntMap.lookup sid m
-    ValuesVec vec ->
-      if sid >= 0 && sid < V.length vec
-        then V.unsafeIndex vec sid
-        else Nothing
+valuesLookup sid (Values m) = IntMap.lookup sid m
 
 valuesInsert :: ProgramId -> Any -> Values -> Values
-valuesInsert sid v values =
-  case values of
-    ValuesMap m -> ValuesMap (IntMap.insert sid v m)
-    ValuesVec vec ->
-      if sid >= 0 && sid < V.length vec
-        then ValuesVec (vec V.// [(sid, Just v)])
-        else
-          let m = valuesVecToMap vec
-          in ValuesMap (IntMap.insert sid v m)
-
-valuesVecToMap :: V.Vector (Maybe Any) -> IntMap.IntMap Any
-valuesVecToMap =
-  V.ifoldl' (\acc i mv -> case mv of
-                            Nothing -> acc
-                            Just v -> IntMap.insert i v acc
-             ) IntMap.empty
+valuesInsert sid v (Values m) = Values (IntMap.insert sid v m)
 
 handle :: ProgramId -> Handle a
 handle = Handle
