@@ -26,16 +26,12 @@ module Engine.Data.ECS
   , entityRows
   , entityRowsV
   , matchingRows
-  , applyEntityRowUpdates
-  , applyArchetypeRunUpdates
   , stepWorld
   , worldHasSteps
   , driveStep
   , foldEntities
   , foldEntitiesFrom
   , mapEntities
-  , setEntityRows
-  , setEntityRowsV
   , setEntityRowsVSameShape
   , nextId
   , spawn
@@ -341,20 +337,6 @@ locDeleteKnown i locs = vecUpdate i Nothing locs
 locAppend :: Loc -> LocTable -> LocTable
 locAppend loc locs = V.snoc locs (Just loc)
 
-locSetGrow :: Int -> Loc -> LocTable -> Int -> (LocTable, Int)
-locSetGrow eid' loc locs locLen
-  | eid' < 0 = (locs, locLen)
-  | eid' < locLen = (locInsertKnown eid' loc locs, locLen)
-  | eid' == locLen = (locAppend loc locs, locLen + 1)
-  | otherwise =
-      let fillCount = eid' - locLen
-          tailCells =
-            if fillCount == 0
-              then [Just loc]
-              else replicate fillCount Nothing <> [Just loc]
-          locs' = locs V.++ V.fromList tailCells
-      in (locs', eid' + 1)
-
 entities :: World c -> [Entity]
 entities w =
   Foldable.foldr
@@ -400,19 +382,6 @@ mapEntities f w =
           (rowsW w)
   in setEntityRowsVSameShape rows' w
 
-setEntityRows :: [EntityRow c] -> World c -> World c
-setEntityRows rows = setEntityRowsV (V.fromList rows)
-
-setEntityRowsV :: V.Vector (EntityRow c) -> World c -> World c
-setEntityRowsV rows w =
-  let (locs', locLen') = buildLocsV (nextIdW w) rows
-  in w
-      { rowsW = rows
-      , entityLocW = locs'
-      , nextIdW = max (nextIdW w) locLen'
-      , entityCountW = Foldable.length rows
-      }
-
 -- | Fast replacement for row updates that preserve entity ids and row count.
 -- The location table remains valid and is intentionally reused.
 setEntityRowsVSameShape :: V.Vector (EntityRow c) -> World c -> World c
@@ -421,49 +390,6 @@ setEntityRowsVSameShape rows w =
     { rowsW = rows
     , entityCountW = entityCountW w
     }
-
-buildLocsV :: Int -> V.Vector (EntityRow c) -> (LocTable, Int)
-buildLocsV locLen0 rows =
-  V.ifoldl'
-    (\(locs, locLen) i (EntityRow eid' _ _) ->
-      locSetGrow eid' (Loc i) locs locLen
-    )
-    (locInit locLen0, locLen0)
-    rows
-
-applyEntityRowUpdates :: [(Sig, Int, EntityRow c)] -> World c -> World c
-applyEntityRowUpdates updates w =
-  case updates of
-    [] -> w
-    _ ->
-      let rows0 = rowsW w
-          stepOne rowsAcc (_, _, row@(EntityRow eid' _ _)) =
-            case locLookupWorld eid' w of
-              Nothing -> rowsAcc
-              Just (Loc idx) -> vecUpdate idx row rowsAcc
-          rows1 = foldl' stepOne rows0 updates
-      in setEntityRowsVSameShape rows1 w
-
-applyArchetypeRunUpdates :: [(Sig, V.Vector (EntityRow c))] -> World c -> World c
-applyArchetypeRunUpdates runs w =
-  case runs of
-    [] -> w
-    _ ->
-      let byEid =
-            foldl'
-              (\acc (_, rows) ->
-                Foldable.foldl'
-                  (\acc' row@(EntityRow eid' _ _) -> IntMap.insert eid' row acc')
-                  acc
-                  rows
-              )
-              IntMap.empty
-              runs
-          rows1 =
-            V.map
-              (\row@(EntityRow eid' _ _) -> IntMap.findWithDefault row eid' byEid)
-              (rowsW w)
-      in setEntityRowsVSameShape rows1 w
 
 matchingRows :: Sig -> Sig -> World c -> V.Vector (EntityRow c)
 matchingRows req forb w =
