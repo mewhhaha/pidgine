@@ -25,6 +25,8 @@ enable `DeriveGeneric` and `TypeApplications` where needed.
 - Continuous, async-first: programs are coroutines that run across frames; `await` is explicit and everything else stays pure.
 - `await` is overloaded: you can `await` a handle, an event predicate, or an explicit `Await` value.
 - Time is first-class: `Step`/`Signal`/`Tween` model time directly and can be used inside programs via `S.step`.
+- Movement / simulation should stay authoritative in components (`Pos`, `Vel`, etc.) and be advanced explicitly each tick.
+- `Tween`/`Step` is primarily for timed behavior and visual effect; interpolation is best used for presentation, not as the source of simulation truth.
 - Per-entity programs live in program locals: `eachM` creates per-entity programs keyed by the query result type and stored in program locals (not on entities), so entities only store components.
 - One sync point: `await (compute ...)` gathers `each`/`collect` and runs them in one pass.
 - Composition everywhere: queries are Applicative, patches are Semigroup/Monoid, steps compose, programs can `await` other programs/events.
@@ -35,11 +37,18 @@ Benchmarks focus on quick, game‑like scenarios so iteration stays fast.
 
 - `game/rooftop-duel`: 1 bird + 2 perches (collisions and steering).
 - `game/flock-10k`: 1 lead pigeon + 10k flock birds (simple chase + damage).
+- See the benchmark target names for your current goal (`program/10k/eachm`, `program/10k/eachm-aztecs`, etc.).
 
 Run:
 
 ```sh
-cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='+RTS -N -s -RTS'
+cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> +RTS -N -s -RTS'
+```
+
+Allocation comparisons:
+
+```sh
+cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> --iters 1000 +RTS -N -s -RTS'
 ```
 
 ## FRP: Practical examples
@@ -174,6 +183,32 @@ Note: `S.step` stores Step state keyed by the Step type (`F.Step a b`).
 If you need multiple independent steps with the same `a`/`b` types, wrap either `a` or `b` in a `newtype` so the Step type differs.
 Inside `eachM`, `S.step` becomes per‑entity automatically.
 Bind `S.step`/`S.time` once per tick if you need the value multiple times.
+
+### 2e) Simulation and render interpolation (recommended)
+
+Use interpolation as a render layer, not as the simulation source:
+
+1. Simulation program updates authoritative state (`Pos`, `Vel`) in a deterministic fixed step.
+2. Physics updates are applied to snapshot state only.
+3. Render code interpolates `prevPos -> curPos` with `alpha = frameAccum / fixedDt`.
+
+```haskell
+-- Pure interpolation helper used by the renderer.
+interpPos :: Double -> Pos -> Pos -> Pos
+interpPos alpha (Pos x0 y0) (Pos x1 y1) =
+  Pos (x0 + (x1 - x0) * alpha) (y0 + (y1 - y0) * alpha)
+
+-- Pseudocode in the host loop:
+--
+-- accum += frameDt
+-- while accum >= fixedDt:
+--   run one physics tick with dt = fixedDt
+--   accum -= fixedDt
+-- alpha = accum / fixedDt
+-- renderPos = interpPos alpha prevPos curPos
+```
+
+`PrevPos`/`CurPos` should stay separate from collision/simulation-critical state; keep gameplay based on the authoritative state only.
 
 ### 3) Delay and hold
 

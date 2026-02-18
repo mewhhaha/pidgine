@@ -484,7 +484,6 @@ data BatchOp c msg
       !E.Sig
       !E.Sig
       (Gather c msg (Any, BatchOut c msg))
-      !(Maybe (E.Sig -> RowVec c -> Any -> (Any, Bool, RowVec c)))
   | BatchOpStateless
       !E.Sig
       !E.Sig
@@ -498,31 +497,28 @@ data BatchRun c msg a = BatchRun
 
 data Batch c msg a = Batch
   !(DTime -> Inbox msg -> Locals c msg -> BatchRun c msg a)
-  !Bool
 
 instance Functor (Batch c msg) where
-  fmap f (Batch g parOk) =
+  fmap f (Batch g) =
     Batch
       (\d inbox locals ->
         let BatchRun ops n k = g d inbox locals
         in BatchRun ops n (\xs i -> let (a, i') = k xs i in (f a, i'))
       )
-      parOk
 
 instance Applicative (Batch c msg) where
-  pure a = Batch (\_ _ _ -> BatchRun V.empty 0 (\_ i -> (a, i))) True
-  Batch gf parF <*> Batch ga parA =
+  pure a = Batch (\_ _ _ -> BatchRun V.empty 0 (\_ i -> (a, i)))
+  Batch gf <*> Batch ga =
     Batch
       (\d inbox locals ->
         let BatchRun opsF nF kF = gf d inbox locals
             BatchRun opsA nA kA = ga d inbox locals
             k xs i0 =
-              let (f, i1) = kF xs i0
+              let (fVal, i1) = kF xs i0
                   (a, i2) = kA xs i1
-              in (f a, i2)
+              in (fVal a, i2)
         in BatchRun (opsF V.++ opsA) (nF + nA) k
       )
-      (parF && parA)
 
 data Gather c msg a where
   Gather ::
@@ -554,22 +550,18 @@ instance Applicative (Gather c msg) where
             (stA1, stA2) = splitA rows stA
         in ((stF1, stA1), (stF2, stA2))
 
-batchRun1With ::
+batchRun1 ::
   E.Sig ->
   E.Sig ->
   Gather c msg (a, BatchOut c msg) ->
-  Maybe (E.Sig -> RowVec c -> Any -> (Any, Bool, RowVec c)) ->
   BatchRun c msg a
-batchRun1With req forb g runArchetype =
+batchRun1 req forb g =
   let g' = fmap (first unsafeCoerce) g
       k xs i =
         if i < V.length xs
           then (unsafeCoerce (V.unsafeIndex xs i), i + 1)
           else error "compute: missing batch result"
-  in BatchRun (V.singleton (BatchOp req forb g' runArchetype)) 1 k
-
-batchRun1 :: E.Sig -> E.Sig -> Gather c msg (a, BatchOut c msg) -> BatchRun c msg a
-batchRun1 req forb g = batchRun1With req forb g Nothing
+  in BatchRun (V.singleton (BatchOp req forb g')) 1 k
 
 each :: forall a c msg. E.Queryable c a => (a -> EntityPatch c) -> Batch c msg ()
 each f =
@@ -584,7 +576,7 @@ each f =
             let (sig', bag') = runEntityPatchUnsafe (f a) sig bag
             in (sig', bag', ())
       doneQ () = ((), mempty)
-  in Batch (\_ _ _ -> batchRun1 req forb (Gather () stepQ doneQ (\_ _ -> ()) (\_ s -> (s, s)))) True
+  in Batch (\_ _ _ -> batchRun1 req forb (Gather () stepQ doneQ (\_ _ -> ()) (\_ s -> (s, s))))
 
 
 data EachAcc c msg = EachAcc
@@ -631,12 +623,12 @@ eachMWith :: forall c msg a.
 {-# INLINE eachMWith #-}
 eachMWith req forb runMatch f =
   Batch (\d inbox locals ->
-      let progMap0 :: IntMap.IntMap (ProgState c msg)
-          progMap0 =
-            maybe IntMap.empty unsafeCoerce (IntMap.lookup progKey (localsGlobal locals))
-          acc0 = emptyEachAcc d inbox progMap0
-      in batchRun1 req forb (Gather acc0 stepEntity doneEntity mergeEntity splitEntity)
-    ) True
+    let
+      progMap0 :: IntMap.IntMap (ProgState c msg)
+      progMap0 =
+        maybe IntMap.empty unsafeCoerce (IntMap.lookup progKey (localsGlobal locals))
+      acc0 = emptyEachAcc d inbox progMap0
+    in batchRun1 req forb (Gather acc0 stepEntity doneEntity mergeEntity splitEntity))
   where
     progKey = E.typeIdOf @a
     stepEntity e sig bag acc =
@@ -692,7 +684,7 @@ collect q =
           Nothing -> (sig, bag, acc)
           Just a -> (sig, bag, acc <> buildOne (e, a))
       doneQ acc = (buildToList acc, mempty)
-  in Batch (\_ _ _ -> batchRun1 req forb (Gather mempty stepQ doneQ (<>) (\_ s -> (s, s)))) True
+  in Batch (\_ _ _ -> batchRun1 req forb (Gather mempty stepQ doneQ (<>) (\_ s -> (s, s))))
 
 
 data ProgCtx c msg = ProgCtx
@@ -1043,7 +1035,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
       in (w', outFrom out, programs', runFlags', progressed, stepped1)
 
     compilePending dTime (PendingBatch pid locals inbox b cont) =
-      let Batch runBatch _ = b
+      let Batch runBatch = b
           BatchRun ops n k = runBatch dTime inbox locals
           kAny xs = unsafeCoerce (fst (k xs 0))
           contAny v = unsafeCoerce (cont (unsafeCoerce v))
@@ -1064,7 +1056,7 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
 
     opToStep pid op =
       case op of
-        BatchOp req forb g _runArchetype ->
+        BatchOp req forb g ->
           case g of
             Gather s stepFn doneFn mergeFn splitFn ->
               KernelStepStateful pid req forb s stepFn doneFn mergeFn splitFn
