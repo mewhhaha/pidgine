@@ -25,3 +25,7 @@ cabal.project.local
 *.orig
 *~
 .DS_Store
+
+# local codex/agent workspace files
+.codex/
+agents.md

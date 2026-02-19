@@ -32,7 +32,7 @@ module Engine.Data.ECS
   , foldEntities
   , foldEntitiesFrom
   , mapEntities
-  , setEntityRowsVSameShape
+  , setEntityRowsVSameShapeUnsafe
   , nextId
   , spawn
   , kill
@@ -57,6 +57,7 @@ module Engine.Data.ECS
   , bagEditSet
   , bagEditUpdate
   , bagEditDel
+  , bagEditDeletedMask
   , bagApplyEdit
   , bagApplyEditUnsafe
   , bagApplyEditPacked
@@ -180,6 +181,24 @@ bagEditToList edit =
     BagEdit2 a b -> [a, b]
     BagEditN ops -> ops
 
+bagEditDeletedMask :: BagEdit c -> Sig
+{-# INLINE bagEditDeletedMask #-}
+bagEditDeletedMask edit =
+  case edit of
+    BagEdit0 -> 0
+    BagEdit1 opA -> opMask opA
+    BagEdit2 opA opB -> opMask opA .|. opMask opB
+    BagEditN ops -> go 0 ops
+  where
+    opMask op =
+      case op of
+        BagOpDel bitIx -> bit bitIx
+        _ -> 0
+    go !acc ops =
+      case ops of
+        [] -> acc
+        op : rest -> go (acc .|. opMask op) rest
+
 stepStoreEmpty :: StepStore
 stepStoreEmpty = StepStore IntMap.empty
 
@@ -197,6 +216,18 @@ stepStoreDeleteEntity eid' (StepStore m) =
         let entMap' = IntMap.delete eid' entMap
         in if IntMap.null entMap' then Nothing else Just entMap'
   in StepStore (IntMap.mapMaybe dropOne m)
+
+stepStoreDeleteBitEntity :: Int -> Int -> StepStore -> StepStore
+stepStoreDeleteBitEntity bitIx eid' (StepStore m) =
+  case IntMap.lookup bitIx m of
+    Nothing -> StepStore m
+    Just entMap ->
+      let entMap' = IntMap.delete eid' entMap
+          m' =
+            if IntMap.null entMap'
+              then IntMap.delete bitIx m
+              else IntMap.insert bitIx entMap' m
+      in StepStore m'
 
 emptyBag :: forall c. ComponentId c => Bag c
 emptyBag =
@@ -380,12 +411,12 @@ mapEntities f w =
             in EntityRow eid' sig' bag'
           )
           (rowsW w)
-  in setEntityRowsVSameShape rows' w
+  in setEntityRowsVSameShapeUnsafe rows' w
 
 -- | Fast replacement for row updates that preserve entity ids and row count.
 -- The location table remains valid and is intentionally reused.
-setEntityRowsVSameShape :: V.Vector (EntityRow c) -> World c -> World c
-setEntityRowsVSameShape rows w =
+setEntityRowsVSameShapeUnsafe :: V.Vector (EntityRow c) -> World c -> World c
+setEntityRowsVSameShapeUnsafe rows w =
   w
     { rowsW = rows
     , entityCountW = entityCountW w
@@ -671,12 +702,16 @@ runQuerySig q sig e bag =
 keyOfType :: forall c a. (Component c a, ComponentBit c a) => Key c
 keyOfType = Key (componentBitOf @c @a)
 
-bagGetBy :: Int -> Bag c -> Maybe Any
-bagGetBy bitIx (Bag mask vals) =
-  staticLookup mask vals bitIx
-
 bagGetByTyped :: forall a c. Int -> Bag c -> Maybe a
-bagGetByTyped bitIx bag = unsafeCoerce <$> bagGetBy bitIx bag
+{-# INLINE bagGetByTyped #-}
+bagGetByTyped bitIx (Bag mask vals) =
+  if maskHas mask bitIx
+    then Just (unsafeCoerce (V.unsafeIndex vals (staticIndex mask bitIx)))
+    else Nothing
+
+bagHasBit :: Int -> Bag c -> Bool
+{-# INLINE bagHasBit #-}
+bagHasBit bitIx (Bag mask _) = maskHas mask bitIx
 
 bagGet :: forall c a. (Component c a, ComponentBit c a) => Bag c -> Maybe a
 bagGet = bagGetByTyped (componentBitOf @c @a)
@@ -761,15 +796,49 @@ hasStructuralEdit mask0 =
             then True
             else go mask ops
 
+applyNonStructuralOps :: Sig -> V.Vector Any -> [BagOp] -> V.Vector Any
+{-# INLINE applyNonStructuralOps #-}
+applyNonStructuralOps mask vals ops =
+  V.modify
+    (\mv ->
+      forM_ ops $ \op ->
+        case op of
+          BagOpSet bitIx vAny ->
+            if maskHas mask bitIx
+              then do
+                let i = staticIndex mask bitIx
+                old <- MV.unsafeRead mv i
+                if ptrEq old vAny
+                  then pure ()
+                  else MV.unsafeWrite mv i vAny
+              else pure ()
+          BagOpUpdate bitIx fAny ->
+            if maskHas mask bitIx
+              then do
+                let i = staticIndex mask bitIx
+                cur <- MV.unsafeRead mv i
+                let cur' = fAny cur
+                if ptrEq cur cur'
+                  then pure ()
+                  else MV.unsafeWrite mv i cur'
+              else pure ()
+          BagOpDel _ -> pure ()
+    )
+    vals
+
 bagApplyEditPacked :: BagEdit c -> Bag c -> Bag c
 bagApplyEditPacked edit bag0@(Bag mask0 vals0) =
   case edit of
     BagEdit0 -> bag0
     BagEdit1 _ -> bagApplyEdit edit bag0
-    BagEdit2 _ _ -> bagApplyEdit edit bag0
+    BagEdit2 opA opB ->
+      let ops = [opA, opB]
+      in if hasStructuralEdit mask0 ops
+          then bagApplyEdit edit bag0
+          else Bag mask0 (applyNonStructuralOps mask0 vals0 ops)
     BagEditN ops
       | not (hasStructuralEdit mask0 ops) ->
-          bagApplyEdit edit bag0
+          Bag mask0 (applyNonStructuralOps mask0 vals0 ops)
       | otherwise ->
       runST $ do
         let maxBits = finiteBitSize (0 :: Sig)
@@ -853,7 +922,22 @@ set :: forall a c. (Component c a, ComponentBit c a) => Entity -> a -> World c -
 set e a = updateEntityBag (bagSet a) e
 
 del :: forall a c. (Component c a, ComponentBit c a) => Entity -> World c -> World c
-del = updateEntityBag (bagDel @a)
+del e w =
+  let eid' = eid e
+      bitIx = componentBitOf @c @a
+      store' = stepStoreDeleteBitEntity bitIx eid' (stepStoreW w)
+  in case locLookupWorld eid' w of
+      Nothing -> w { stepStoreW = store' }
+      Just (Loc idx) ->
+        let rows0 = rowsW w
+            EntityRow _ sig0 bag = rows0 V.! idx
+            bag' = bagDelByBit bitIx bag
+            staticOld = bagMask bag
+            stepBits = (sig0 .&. complement staticOld) .&. complement (bit bitIx)
+            sig' = bagMask bag' .|. stepBits
+            row' = EntityRow eid' sig' bag'
+            rows' = vecUpdate idx row' rows0
+        in w { rowsW = rows', stepStoreW = store' }
 
 driveStep :: forall a c. (Component c a, ComponentBit c a) => Entity -> F.Step () a -> World c -> World c
 driveStep e s0 w =
@@ -920,29 +1004,60 @@ data Query c a = Query
 queryInfo :: Query c a -> QueryInfo
 queryInfo = queryInfoQ
 
+mapQuery :: (a -> b) -> Query c a -> Query c b
+{-# INLINE mapQuery #-}
+mapQuery f (Query q qi) =
+  Query
+    (\e bag ->
+      case q e bag of
+        Nothing -> Nothing
+        Just a -> Just (f a)
+    )
+    qi
+
 instance Functor (Query c) where
-  fmap f (Query q qi) = Query (\e bag -> fmap f (q e bag)) qi
+  fmap = mapQuery
 
 instance Applicative (Query c) where
   pure a = Query (\_ _ -> Just a) mempty
-  Query f qiF <*> Query g qiG = Query (\e bag -> f e bag <*> g e bag) (qiF <> qiG)
+  Query f qiF <*> Query g qiG = Query run (qiF <> qiG)
+    where
+      run e bag =
+        case f e bag of
+          Nothing -> Nothing
+          Just h ->
+            case g e bag of
+              Nothing -> Nothing
+              Just a -> Just (h a)
 
 instance Monad (Query c) where
-  Query q _ >>= f = Query (\e bag -> q e bag >>= \a -> runQuery (f a) e bag) mempty
+  Query q _ >>= f = Query run mempty
+    where
+      run e bag =
+        case q e bag of
+          Nothing -> Nothing
+          Just a -> runQuery (f a) e bag
 
 instance Alternative (Query c) where
   empty = Query (\_ _ -> Nothing) mempty
-  Query a _ <|> Query b _ = Query (\e bag -> a e bag <|> b e bag) mempty
+  Query a _ <|> Query b _ = Query run mempty
+    where
+      run e bag =
+        case a e bag of
+          Just x -> Just x
+          Nothing -> b e bag
 
 comp :: forall a c. (Component c a, ComponentBit c a) => Query c a
 comp =
   let bitIx = componentBitOf @c @a
   in Query (\_ bag -> bagGetByTyped bitIx bag) (QueryInfo (bit bitIx) 0)
+{-# INLINE comp #-}
 
 opt :: forall a c. (Component c a, ComponentBit c a) => Query c (Maybe a)
 opt =
   let bitIx = componentBitOf @c @a
   in Query (\_ bag -> Just (bagGetByTyped bitIx bag)) mempty
+{-# INLINE opt #-}
 
 data Has a = Has deriving (Eq, Show)
 data Not a = Not deriving (Eq, Show)
@@ -950,14 +1065,16 @@ data Not a = Not deriving (Eq, Show)
 hasQ :: forall a c. (Component c a, ComponentBit c a) => Query c (Has a)
 hasQ =
   let bitIx = componentBitOf @c @a
-  in Query (\_ bag -> if isJust (bagGetByTyped @a bitIx bag) then Just Has else Nothing)
+  in Query (\_ bag -> if bagHasBit bitIx bag then Just Has else Nothing)
       (QueryInfo (bit bitIx) 0)
+{-# INLINE hasQ #-}
 
 notQ :: forall a c. (Component c a, ComponentBit c a) => Query c (Not a)
 notQ =
   let bitIx = componentBitOf @c @a
-  in Query (\_ bag -> if isJust (bagGetByTyped @a bitIx bag) then Nothing else Just Not)
+  in Query (\_ bag -> if bagHasBit bitIx bag then Nothing else Just Not)
       (QueryInfo 0 (bit bitIx))
+{-# INLINE notQ #-}
 
 runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
@@ -1001,15 +1118,19 @@ class QueryField c a where
 
 instance {-# OVERLAPPABLE #-} (Component c a, ComponentBit c a) => QueryField c a where
   fieldQuery = comp
+  {-# INLINE fieldQuery #-}
 
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Maybe a) where
   fieldQuery = opt
+  {-# INLINE fieldQuery #-}
 
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Has a) where
   fieldQuery = hasQ
+  {-# INLINE fieldQuery #-}
 
 instance {-# OVERLAPPING #-} (Component c a, ComponentBit c a) => QueryField c (Not a) where
   fieldQuery = notQ
+  {-# INLINE fieldQuery #-}
 
 class Queryable c a where
   queryC :: Query c a
@@ -1019,53 +1140,129 @@ class QueryableAuto (isComp :: Bool) c a where
 
 instance (Component c a, ComponentBit c a) => QueryableAuto 'True c a where
   queryAuto = comp
+  {-# INLINE queryAuto #-}
 
 instance (Generic a, GQueryable c (Rep a)) => QueryableAuto 'False c a where
-  queryAuto = to <$> gquery
+  queryAuto = Query run (queryInfoQ q)
+    where
+      q = gquery @c @(Rep a)
+      run e bag =
+        case runQuery q e bag of
+          Nothing -> Nothing
+          Just x -> Just (to x)
+  {-# INLINE queryAuto #-}
 
 instance (Generic c, QueryableAuto (HasType (Rep c) a) c a) => Queryable c a where
   queryC = queryAuto @(HasType (Rep c) a) @c @a
+  {-# INLINE queryC #-}
 
 class QueryableSum c a where
   querySumC :: Query c a
   default querySumC :: (Generic a, GQueryableSum c (Rep a)) => Query c a
-  querySumC = to <$> gquerySum
+  querySumC = Query run (queryInfoQ q)
+    where
+      q = gquerySum @c @(Rep a)
+      run e bag =
+        case runQuery q e bag of
+          Nothing -> Nothing
+          Just x -> Just (to x)
+  {-# INLINE querySumC #-}
 
 query :: forall a c. Queryable c a => Query c a
 query = queryC @c @a
+{-# INLINE query #-}
 
 querySum :: forall a c. QueryableSum c a => Query c a
 querySum = querySumC @c @a
+{-# INLINE querySum #-}
 
 class GQueryable c f where
   gquery :: Query c (f p)
 
 instance GQueryable c U1 where
-  gquery = pure U1
+  gquery = Query (\_ _ -> Just U1) mempty
+  {-# INLINE gquery #-}
 
 instance GQueryable c f => GQueryable c (M1 i m f) where
-  gquery = M1 <$> gquery
+  gquery = Query run (queryInfoQ q)
+    where
+      q = gquery @c @f
+      run e bag =
+        case runQuery q e bag of
+          Nothing -> Nothing
+          Just x -> Just (M1 x)
+  {-# INLINE gquery #-}
 
 instance (GQueryable c a, GQueryable c b) => GQueryable c (a :*: b) where
-  gquery = (:*:) <$> gquery <*> gquery
+  gquery = Query run (queryInfoQ qa <> queryInfoQ qb)
+    where
+      qa = gquery @c @a
+      qb = gquery @c @b
+      run e bag =
+        case runQuery qa e bag of
+          Nothing -> Nothing
+          Just a ->
+            case runQuery qb e bag of
+              Nothing -> Nothing
+              Just b -> Just (a :*: b)
+  {-# INLINE gquery #-}
 
 instance QueryField c a => GQueryable c (K1 i a) where
-  gquery = K1 <$> fieldQuery
+  gquery = Query run (queryInfoQ q)
+    where
+      q = fieldQuery @c @a
+      run e bag =
+        case runQuery q e bag of
+          Nothing -> Nothing
+          Just x -> Just (K1 x)
+  {-# INLINE gquery #-}
 
 class GQueryableSum c f where
   gquerySum :: Query c (f p)
 
 instance (GQueryableSum c a, GQueryableSum c b) => GQueryableSum c (a :+: b) where
-  gquerySum = (L1 <$> gquerySum) <|> (R1 <$> gquerySum)
+  gquerySum = Query run mempty
+    where
+      qa = gquerySum @c @a
+      qb = gquerySum @c @b
+      run e bag =
+        case runQuery qa e bag of
+          Just l -> Just (L1 l)
+          Nothing ->
+            case runQuery qb e bag of
+              Nothing -> Nothing
+              Just r -> Just (R1 r)
+  {-# INLINE gquerySum #-}
 
 instance GQueryableSum c f => GQueryableSum c (M1 D m f) where
-  gquerySum = M1 <$> gquerySum
+  gquerySum = Query run (queryInfoQ q)
+    where
+      q = gquerySum @c @f
+      run e bag =
+        case runQuery q e bag of
+          Nothing -> Nothing
+          Just x -> Just (M1 x)
+  {-# INLINE gquerySum #-}
 
 instance GQueryableSum c f => GQueryableSum c (M1 S m f) where
-  gquerySum = M1 <$> gquerySum
+  gquerySum = Query run (queryInfoQ q)
+    where
+      q = gquerySum @c @f
+      run e bag =
+        case runQuery q e bag of
+          Nothing -> Nothing
+          Just x -> Just (M1 x)
+  {-# INLINE gquerySum #-}
 
 instance GQueryable c f => GQueryableSum c (M1 C m f) where
-  gquerySum = M1 <$> gquery
+  gquerySum = Query run (queryInfoQ q)
+    where
+      q = gquery @c @f
+      run e bag =
+        case runQuery q e bag of
+          Nothing -> Nothing
+          Just x -> Just (M1 x)
+  {-# INLINE gquerySum #-}
 
 put :: forall a c. Typeable a => a -> World c -> World c
 put a w =

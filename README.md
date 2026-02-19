@@ -27,7 +27,7 @@ enable `DeriveGeneric` and `TypeApplications` where needed.
 - Time is first-class: `Step`/`Signal`/`Tween` model time directly and can be used inside programs via `S.step`.
 - Movement / simulation should stay authoritative in components (`Pos`, `Vel`, etc.) and be advanced explicitly each tick.
 - `Tween`/`Step` is primarily for timed behavior and visual effect; interpolation is best used for presentation, not as the source of simulation truth.
-- Per-entity programs live in program locals: `eachM` creates per-entity programs keyed by the query result type and stored in program locals (not on entities), so entities only store components.
+- Per-entity programs live in program locals: `eachM` creates per-entity programs keyed by callsite + query type and stored in program locals (not on entities), so entities only store components.
 - One sync point: `await (compute ...)` gathers `each`/`collect` and runs them in one pass.
 - Composition everywhere: queries are Applicative, patches are Semigroup/Monoid, steps compose, programs can `await` other programs/events.
 
@@ -35,9 +35,12 @@ enable `DeriveGeneric` and `TypeApplications` where needed.
 
 Benchmarks focus on quick, game‑like scenarios so iteration stays fast.
 
-- `game/rooftop-duel`: 1 bird + 2 perches (collisions and steering).
+- `game/rooftop-duel`: 1 bird + 2 perches (collaboration steering + collisions).
 - `game/flock-10k`: 1 lead pigeon + 10k flock birds (simple chase + damage).
-- See the benchmark target names for your current goal (`program/10k/eachm`, `program/10k/eachm-aztecs`, etc.).
+- `program/10k/eachm`: same workload as `game/flock-10k` with primary engine target name.
+- `program/10k/eachm-aztecs`: alias to `program/10k/eachm` for parity with roadmap docs.
+- `program/10k+1/eachm`: same as `program/10k/eachm` but with 10k+1 entities.
+- `program/10k+1/eachm-aztecs`: informational variant of `program/10k+1/eachm`.
 
 Run:
 
@@ -45,10 +48,22 @@ Run:
 cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> +RTS -N -s -RTS'
 ```
 
-Allocation comparisons:
+Run allocation comparisons with fixed iterations:
 
 ```sh
 cabal bench pidgine-bench --ghc-options=-O2 --benchmark-options='-m glob <benchmark-name> --iters 1000 +RTS -N -s -RTS'
+```
+
+Run the full target set with optional allocation budgets:
+
+```sh
+./scripts/bench-guard.sh
+```
+
+Run continuously while tuning:
+
+```sh
+./scripts/bench-guard.sh --loop
 ```
 
 ## FRP: Practical examples
@@ -179,8 +194,8 @@ wiggleProg = do
   pure ()
 ```
 
-Note: `S.step` stores Step state keyed by the Step type (`F.Step a b`).
-If you need multiple independent steps with the same `a`/`b` types, wrap either `a` or `b` in a `newtype` so the Step type differs.
+Note: `S.step` stores Step state keyed by step callsite + Step type (`F.Step a b`).
+Independent calls with the same `a`/`b` types remain isolated by callsite.
 Inside `eachM`, `S.step` becomes per‑entity automatically.
 Bind `S.step`/`S.time` once per tick if you need the value multiple times.
 
@@ -417,7 +432,7 @@ Program (coroutine)
   - handle id
   - step state
   - local state (per-program)
-  - per-entity programs (eachM) stored in program locals (keyed by EntityId + query type)
+  - per-entity programs (`eachM`) stored in program locals (keyed by EntityId + eachM callsite + query type)
 ```
 
 Entities own only components; program-local programs/state are not stored on entities.
@@ -679,8 +694,8 @@ If you want `do`‑notation inside `compute`, enable `ApplicativeDo`.
 For per‑entity continuations, use `eachM` with a monadic body. This gives each
 entity its own time/state machine without storing Steps in components.
 `eachM` resumes the per‑entity program; it is intentionally entity‑local (edit/await/send/step).
-Per‑entity state is keyed by the **query result type**, so two `eachM` loops with the
-same query type in the same program will share per‑entity state.
+Per‑entity state is keyed by **eachM callsite + query result type**, so independent
+loops over the same query type do not share state.
 Note: some longer examples below still show `gather` or `each` with `edit`; translate
 them to `await (compute ...)` and `eachM` when you need monadic actions.
 If you need fresh data or cross‑entity effects, split into another program and communicate
@@ -744,9 +759,9 @@ runFrame dt w g =
   in (w', g')
 ```
 
-Note: Programs are evaluated in parallel per round against the same snapshot/inbox.
-Patches are merged in list order after the round, so program order only affects
-patch merge, not in‑round visibility.
+Note: Programs share the same event inbox snapshot per round, but world updates are
+applied in program-list order within the round. Program order therefore affects
+in-round world visibility and final patch merge order.
 
 Patch helpers also support update-in-place:
 
@@ -819,7 +834,7 @@ g0 =
 ### 3) Program order semantics
 
 ```haskell
--- Programs run in parallel per round; list order only affects patch merge order.
+-- Programs share an inbox snapshot per round, but world updates apply in list order.
 data WritePos
 data ReadPos
 
@@ -1251,7 +1266,7 @@ enemyProg = do
 
 `eachM` state-machine behavior:
 - One continuation per matching entity (stored in program locals, not on components).
-- `S.step` state is per-entity inside `eachM`, keyed by step type.
+- `S.step` state is per-entity inside `eachM`, keyed by step callsite + step type.
 - If an entity stops matching the query, its `eachM` continuation/state is dropped.
 
 ---
@@ -1690,7 +1705,7 @@ questGraph =
 ## Pain points (current)
 
 - No built-in IO/async runtime: `Job`/`Events` are data only; you need an external executor.
-- Program graph runs in parallel per round; ordering only affects patch merge, not in‑round visibility.
+- Program graph shares an inbox snapshot per round, but world updates are applied in list order; ordering affects visibility and patch merge.
 - Patch conflicts are resolved by list order; no merge policy beyond `Semigroup` order.
 - Waiting programs are re-run within a frame; misbehaving programs can loop forever.
 - `QueryableSum` skips signature pruning; sum queries scan all entities.

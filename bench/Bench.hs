@@ -309,4 +309,28 @@ main = defaultMain
             in forceEachm w1
           ) w
       ]
+  , bgroup "program/10k"
+      [ let w = buildWorldVampire 10000
+        in bench "eachm" $ nf (\w0 ->
+            let (w1, _, _) = S.run 0.016 w0 [] graphVampire
+            in forceEachm w1
+          ) w
+      , let w = buildWorldVampire 10000
+        in bench "eachm-aztecs" $ nf (\w0 ->
+            let (w1, _, _) = S.run 0.016 w0 [] graphVampire
+            in forceEachm w1
+          ) w
+      ]
+  , bgroup "program/10k+1"
+      [ let w = buildWorldVampire 10001
+        in bench "eachm" $ nf (\w0 ->
+            let (w1, _, _) = S.run 0.016 w0 [] graphVampire
+            in forceEachm w1
+          ) w
+      , let w = buildWorldVampire 10001
+        in bench "eachm-aztecs" $ nf (\w0 ->
+            let (w1, _, _) = S.run 0.016 w0 [] graphVampire
+            in forceEachm w1
+          ) w
+      ]
   ]

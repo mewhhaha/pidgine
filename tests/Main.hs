@@ -86,8 +86,15 @@ main = do
   assert "program await value" program_await_value
   assert "each per-entity" program_eachm_entity_state
   assert "eachM enemy ai state machine" program_eachm_enemy_state_machine
+  assert "eachM independent loops" program_eachm_independent_loops
+  assert "step independent callsites" program_step_independent_callsites
+  assert "drive + del stops step updates" program_drive_del_stops
   assert "each tuple query" program_each_tuple_query
+  assert "patch monoid identity" (prop_program_patch_identity 7)
+  assert "patch monoid associativity" (prop_program_patch_assoc 11)
   assert "compute fused order" program_compute_fused_order
+  assert "compute fused collect order" program_collect_fused_order
+  assert "event chain" program_event_chain
 
   results <-
     sequence
@@ -105,11 +112,15 @@ main = do
       , quickCheckResult prop_query_alt
       , quickCheckResult prop_query_queryable
       , quickCheckResult prop_query_queryable_sum
+      , quickCheckResult prop_bag_apply_edit_packed_non_structural
       , quickCheckResult prop_relations
       , quickCheckResult prop_parent_child
       , quickCheckResult prop_transform_inverse
       , quickCheckResult prop_program_resume
       , quickCheckResult prop_program_await_value
+      , quickCheckResult prop_program_patch_identity
+      , quickCheckResult prop_program_patch_assoc
+      , quickCheckResult prop_program_collect_fused
       ]
 
   if all isSuccess results

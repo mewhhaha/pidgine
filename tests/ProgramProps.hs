@@ -6,10 +6,18 @@ module ProgramProps
   , program_await_value
   , program_eachm_entity_state
   , program_eachm_enemy_state_machine
+  , program_eachm_independent_loops
+  , program_step_independent_callsites
+  , program_drive_del_stops
   , program_each_tuple_query
   , program_compute_fused_order
+  , program_collect_fused_order
+  , program_event_chain
   , prop_program_resume
   , prop_program_await_value
+  , prop_program_patch_identity
+  , prop_program_patch_assoc
+  , prop_program_collect_fused
   ) where
 
 import Data.List (foldl')
@@ -27,6 +35,12 @@ data Marker = Marker
 newtype Count = Count Int
   deriving (Eq, Show)
 
+newtype LoopA = LoopA Int
+  deriving (Eq, Show)
+
+newtype LoopB = LoopB Int
+  deriving (Eq, Show)
+
 data EnemyTag = EnemyTag
   deriving (Eq, Show)
 
@@ -41,6 +55,8 @@ data C
   = CInt Int
   | CBool Bool
   | CCount Count
+  | CLoopA LoopA
+  | CLoopB LoopB
   | CMarker Marker
   | CEnemy EnemyTag
   | CEnemyAI EnemyAI
@@ -60,6 +76,32 @@ computeS = S.compute
 
 computeU :: S.Batch C () a -> S.Batch C () a
 computeU = S.compute
+
+runPatch :: S.Patch C -> World -> World
+runPatch p w0 =
+  let g0 :: Graph ()
+      g0 =
+        S.graph $ do
+          _ <- S.program (S.world p)
+          pure ()
+      (w1, _, _) = S.run 0.1 w0 [] g0
+  in w1
+
+countsCompute :: S.Batch C (Int, Int) (Int, Int)
+countsCompute =
+  (,) <$> (length . map snd <$> S.collect qMarker)
+      <*> (S.each @Int (const (S.set Marker)) *> fmap length (S.collect qMarker))
+
+runCollectGraph :: World -> (World, S.Events (Int, Int), Graph (Int, Int))
+runCollectGraph w0 =
+  let g0 :: Graph (Int, Int)
+      g0 =
+        S.graph $ do
+          _ <- S.program $ do
+            counts <- S.await $ S.compute countsCompute
+            S.send [counts]
+          pure ()
+  in S.run 0.1 w0 [] g0
 
 program_resume_once :: Bool
 program_resume_once =
@@ -197,6 +239,77 @@ program_eachm_entity_state =
       && E.get @Count e1 w4 == Just (Count 2)
       && E.get @Count e2 w4 == Just (Count 2)
 
+program_eachm_independent_loops :: Bool
+program_eachm_independent_loops =
+  let (e, w0) = E.spawn (Count 0) (E.emptyWorld :: World)
+      prog :: ProgramM () ()
+      prog = do
+        _ <- S.await $ computeU $
+          S.eachM @Count (\_ -> do
+            n <- S.step (F.acc (0 :: Int)) [(+1)]
+            S.edit (S.set (LoopA n))
+          ) *>
+          S.eachM @Count (\_ -> do
+            n <- S.step (F.acc (100 :: Int)) [(+10)]
+            S.edit (S.set (LoopB n))
+          )
+        pure ()
+      g0 :: Graph ()
+      g0 =
+        S.graph $ do
+          _ <- S.program prog
+          pure ()
+      (w1, _, g1) = S.run 0.1 w0 [] g0
+      (w2, _, _) = S.run 0.1 w1 [] g1
+  in E.get @LoopA e w1 == Just (LoopA 1)
+      && E.get @LoopB e w1 == Just (LoopB 110)
+      && E.get @LoopA e w2 == Just (LoopA 2)
+      && E.get @LoopB e w2 == Just (LoopB 120)
+
+program_step_independent_callsites :: Bool
+program_step_independent_callsites =
+  let prog :: ProgramM (Int, Int) ()
+      prog = do
+        a <- S.step (F.acc (0 :: Int)) [(+1)]
+        b <- S.step (F.acc (100 :: Int)) [(+10)]
+        S.send [(a, b)]
+      g0 :: Graph (Int, Int)
+      g0 =
+        S.graph $ do
+          _ <- S.program prog
+          pure ()
+      (w1, out1, g1) = S.run 0.1 (E.emptyWorld :: World) [] g0
+      (_, out2, _) = S.run 0.1 w1 [] g1
+  in out1 == [(1, 110)] && out2 == [(2, 120)]
+
+counterStep :: Int -> F.Step () Int
+counterStep n = F.Step $ \_ () -> (n, counterStep (n + 1))
+
+tickDriven :: ProgramM () ()
+tickDriven = do
+  _ <- S.await $ computeU $
+    S.each @() (const mempty)
+  pure ()
+
+program_drive_del_stops :: Bool
+program_drive_del_stops =
+  let (e, w0) = E.spawn () (E.emptyWorld :: World)
+      w1 = runPatch (S.drive e (counterStep 0)) w0
+      g0 :: Graph ()
+      g0 =
+        S.graph $ do
+          _ <- S.program tickDriven
+          pure ()
+      (w2, _, g1) = S.run 0.1 w1 [] g0
+      w3 = runPatch (S.at e (S.del @Int)) w2
+      (w4, _, g2) = S.run 0.1 w3 [] g1
+      (w5, _, _) = S.run 0.1 w4 [] g2
+  in E.get @Int e w1 == Just 0
+      && E.get @Int e w2 == Just 1
+      && E.get @Int e w3 == Nothing
+      && E.get @Int e w4 == Nothing
+      && E.get @Int e w5 == Nothing
+
 program_each_tuple_query :: Bool
 program_each_tuple_query =
   let (e, w0) = E.spawn ((3 :: Int), True) (E.emptyWorld :: World)
@@ -232,6 +345,57 @@ program_compute_fused_order =
           pure ()
       (w1, _, _) = S.run 0.1 w0 [] g0
   in E.get @Int e w1 == Just 1
+
+prop_program_patch_identity :: Int -> Bool
+prop_program_patch_identity x =
+  let (e, w0) = E.spawn (x :: Int) (E.emptyWorld :: World)
+      w1 = runPatch (mempty :: S.Patch C) w0
+  in E.get @Int e w1 == Just x
+
+prop_program_patch_assoc :: Int -> Bool
+prop_program_patch_assoc x =
+  let (e, w0) = E.spawn (x :: Int) (E.emptyWorld :: World)
+      p1 = S.at e (S.set (x + 1))
+      p2 = S.at e (S.set (x + 2))
+      p3 = S.at e (S.set (x + 3))
+      w1 = runPatch (p1 <> (p2 <> p3)) w0
+      w2 = runPatch ((p1 <> p2) <> p3) w0
+  in E.get @Int e w1 == Just (x + 3)
+      && E.get @Int e w1 == E.get @Int e w2
+
+program_collect_fused_order :: Bool
+program_collect_fused_order =
+  let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
+      (w1, out, _) = runCollectGraph w0
+  in out == [(0, 1)] && E.get @Marker e w1 == Just Marker
+
+prop_program_collect_fused :: Int -> Bool
+prop_program_collect_fused x =
+  let (_, w0) = E.spawn (x :: Int) (E.emptyWorld :: World)
+      (_, out, _) = runCollectGraph w0
+  in out == [(0, 1)]
+
+program_event_chain :: Bool
+program_event_chain =
+  let (e, w0) = E.spawn (Count 0) (E.emptyWorld :: World)
+      g0 :: Graph Int
+      g0 =
+        S.graph $ do
+          _ <- S.program (S.send [1 :: Int])
+          _ <- S.program $ do
+            _ <- S.await (== (1 :: Int))
+            S.world (S.at e (S.set (Count 1)))
+            S.send [2 :: Int]
+          _ <- S.program $ do
+            _ <- S.await (== (2 :: Int))
+            S.world (S.at e (S.set (Count 2)))
+            S.send [3 :: Int]
+          _ <- S.program $ do
+            _ <- S.await (== (3 :: Int))
+            S.world (S.at e (S.set (Count 3)))
+          pure ()
+      (w1, _, _) = S.run 0.1 w0 [] g0
+  in E.get @Count e w1 == Just (Count 3)
 
 data Phase = Start | Wait
   deriving (Eq, Show)
