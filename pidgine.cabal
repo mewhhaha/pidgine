@@ -39,6 +39,7 @@ test-suite pidgine-tests
     type:             exitcode-stdio-1.0
     hs-source-dirs:   tests
     main-is:          Main.hs
+    ghc-options:      -threaded -rtsopts
     other-modules:    FRPProps
                       ECSProps
                       ProgramProps

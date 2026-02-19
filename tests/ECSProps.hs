@@ -12,6 +12,7 @@ module ECSProps
   , prop_query_queryable
   , prop_query_queryable_sum
   , prop_bag_apply_edit_packed_non_structural
+  , prop_bag_apply_edit_packed_structural
   , prop_relations
   , prop_parent_child
   , prop_transform_inverse
@@ -107,6 +108,31 @@ prop_bag_apply_edit_packed_non_structural x b dx dy =
             && E.bagGet @C @T.Local bagA == E.bagGet @C @T.Local bagB
             && E.bagGet @C @T.Global bagA == E.bagGet @C @T.Global bagB
   in sameResult edit2 && sameResult editN
+
+prop_bag_apply_edit_packed_structural :: Int -> Bool -> Int -> Int -> Bool
+prop_bag_apply_edit_packed_structural x b dx dy =
+  let (_, w0) = E.spawn (x, b) (E.emptyWorld :: World)
+      bag0 =
+        case E.entityRows w0 of
+          E.EntityRow _ _ bag : _ -> bag
+          [] -> error "expected spawned entity"
+      local = T.Local (T.translate (fromIntegral dx, fromIntegral dy, 0))
+      editSetMissing = E.bagEditSet @C @T.Local local
+      editDelPresent = E.bagEditDel @C @Bool
+      editMixed =
+        editSetMissing
+          <> E.bagEditUpdate @C @Int (+ dx)
+          <> editDelPresent
+          <> E.bagEditSet @C @Bool (not b)
+      sameResult edit =
+        let bagA = E.bagApplyEdit edit bag0
+            bagB = E.bagApplyEditPacked edit bag0
+        in E.sigFromBag bagA == E.sigFromBag bagB
+            && E.bagGet @C @Int bagA == E.bagGet @C @Int bagB
+            && E.bagGet @C @Bool bagA == E.bagGet @C @Bool bagB
+            && E.bagGet @C @T.Local bagA == E.bagGet @C @T.Local bagB
+            && E.bagGet @C @T.Global bagA == E.bagGet @C @T.Global bagB
+  in sameResult editSetMissing && sameResult editDelPresent && sameResult editMixed
 
 data Owns
 

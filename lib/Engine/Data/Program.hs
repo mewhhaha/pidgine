@@ -27,7 +27,6 @@ module Engine.Data.Program
   , EntityM
   , MonadProgram
   , Batch
-  , compute
   , each
   , eachM
   , collect
@@ -127,17 +126,6 @@ runEntityPatch :: EntityPatch c -> Sig -> E.Bag c -> (Sig, E.Bag c)
 {-# INLINE runEntityPatch #-}
 runEntityPatch (EntityPatch patchEdit) sig bag =
   let bag' = E.bagApplyEditPacked patchEdit bag
-      staticOld = E.sigFromBag bag
-      deletedBits = E.bagEditDeletedMask patchEdit
-      stepBits = (sig .&. complement staticOld) .&. complement deletedBits
-      sig' = E.sigFromBag bag' .|. stepBits
-  in (sig', bag')
-
--- Unsafe: only use when the Bag is uniquely owned by the caller.
-runEntityPatchUnsafe :: EntityPatch c -> Sig -> E.Bag c -> (Sig, E.Bag c)
-{-# INLINE runEntityPatchUnsafe #-}
-runEntityPatchUnsafe (EntityPatch patchEdit) sig bag =
-  let bag' = E.bagApplyEditPackedUnsafe patchEdit bag
       staticOld = E.sigFromBag bag
       deletedBits = E.bagEditDeletedMask patchEdit
       stepBits = (sig .&. complement staticOld) .&. complement deletedBits
@@ -562,7 +550,7 @@ batchRun1 req forb g =
       k xs i =
         if i < V.length xs
           then (unsafeCoerce (V.unsafeIndex xs i), i + 1)
-          else error "compute: missing batch result"
+          else error "batch: missing result"
   in BatchRun (V.singleton (BatchOp req forb g')) 1 k
 
 each :: forall a c msg. E.Queryable c a => (a -> EntityPatch c) -> Batch c msg ()
@@ -575,7 +563,7 @@ each f =
         case runQ e bag of
           Nothing -> (sig, bag, ())
           Just a ->
-            let (sig', bag') = runEntityPatchUnsafe (f a) sig bag
+            let (sig', bag') = runEntityPatch (f a) sig bag
             in (sig', bag', ())
       doneQ () = ((), mempty)
   in Batch (\_ _ _ -> batchRun1 req forb (Gather () stepQ doneQ (\_ _ -> ()) (\_ s -> (s, s))))
@@ -824,7 +812,7 @@ instance MonadProgram c msg (EntityM c msg) where
   dt = EntityM $ \ctx -> (ctx, Done (ctxDt ctx))
   awaitM waitOn = EntityM $ \ctx ->
     case waitOn of
-      BatchWait _ -> error "await: compute is only valid in ProgramM"
+      BatchWait _ -> error "await: batch is only valid in ProgramM"
       _ ->
         case awaitGate waitOn (ctxInbox ctx) of
           Nothing -> (ctx, Wait (awaitM waitOn))
@@ -841,7 +829,7 @@ instance MonadProgram c msg (EntityM c msg) where
 edit :: EntityPatch c -> EntityM c msg ()
 {-# INLINE edit #-}
 edit p = EntityM $ \ctx ->
-  let (sig', bag') = runEntityPatchUnsafe p (ctxSig ctx) (ctxBag ctx)
+  let (sig', bag') = runEntityPatch p (ctxSig ctx) (ctxBag ctx)
   in (ctx { ctxSig = sig', ctxBag = bag' }, Done ())
 
 world :: Patch c -> ProgramM c msg ()
@@ -859,9 +847,6 @@ sample tw = F.at tw <$> time
 
 step :: forall a b c msg m. (HasCallStack, MonadProgram c msg m, Typeable a, Typeable b) => F.Step a b -> a -> m b
 step = stepM
-
-compute :: Batch c msg a -> Batch c msg a
-compute = id
 
 runEntityM :: forall c msg a. DTime -> Inbox msg -> E.Sig -> E.Bag c -> Machines -> EntityM c msg a
   -> (E.Bag c, E.Sig, Machines, Out msg, Bool, EntityM c msg a, Maybe a)
@@ -1260,16 +1245,19 @@ stepRound d w0 events0 programs toRun done0 seen0 values0 allSet stepped0 =
             else
               let rows0 = E.entityRowsV wStep
                   rowCount = V.length rows0
-                  chunkCount = chooseParallelChunks rowCount (V.length steps0)
+                  stepCount = V.length steps0
+                  chunkCount = chooseParallelChunks rowCount stepCount
+                  statefulChunkMax = 8
+                  statefulChunkCount = if hasStateful then min statefulChunkMax chunkCount else chunkCount
                   runChunk =
                     if hasStateful
                       then runKernelRowsStateful
                       else runKernelRowsStateless
               in
-                if chunkCount <= 1
+                if statefulChunkCount <= 1
                   then runPendingSteps state0 wStep
                   else
-                    let rowChunks = splitRowChunks chunkCount rows0
+                    let rowChunks = splitRowChunks statefulChunkCount rows0
                     in
                       if length rowChunks <= 1
                         then runPendingSteps state0 wStep

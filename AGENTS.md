@@ -30,7 +30,7 @@ Notes:
 
 Execution model target:
 
-- One fused batch kernel per `await (compute ...)` boundary.
+- One fused batch kernel per `await <batch>` boundary.
 - Kernel runs over the main spine only (no archetype storage paths).
 - Assume at least one full pass over all entities per tick; optimize that path first.
 - Keep evaluation order deterministic (stable program/step order).

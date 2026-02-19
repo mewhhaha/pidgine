@@ -10,6 +10,7 @@ module ProgramProps
   , program_step_independent_callsites
   , program_drive_del_stops
   , program_each_tuple_query
+  , program_parallel_kernel_equivalence
   , program_compute_fused_order
   , program_collect_fused_order
   , program_event_chain
@@ -20,11 +21,14 @@ module ProgramProps
   , prop_program_collect_fused
   ) where
 
+import Control.Exception (bracket)
 import Data.List (foldl')
 import GHC.Generics (Generic)
+import GHC.Conc (getNumCapabilities, setNumCapabilities)
 import qualified Engine.Data.ECS as E
 import qualified Engine.Data.FRP as F
 import qualified Engine.Data.Program as S
+import System.IO.Unsafe (unsafePerformIO)
 
 data WaitGo
 data Speed
@@ -51,6 +55,11 @@ data EnemyAI
   | Recover
   deriving (Eq, Show)
 
+data ProbeRow = ProbeRow
+  { probeCount :: Count
+  , probeLoopA :: LoopA
+  } deriving (Eq, Show, Generic)
+
 data C
   = CInt Int
   | CBool Bool
@@ -71,11 +80,11 @@ type ProgramM msg a = S.ProgramM C msg a
 qMarker :: E.Query C Marker
 qMarker = E.comp
 
-computeS :: S.Batch C String a -> S.Batch C String a
-computeS = S.compute
+batchS :: S.Batch C String a -> S.Batch C String a
+batchS = id
 
-computeU :: S.Batch C () a -> S.Batch C () a
-computeU = S.compute
+batchU :: S.Batch C () a -> S.Batch C () a
+batchU = id
 
 runPatch :: S.Patch C -> World -> World
 runPatch p w0 =
@@ -98,7 +107,7 @@ runCollectGraph w0 =
       g0 =
         S.graph $ do
           _ <- S.program $ do
-            counts <- S.await $ S.compute countsCompute
+            counts <- S.await countsCompute
             S.send [counts]
           pure ()
   in S.run 0.1 w0 [] g0
@@ -108,11 +117,11 @@ program_resume_once =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
       sys :: ProgramM String ()
       sys = do
-        _ <- S.await $ computeS $ do
+        _ <- S.await $ batchS $ do
           S.each @Int $ \n ->
             S.set (n + 1)
         _ <- S.await (== "go")
-        _ <- S.await $ computeS $ do
+        _ <- S.await $ batchS $ do
           S.each @Int $ \n ->
             S.set (n + 10)
         pure ()
@@ -139,7 +148,7 @@ program_await_value =
           speedH <- S.program (pure 3)
           _ <- S.program $ do
             v <- S.await speedH
-            _ <- S.await $ computeS $ do
+            _ <- S.await $ batchS $ do
               S.each @Int $ \_ ->
                 S.set (v :: Int)
             pure ()
@@ -152,7 +161,7 @@ countStep = F.acc 0
 
 countProg :: ProgramM () ()
 countProg = do
-  _ <- S.await $ computeU $ do
+  _ <- S.await $ batchU $ do
     S.eachM @Count $ \_ -> do
       n <- S.step countStep [(+1)]
       S.edit (S.set (Count n))
@@ -187,7 +196,7 @@ idleState = F.switch idleStep
 
 enemyAiProg :: ProgramM () ()
 enemyAiProg = do
-  _ <- S.await $ computeU $ do
+  _ <- S.await $ batchU $ do
     S.eachM @EnemyTag $ \_ -> do
       st <- S.step idleState ()
       S.edit (S.set st)
@@ -197,6 +206,49 @@ runFrameU :: World -> Graph () -> (World, Graph ())
 runFrameU w g =
   let (w', _, g') = S.run 0.1 w [] g
   in (w', g')
+
+withCapabilities :: Int -> IO a -> IO a
+withCapabilities caps action =
+  bracket getNumCapabilities setNumCapabilities $ \_ -> do
+    setNumCapabilities (max 1 caps)
+    action
+
+buildCountWorld :: Int -> World
+buildCountWorld n =
+  let spawnOne (i, w) _ =
+        let (_, w') = E.spawn (Count i) w
+        in (i + 1, w')
+  in snd (foldl' spawnOne (0 :: Int, E.emptyWorld :: World) [1 .. n])
+
+parallelProbeProg :: ProgramM () ()
+parallelProbeProg = do
+  _ <- S.await $ batchU $
+    S.each @Count (\(Count n) -> S.set (Count (n + 1)))
+      *> S.eachM @Count (\_ -> do
+        n <- S.step (F.acc (0 :: Int)) [(+1)]
+        S.edit (S.set (LoopA n))
+      )
+  pure ()
+
+runParallelProbe :: Int -> IO [(E.Entity, ProbeRow)]
+runParallelProbe caps =
+  withCapabilities caps $ do
+    let w0 = buildCountWorld 5000
+        g0 :: Graph ()
+        g0 =
+          S.graph $ do
+            _ <- S.program parallelProbeProg
+            pure ()
+        (w1, _, _) = S.run 0.1 w0 [] g0
+    pure (E.runq (E.query @ProbeRow) w1)
+
+program_parallel_kernel_equivalence :: Bool
+program_parallel_kernel_equivalence =
+  unsafePerformIO $ do
+    seqRows <- runParallelProbe 1
+    parRows <- runParallelProbe 2
+    pure (seqRows == parRows)
+{-# NOINLINE program_parallel_kernel_equivalence #-}
 
 program_eachm_enemy_state_machine :: Bool
 program_eachm_enemy_state_machine =
@@ -244,7 +296,7 @@ program_eachm_independent_loops =
   let (e, w0) = E.spawn (Count 0) (E.emptyWorld :: World)
       prog :: ProgramM () ()
       prog = do
-        _ <- S.await $ computeU $
+        _ <- S.await $ batchU $
           S.eachM @Count (\_ -> do
             n <- S.step (F.acc (0 :: Int)) [(+1)]
             S.edit (S.set (LoopA n))
@@ -287,7 +339,7 @@ counterStep n = F.Step $ \_ () -> (n, counterStep (n + 1))
 
 tickDriven :: ProgramM () ()
 tickDriven = do
-  _ <- S.await $ computeU $
+  _ <- S.await $ batchU $
     S.each @() (const mempty)
   pure ()
 
@@ -315,7 +367,7 @@ program_each_tuple_query =
   let (e, w0) = E.spawn ((3 :: Int), True) (E.emptyWorld :: World)
       prog :: ProgramM () ()
       prog = do
-        _ <- S.await $ computeU $ do
+        _ <- S.await $ batchU $ do
           S.each @(Int, Bool) $ \(n, alive) ->
             if alive
               then S.set (n + 1)
@@ -334,7 +386,7 @@ program_compute_fused_order =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
       markProg :: ProgramM () ()
       markProg = do
-        marks <- S.await $ computeU $
+        marks <- S.await $ batchU $
           S.each @Int (\_ -> S.set Marker) *> S.collect qMarker
         S.world (S.at e (S.set (length marks)))
         pure ()
@@ -423,11 +475,11 @@ runFrames evs =
   let (e, w0) = E.spawn (0 :: Int) (E.emptyWorld :: World)
       sys :: ProgramM String ()
       sys = do
-        _ <- S.await $ computeS $ do
+        _ <- S.await $ batchS $ do
           S.each @Int $ \n ->
             S.set (n + 1)
         _ <- S.await (== "go")
-        _ <- S.await $ computeS $ do
+        _ <- S.await $ batchS $ do
           S.each @Int $ \n ->
             S.set (n + 10)
         pure ()
@@ -458,7 +510,7 @@ prop_program_await_value v =
           speedH <- S.program (pure v)
           _ <- S.program $ do
             v' <- S.await speedH
-            _ <- S.await $ computeS $ do
+            _ <- S.await $ batchS $ do
               S.each @Int $ \_ ->
                 S.set (v' :: Int)
             pure ()

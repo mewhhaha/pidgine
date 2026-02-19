@@ -28,7 +28,7 @@ enable `DeriveGeneric` and `TypeApplications` where needed.
 - Movement / simulation should stay authoritative in components (`Pos`, `Vel`, etc.) and be advanced explicitly each tick.
 - `Tween`/`Step` is primarily for timed behavior and visual effect; interpolation is best used for presentation, not as the source of simulation truth.
 - Per-entity programs live in program locals: `eachM` creates per-entity programs keyed by callsite + query type and stored in program locals (not on entities), so entities only store components.
-- One sync point: `await (compute ...)` gathers `each`/`collect` and runs them in one pass.
+- One sync point: `await` on a `Batch` gathers `each`/`collect` and runs them in one pass.
 - Composition everywhere: queries are Applicative, patches are Semigroup/Monoid, steps compose, programs can `await` other programs/events.
 
 ## Benchmarks
@@ -188,7 +188,7 @@ wiggleProg :: S.ProgramM c msg ()
 wiggleProg = do
   let tweenX = F.tween (F.Span 0 1) easeInOut (lerp (-2) 2)
   x <- S.step (F.sample tweenX) ()
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @Pos $ \_ ->
       S.set (Pos x)
   pure ()
@@ -684,12 +684,12 @@ When an `await` is not ready, the rest of that program does not run for the tick
 Programs are coroutines: they resume at the suspended `await` on later frames,
 and restart from the top once they return.
 
-Entity iteration lives inside `S.await $ S.compute $ do ...` (explicit sync point).
-`S.each` (pure patch) and `S.collect` are only usable in a `compute`, so you can’t
+Entity iteration lives inside `S.await $ do ...` (explicit sync point).
+`S.each` (pure patch) and `S.collect` are only usable in a `Batch`, so you can’t
 accidentally run them outside.
-`compute` fuses the work into one pass; operations are executed left‑to‑right per
+`await` on a batch fuses the work into one pass; operations are executed left‑to‑right per
 entity and updates apply immediately, so later actions can see earlier edits.
-If you want `do`‑notation inside `compute`, enable `ApplicativeDo`.
+If you want `do`‑notation inside a batch, enable `ApplicativeDo`.
 
 For per‑entity continuations, use `eachM` with a monadic body. This gives each
 entity its own time/state machine without storing Steps in components.
@@ -697,15 +697,15 @@ entity its own time/state machine without storing Steps in components.
 Per‑entity state is keyed by **eachM callsite + query result type**, so independent
 loops over the same query type do not share state.
 Note: some longer examples below still show `gather` or `each` with `edit`; translate
-them to `await (compute ...)` and `eachM` when you need monadic actions.
+them to `await` on a batch and `eachM` when you need monadic actions.
 If you need fresh data or cross‑entity effects, split into another program and communicate
 via events, then `await` the sync point you need.
 
 Graph construction is via `graph`.
 
-Within a single `compute`, `each`/`collect` calls are sequenced left‑to‑right;
+Within a single batch, `each`/`collect` calls are sequenced left‑to‑right;
 later calls can see earlier edits for the same entity. If you need a full “tick
-boundary,” split it into another program and `await x`, then `await (compute ...)` again.
+boundary,” split it into another program and `await x`, then `await` a new batch again.
 
 ### Graph builder (default handles)
 
@@ -719,7 +719,7 @@ g0 =
     _ <- S.program $ do
       speed <- S.await speedH
       dt <- S.dt
-      _ <- S.await $ S.compute $ do
+      _ <- S.await $ do
         S.each @Pos $ \(Pos x y) ->
           S.set (Pos (x + speed * dt) y)
       pure ()
@@ -740,7 +740,7 @@ data MoveQ = MoveQ
 moveProg :: ProgramM () ()
 moveProg = do
   dt <- S.dt
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @MoveQ $ \q ->
       let Pos x y = pos q
           Vel vx vy = vel q
@@ -840,7 +840,7 @@ data ReadPos
 
 writePos :: ProgramM () ()
 writePos = do
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @Pos $ \(Pos x y) ->
       S.set (Pos (x + 1) y)
   pure ()
@@ -908,7 +908,7 @@ data MoveQ = MoveQ
 
 speedProg :: ProgramM () ()
 speedProg = do
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @MoveQ $ \q ->
       let Vel vx vy = vel q
       in S.set (Vel (vx * 1.1) (vy * 1.1))
@@ -918,7 +918,7 @@ moveProg :: S.Handle () -> ProgramM () ()
 moveProg speedH = do
   _ready <- S.await speedH
   dt <- S.dt
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @MoveQ $ \q ->
       let Pos x y = pos q
           Vel vx vy = vel q
@@ -950,7 +950,7 @@ moveProg :: S.Handle Double -> ProgramM () ()
 moveProg speedH = do
   speed <- S.await speedH
   dt <- S.dt
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @Pos $ \(Pos x y) ->
       S.set (Pos (x + speed * dt) y)
   pure ()
@@ -965,19 +965,19 @@ g0 =
 
 ### 4c.1) Batching entity work
 
-Use `await (compute ...)` to run entity work. The compute
-fuses work into one pass; updates apply as the actions run.
+Use `await` on a batch to run entity work. The batch fuses work into one pass;
+updates apply as the actions run.
 
 ```haskell
 {-# LANGUAGE TypeApplications #-}
 
-hits <- S.await $ S.compute $ do
+hits <- S.await $ do
   S.each @Pos $ \(Pos x y) ->
     S.set (Pos (x + 1) y)
   S.collect (E.comp @Pos)
 ```
 
-Another common pattern is “compute collisions once, then consume them”:
+Another common pattern is “collect collisions once, then consume them”:
 
 ```haskell
 {-# LANGUAGE TypeApplications #-}
@@ -989,7 +989,7 @@ data Collision = Collision Entity Entity
 
 collideProg :: ProgramM () [Collision]
 collideProg = do
-  pairs <- S.await $ S.compute $ S.collect (E.query @PairQ)  -- PairQ omitted for brevity
+  pairs <- S.await $ S.collect (E.query @PairQ)  -- PairQ omitted for brevity
   pure (detect pairs)                 -- detect :: [(Entity, PairQ)] -> [Collision]
 
 damageProg :: S.Handle [Collision] -> ProgramM () ()
@@ -1024,7 +1024,7 @@ data CountEnemies
 
 countEnemies :: ProgramM () ()
 countEnemies = do
-  enemies <- S.await $ S.compute $ S.collect (E.query @EnemyQ)
+  enemies <- S.await $ S.collect (E.query @EnemyQ)
   let n = length enemies
   pure ()
 ```
@@ -1069,7 +1069,7 @@ tween2 duration from to = do
 -- assume Pos component
 -- tweenProg = do
 --   x <- S.sample (F.tween (F.Span 0 duration) id (lerp 0 target))
---   _ <- S.await $ S.compute $ do
+--   _ <- S.await $ do
 --     S.each @Pos $ \_ -> S.set (Pos x)
 --   pure ()
 ```
@@ -1257,7 +1257,7 @@ data Enemy = Enemy deriving (Eq, Show)
 
 enemyProg :: S.ProgramM c msg ()
 enemyProg = do
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.eachM @Enemy $ \_ -> do
       st <- S.step enemy ()
       S.edit (S.set st)
@@ -1323,7 +1323,7 @@ data MoveQ = MoveQ
 moveProg :: ProgramM () ()
 moveProg = do
   dt <- S.dt
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @MoveQ $ \q ->
       let Pos x y = pos q
           Vel vx vy = vel q
@@ -1333,7 +1333,7 @@ moveProg = do
 bounceProg :: S.Handle () -> ProgramM () ()
 bounceProg moveH = do
   _ <- S.await moveH
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @MoveQ $ \q ->
       let Pos _ y = pos q
           Vel vx vy = vel q
@@ -1576,7 +1576,7 @@ data Jump
 gravityProg :: ProgramM I.Input ()
 gravityProg = do
   dt <- S.dt
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @Vel $ \(Vel vx vy) ->
       S.set (Vel vx (vy - 9.8 * dt))
   pure ()
@@ -1584,7 +1584,7 @@ gravityProg = do
 moveProg :: ProgramM I.Input ()
 moveProg = do
   dt <- S.dt
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @MoveQ $ \(MoveQ (Pos x y) (Vel vx vy)) ->
       S.set (Pos (x + vx * dt) (y + vy * dt))
   pure ()
@@ -1592,7 +1592,7 @@ moveProg = do
 jumpProg :: ProgramM I.Input ()
 jumpProg = do
   _ <- S.await (I.justPressed (I.Button "jump"))
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @JumpQ $ \(JumpQ (Vel vx _) _) ->
       S.set (Vel vx 12) <> S.del @OnGround
   pure ()
@@ -1633,7 +1633,7 @@ data PoolQ = PoolQ { free :: E.Not Enemy }
 spawnProg :: ProgramM Msg ()
 spawnProg = do
   spawns <- S.await (== SpawnEnemy)
-  pool <- S.await $ S.compute $ do
+  pool <- S.await $ do
     S.collect (E.query @PoolQ)
   let targets = take (length spawns) pool
       p = foldMap (\(e, _) ->
@@ -1668,7 +1668,7 @@ data QuestFinish
 questStartProg :: ProgramM Msg ()
 questStartProg = do
   _ <- S.await (== TalkNPC)
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @Quest $ \q ->
       case q of
         NotStarted -> S.set InProgress
@@ -1677,7 +1677,7 @@ questStartProg = do
 questFinishProg :: ProgramM Msg ()
 questFinishProg = do
   _ <- S.await (== BossDown)
-  _ <- S.await $ S.compute $ do
+  _ <- S.await $ do
     S.each @Quest $ \q ->
       case q of
         InProgress -> S.set Complete

@@ -38,8 +38,8 @@ type ProgramM msg a = S.ProgramM C msg a
 
 type Graph msg = S.Graph C msg
 
-computeS :: S.Batch C String a -> S.Batch C String a
-computeS = S.compute
+batch :: S.Batch C String a -> S.Batch C String a
+batch = id
 
 reqPV :: E.Sig
 reqPV =
@@ -198,8 +198,8 @@ advanceVampireMob dt (Pos x y) _ (Acc ax _) (Pos px py) (Hp hp) =
 pongProg :: ProgramM String ()
 pongProg = do
   dt <- S.dt
-  paddles <- S.await $ computeS $ S.collect qPaddle
-  balls <- S.await $ computeS $ S.collect qBall
+  paddles <- S.await $ batch $ S.collect qPaddle
+  balls <- S.await $ batch $ S.collect qBall
   let (leftY, leftVy, rightY, rightVy) =
         foldl'
           (\(ly, lvy, ry, rvy) (_, PaddleInfo (Pos _ py) (Vel _ pvy) (Hp side) _) ->
@@ -216,7 +216,7 @@ pongProg = do
       maxDy = pongPaddleSpeed * dt
       minY = -pongFieldHalfH + pongPaddleHalf
       maxY = pongFieldHalfH - pongPaddleHalf
-  _ <- S.await $ computeS $
+  _ <- S.await $ batch $
     S.eachM @PaddleInfo $ \(PaddleInfo (Pos _ y) _ (Hp side) _) -> do
       let targetY = ballY
           dy = clamp (-maxDy) maxDy (targetY - y)
@@ -224,7 +224,7 @@ pongProg = do
           x' = if side < 0 then -pongPaddleX else pongPaddleX
           vy' = if dt > 0 then dy / dt else 0
       S.edit (S.set (Pos x' y') <> S.set (Vel 0 vy'))
-  _ <- S.await $ computeS $
+  _ <- S.await $ batch $
     S.eachM @BallInfo $ \(BallInfo (Pos x y) (Vel vx vy) _ _) -> do
       let x1 = x + vx * dt
           y1 = y + vy * dt
@@ -268,16 +268,16 @@ pongProg = do
 vampireProg :: ProgramM String ()
 vampireProg = do
   dt <- S.dt
-  players <- S.await $ computeS $ S.collect qPlayer
+  players <- S.await $ batch $ S.collect qPlayer
   let (p0, v0) =
         case players of
           (_, PlayerInfo p v _ _) : _ -> (p, v)
           _ -> (Pos 0 0, Vel vampirePlayerSpeed 12)
       (p1, v1) = advanceVampirePlayer dt p0 v0
-  _ <- S.await $ computeS $
+  _ <- S.await $ batch $
     S.eachM @PlayerInfo $ \_ -> do
       S.edit (S.set p1 <> S.set v1)
-  _ <- S.await $ computeS $
+  _ <- S.await $ batch $
     S.eachM @NpcInfo $ \(NpcInfo p v a hp) -> do
       let (p', v', hp') = advanceVampireMob dt p v a p1 hp
       S.edit (S.set p' <> S.set v' <> S.set hp')

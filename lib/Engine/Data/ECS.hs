@@ -59,9 +59,7 @@ module Engine.Data.ECS
   , bagEditDel
   , bagEditDeletedMask
   , bagApplyEdit
-  , bagApplyEditUnsafe
   , bagApplyEditPacked
-  , bagApplyEditPackedUnsafe
   , bagSetDirect
   , bagUpdateDirect
   , bagDelDirect
@@ -699,6 +697,14 @@ runQuerySig q sig e bag =
     then runQuery q e bag
     else Nothing
 
+queryMatchRow :: Query c a -> EntityRow c -> Maybe (Entity, a)
+{-# INLINE queryMatchRow #-}
+queryMatchRow q (EntityRow eid' sig bag) =
+  let e = Entity eid'
+  in case runQuerySig q sig e bag of
+      Nothing -> Nothing
+      Just a -> Just (e, a)
+
 keyOfType :: forall c a. (Component c a, ComponentBit c a) => Key c
 keyOfType = Key (componentBitOf @c @a)
 
@@ -774,9 +780,6 @@ bagApplyEdit edit bag0 =
       BagEdit1 a -> runOp bag0 a
       BagEdit2 a b -> runOp (runOp bag0 a) b
       BagEditN ops -> foldl' runOp bag0 ops
-
-bagApplyEditUnsafe :: BagEdit c -> Bag c -> Bag c
-bagApplyEditUnsafe = bagApplyEdit
 
 hasStructuralEdit :: Sig -> [BagOp] -> Bool
 {-# INLINE hasStructuralEdit #-}
@@ -882,9 +885,6 @@ bagApplyEditPacked edit bag0@(Bag mask0 vals0) =
         fillVals 0 0
         vals' <- V.unsafeFreeze mvals
         pure (Bag mask' vals')
-
-bagApplyEditPackedUnsafe :: BagEdit c -> Bag c -> Bag c
-bagApplyEditPackedUnsafe = bagApplyEditPacked
 
 bagSetDirect :: forall c a. (Component c a, ComponentBit c a) => a -> Bag c -> Bag c
 {-# INLINE bagSetDirect #-}
@@ -1078,33 +1078,25 @@ notQ =
 
 runq :: Query c a -> World c -> [(Entity, a)]
 runq q w =
-  let info = queryInfoQ q
-      req = requireQ info
-      forb = forbidQ info
-      stepRow (EntityRow eid' _ bag) acc =
-        case runQuery q (Entity eid') bag of
-          Nothing -> acc
-          Just a -> (Entity eid', a) : acc
-      stepRun (EntityRow eid' sig bag) acc =
-        if (sig .&. req) == req && (sig .&. forb) == 0
-          then stepRow (EntityRow eid' sig bag) acc
-          else acc
-  in Foldable.foldr stepRun [] (rowsW w)
+  Foldable.foldr
+    (\row acc ->
+      case queryMatchRow q row of
+        Nothing -> acc
+        Just ea -> ea : acc
+    )
+    []
+    (rowsW w)
 
 foldq :: Query c a -> (Entity -> a -> s -> s) -> s -> World c -> s
 foldq q step s0 w =
-  let info = queryInfoQ q
-      req = requireQ info
-      forb = forbidQ info
-      stepRow acc (EntityRow eid' _ bag) =
-        case runQuery q (Entity eid') bag of
-          Nothing -> acc
-          Just a -> step (Entity eid') a acc
-      stepRun acc (EntityRow eid' sig bag) =
-        if (sig .&. req) == req && (sig .&. forb) == 0
-          then stepRow acc (EntityRow eid' sig bag)
-          else acc
-  in Foldable.foldl' stepRun s0 (rowsW w)
+  Foldable.foldl'
+    (\acc row ->
+      case queryMatchRow q row of
+        Nothing -> acc
+        Just (e, a) -> step e a acc
+    )
+    s0
+    (rowsW w)
 
 filterQ :: (a -> Bool) -> Query c a -> Query c a
 filterQ f (Query q qi) =

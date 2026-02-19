@@ -90,6 +90,7 @@ main = do
   assert "step independent callsites" program_step_independent_callsites
   assert "drive + del stops step updates" program_drive_del_stops
   assert "each tuple query" program_each_tuple_query
+  assert "parallel kernel equivalence" program_parallel_kernel_equivalence
   assert "patch monoid identity" (prop_program_patch_identity 7)
   assert "patch monoid associativity" (prop_program_patch_assoc 11)
   assert "compute fused order" program_compute_fused_order
@@ -113,6 +114,7 @@ main = do
       , quickCheckResult prop_query_queryable
       , quickCheckResult prop_query_queryable_sum
       , quickCheckResult prop_bag_apply_edit_packed_non_structural
+      , quickCheckResult prop_bag_apply_edit_packed_structural
       , quickCheckResult prop_relations
       , quickCheckResult prop_parent_child
       , quickCheckResult prop_transform_inverse
